@@ -1,5 +1,3 @@
-# an example workflow that uses ChemBL bioactivty data
-
 # import libraries
 import subprocess
 import os
