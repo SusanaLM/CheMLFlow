@@ -4,10 +4,10 @@ import os
 
 # preprocess and clean raw bioactivity data as required.
 script_path = os.path.join('utilities', 'prepareActivityData.py')
-raw_data_file = 'data/acetylchol_bio_raw.csv'
-preprocessed_file = 'data/acetylchol_bio_preprocessed.csv'
-curated_file = 'data/acetaylchol_bio_curated_data.csv'
-curated_smiles_output = 'data/acetylchol_bio_curated_smiles.csv'
+raw_data_file = 'data/covid19_bio_raw.csv'
+preprocessed_file = 'data/covid19_bio_preprocessed.csv'
+curated_file = 'data/covid19_bio_curated_data.csv'
+curated_smiles_output = 'data/covid19_bio_curated_smiles.csv'
 active_threshold = 1000
 inactive_threshold = 10000
 subprocess.run(
