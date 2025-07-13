@@ -154,19 +154,31 @@ class ResMLP(nn.Module):
         return self.head(x).squeeze(1)
 
 class TabTransformer(nn.Module):
-    def __init__(self, input_dim, embed_dim=64, n_heads=4, n_layers=2, dropout=0.1):
+    def __init__(self, input_dim, embed_dim=128, n_heads=8, n_layers=4, dropout=0.1):
         super().__init__()
         self.token_emb = nn.Linear(1, embed_dim)  # each scalar → vector
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=n_heads, dropout=dropout, dim_feedforward=embed_dim*4
+            d_model=embed_dim, nhead=n_heads, dropout=dropout, dim_feedforward=embed_dim*4, batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        # self.head = nn.Sequential(
+        #     nn.Linear(embed_dim, embed_dim//2),
+        #     nn.ReLU(),
+        #     nn.Dropout(dropout),
+        #     nn.Linear(embed_dim//2, 1)
+        # )
+
         self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(embed_dim, embed_dim//2),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(embed_dim//2, 1)
         )
+
 
     def forward(self, x):
         # x: [batch, D] → [batch, D, 1] → embed to [batch, D, E]
@@ -177,17 +189,19 @@ class TabTransformer(nn.Module):
         # out: [D, batch, E] → pool across D
         pooled = out.mean(dim=0)
         return self.head(pooled).squeeze(1)
-
+    
 class Autoencoder(nn.Module):
-    def __init__(self, input_dim, bottleneck=32):
+    def __init__(self, input_dim, bottleneck=64):
         super().__init__()
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 128), nn.ReLU(),
-            nn.Linear(128, bottleneck), nn.ReLU()
+            nn.Linear(input_dim, 512), nn.ReLU(),           # original
+            nn.Linear(512, 128), nn.ReLU(),                   # new intermediate layer
+            nn.Linear(128, bottleneck) #, nn.ReLU()             # bottleneck
         )
         self.decoder = nn.Sequential(
-            nn.Linear(bottleneck, 128), nn.ReLU(),
-            nn.Linear(128, input_dim)
+            nn.Linear(bottleneck, 128), nn.ReLU(),            # mirror of encoder
+            nn.Linear(128, 512), nn.ReLU(),                   # mirror
+            nn.Linear(512, input_dim)                        # output
         )
 
     def forward(self, x):
@@ -195,18 +209,97 @@ class Autoencoder(nn.Module):
         return self.decoder(z)
 
 class AERegressor(nn.Module):
-    def __init__(self, pretrained_encoder, bottleneck=32, dropout=0.2):
+    def __init__(self, pretrained_encoder, bottleneck=64, dropout=0.1):
         super().__init__()
         self.encoder = pretrained_encoder
         self.head = nn.Sequential(
-            nn.Linear(bottleneck, 64), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(64, 1)
+            nn.Linear(bottleneck, 128), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, 1)
         )
 
+    # def forward(self, x):
+    #     with torch.no_grad():   # optionally freeze encoder
+    #         z = self.encoder(x)
+    #     return self.head(z).squeeze(1)
+    
     def forward(self, x):
-        with torch.no_grad():   # optionally freeze encoder
-            z = self.encoder(x)
+        # with torch.no_grad():   # optionally freeze encoder
+        z = self.encoder(x)
         return self.head(z).squeeze(1)
 
 
+class DLRegressor(BaseEstimator, RegressorMixin):
+    def __init__(self,
+                 model_class,
+                 model_kwargs=None,
+                 epochs=100,
+                 batch_size=32,
+                 learning_rate=1e-3,
+                 verbose=False):
+        # we no longer need input_dim here, it lives in model_kwargs
+        self.model_class  = model_class
+        self.model_kwargs = model_kwargs or {}
+        self.epochs       = epochs
+        self.batch_size   = batch_size
+        self.learning_rate= learning_rate
+        self.verbose      = verbose
+        self.scaler       = StandardScaler()
+        self.device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model        = None
 
+    def fit(self, X, y):
+        # scale
+        Xs = self.scaler.fit_transform(X)
+        Ys = np.array(y).reshape(-1, 1)
+
+        # decide if it's a sequence‐model
+        is_sequence = issubclass(self.model_class, GRURegressor)
+
+        # build tensors
+        Xt = torch.tensor(Xs, dtype=torch.float32)
+        if is_sequence:
+            Xt = Xt.unsqueeze(2)    # [N, D] → [N, D, 1]
+        Yt = torch.tensor(Ys, dtype=torch.float32).to(self.device)
+
+        # data loader
+        ds     = TensorDataset(Xt.to(self.device), Yt)
+        loader = DataLoader(ds, batch_size=self.batch_size, shuffle=True)
+
+        # instantiate
+        self.model = self.model_class(**self.model_kwargs).to(self.device)
+        if is_sequence and hasattr(self.model, 'gru'):
+            self.model.gru.flatten_parameters()
+
+        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        criterion = nn.MSELoss()
+
+        # training loop
+        self.model.train()
+        for epoch in range(1, self.epochs+1):
+            total_loss = 0.0
+            for bx, by in loader:
+                optimizer.zero_grad()
+                preds = self.model(bx)                     # [batch] or [batch,1]
+                loss  = criterion(preds.unsqueeze(1), by)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            if self.verbose and epoch % 10 == 0:
+                print(f"Epoch {epoch}/{self.epochs} — loss: {total_loss/len(loader):.4f}")
+        return self
+
+    def predict(self, X):
+        Xs = self.scaler.transform(X)
+        Xt = torch.tensor(Xs, dtype=torch.float32)
+        if issubclass(self.model_class, GRURegressor):
+            Xt = Xt.unsqueeze(2)
+        Xt = Xt.to(self.device)
+
+        self.model.eval()
+        preds_list = []
+        with torch.no_grad():
+            for i in range(0, len(Xt), self.batch_size):
+                batch = Xt[i:i+self.batch_size]
+                p = self.model(batch)
+                preds_list.append(p.cpu().numpy())
+        return np.concatenate(preds_list).flatten()
