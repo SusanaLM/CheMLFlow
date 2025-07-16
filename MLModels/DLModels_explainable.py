@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torch
 import torch.nn as nn
 import random
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, random_split
 
 from DLModels import (
     DLRegressor,
@@ -174,7 +174,7 @@ class DLModel:
         # data_t = torch.tensor(X_train.values, dtype=torch.float32)
         ae = Autoencoder(input_dim=input_dim, bottleneck=bottleneck)
         ae.to(self.device)
-        ae_path = os.path.join(self.results_dir, 'autoencoder.pth')
+        ae_path = os.path.join(self.results_dir, f'autoencoder_b{bottleneck}.pth')
         if os.path.exists(ae_path):
             logging.info(f"Loading pretrained autoencoder from {ae_path}")
             ae.load_state_dict(torch.load(ae_path, map_location=self.device))
@@ -262,6 +262,41 @@ class DLModel:
             torch.save(ae.state_dict(), ae_path)
             logging.info(f"Saved autoencoder weights to {ae_path}")
         return ae.encoder
+    
+    def sweep_bottlenecks(self, X_train, y_train, X_val, y_val,
+                          bottlenecks=[8, 16, 32]):
+        """
+        Train AERegressor for each bottleneck size and report validation R2.
+        """
+        results = {}
+        for b in bottlenecks:
+            logging.info(f"\n=== Sweeping bottleneck={b} ===")
+            # train autoencoder and regressor
+            encoder = self._load_or_train_autoencoder(X_train, bottleneck=b,
+                                                      epochs=150, lr=1e-4)
+            # initialize regressor with matching bottleneck
+            self.model = DLRegressor(
+                model_class=AERegressor,
+                model_kwargs={'pretrained_encoder': encoder,
+                              'bottleneck': b,
+                              'dropout': 0.1},
+                learning_rate=1e-4,
+                epochs=150,
+                batch_size=64,
+                verbose=False
+            )
+            self.model.model = AERegressor(
+                pretrained_encoder=encoder,
+                bottleneck=b,
+                dropout=0.1
+            ).to(self.device)
+            self.model.device = self.device
+            # train & evaluate
+            self.train_model(X_train, y_train, val_fraction=0.1)
+            _, _, r2 = self.evaluate_model(X_val, y_val)
+            results[b] = r2
+            logging.info(f"bottleneck={b} ➜ R2={r2:.3f}")
+        return results
 
     def initialize_model(self, X_train):
         input_dim = X_train.shape[1]
@@ -464,6 +499,17 @@ class DLModel:
         return self.evaluate_model(X_te, y_te)
 
 
+# def main(args):
+#     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+#     model = DLModel(
+#         features_file=args.features_file,
+#         labels_file=args.labels_file,
+#         model_type=args.model_type,
+#         output_dir=args.output_dir
+#     )
+#     y_test, y_pred, r2 = model.run()
+#     print(f"Final Test R2: {r2:.3f}")
+
 def main(args):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     model = DLModel(
@@ -472,8 +518,41 @@ def main(args):
         model_type=args.model_type,
         output_dir=args.output_dir
     )
-    y_test, y_pred, r2 = model.run()
+
+    # load and preprocess
+    X, y = model.load_data()
+    model.verify_data_quality(X, y)
+    X_p = model.preprocess_data(X)
+    X_s = model.select_stable_features(X_p, y)
+
+    # optional sweep only for AERegressor
+    if args.sweep:
+        if args.model_type != 'ae_regressor':
+            print("Sweep is only available for ae_regressor. Nothing to do.")
+            sys.exit(1)
+        # split for sweep
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_s, y, test_size=0.2, random_state=model.random_state
+        )
+        results = model.sweep_bottlenecks(X_tr, y_tr, X_val, y_val)
+        print("Bottleneck sweep results (R2):", results)
+        sys.exit(0)
+
+    # default single-run workflow
+    # split into train/test
+    X_tr2, X_te, y_tr2, y_te = train_test_split(
+        X_s, y, test_size=model.test_size, random_state=model.random_state
+    )
+
+    # initialize and train
+    model.initialize_model(X_tr2)
+    model.train_model(X_tr2, y_tr2)
+
+    # evaluate
+    y_test, y_pred, r2 = model.evaluate_model(X_te, y_te)
     print(f"Final Test R2: {r2:.3f}")
+    return y_test, y_pred, r2
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train PyTorch DL models.")
@@ -490,5 +569,7 @@ if __name__ == "__main__":
         "ae_regressor"
     ], help="Which model to train")
     parser.add_argument("output_dir", help="Directory for outputs")
+    # CLI flag:
+    parser.add_argument("--sweep", action="store_true", help="Run bottleneck sweep and exit")
     args = parser.parse_args()
     sys.exit(main(args))
