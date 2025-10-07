@@ -620,7 +620,7 @@ class MLModel:
 
         # DL path
         if isinstance(estimator, DLRegressor):
-            best_path = os.path.join(self.results_dir, 'best_dl_model.pth')
+            best_path = os.path.join(self.results_dir, f"best_{self.model_type}.pth")
             if os.path.exists(best_path):
                 try:
                     estimator.model.load_state_dict(torch.load(best_path, map_location=self.device))
@@ -781,7 +781,7 @@ class MLModel:
                         return y.view(-1)
 
                 # load best checkpoint if present (non-fatal if missing)
-                best_path = os.path.join(self.results_dir, 'best_dl_model.pth')
+                best_path = os.path.join(self.results_dir, f"best_{self.model_type}.pth")
                 try:
                     estimator.model.load_state_dict(torch.load(best_path, map_location=self.device))
                     logging.info(f"Loaded DL checkpoint: {best_path}")
