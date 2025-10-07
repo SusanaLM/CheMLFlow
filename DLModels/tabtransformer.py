@@ -32,13 +32,13 @@ class TabTransformer(nn.Module):
         )
 
 
-        # self.head = nn.Sequential(
-        #     nn.LayerNorm(embed_dim),
-        #     nn.Linear(embed_dim, embed_dim),
-        #     nn.ReLU(),
-        #     nn.Dropout(dropout),
-        #     nn.Linear(embed_dim, embed_dim//2),
-        #     nn.ReLU(),
-        #     nn.Dropout(dropout),
-        #     nn.Linear(embed_dim//2, 1)
-        # )
+    def forward(self, x):
+        # x: [batch, D] → [batch, D, 1] → embed to [batch, D, E]
+        emb = self.token_emb(x.unsqueeze(-1))
+        # transformer expects [seq_len, batch, embed]
+        t = emb.permute(1, 0, 2)
+        out = self.transformer(t)
+        # out: [D, batch, E] → pool across D
+        pooled = out.mean(dim=0)
+        return self.head(pooled).squeeze(1)
+    
