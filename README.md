@@ -22,25 +22,25 @@ pip install -e .
 
 4. Install RDKit from via conda or pip install
 
-## Conda installation (recommended)
+### Conda installation (recommended)
 conda install -c conda-forge rdkit
 
-## pip installation (works for most applications)
+### pip installation (works for most applications)
 pip install rdkit 
 
 
 5. Install PyTorch and PyTorch Lightning with GPU support
 
-## For Linux/Windows (check for cuda version available. for instance, cu121 here)
+### For Linux/Windows (check for cuda version available. for instance, cu121 here)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install pytorch-lightning
 
-## For AMD GPU (ROCm, Linux only)
+### For AMD GPU (ROCm, Linux only)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.0
 pip install pytorch-lightning
 
-## For Apple Silicon (M1/M2/M3), no CUDA/GPU available 
-## Can use the MPS backend (built into the default macOS wheels) when using mps as the device
+### For Apple Silicon (M1/M2/M3), no CUDA/GPU available 
+### Can use the MPS backend (built into the default macOS wheels) when using mps as the device
  
 pip install torch torchvision torchaudio
 pip install pytorch-lightning 
