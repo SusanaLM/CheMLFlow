@@ -79,22 +79,26 @@ class DataPreparer:
                 df.to_csv(self.curated_file, index=False)
                 logging.info(f"Curated data (pass-through) saved to {self.curated_file}")
                 return
+            
+            # Filter out rows with missing 'standard_value'
+            df_clean = df[df.standard_value.notna()]
 
             # Label as active / intermediate / inactive
             import numpy as np
+            
             conditions = [
-                (df['standard_value'] <= active_threshold),
-                (df['standard_value'] > inactive_threshold)
+                (df_clean['standard_value'] <= active_threshold),
+                (df_clean['standard_value'] > inactive_threshold)
             ]
             choices = ['active', 'inactive']
             labeled = np.select(conditions, choices, default='intermediate')
-            df['bioactivity_class'] = pd.Categorical(labeled, categories=['active', 'intermediate', 'inactive'], ordered=True)
+            df_clean['class'] = pd.Categorical(labeled, categories=['active', 'intermediate', 'inactive'], ordered=True)
 
             # Keep typical useful columns if present
-            keep_cols = [c for c in ['molecule_chembl_id', 'canonical_smiles', 'standard_value', 'bioactivity_class'] if c in df.columns]
+            keep_cols = [c for c in ['molecule_chembl_id', 'canonical_smiles', 'standard_value', 'class'] if c in df_clean.columns]
             if not keep_cols:
-                keep_cols = df.columns.tolist()
-            df[keep_cols].to_csv(self.curated_file, index=False)
+                keep_cols = df_clean.columns.tolist()
+            df_clean[keep_cols].to_csv(self.curated_file, index=False)
             logging.info(f"Curated data with labels saved to {self.curated_file}")
         except Exception as e:
             logging.error(f"Error during labeling: {e}")
@@ -231,3 +235,4 @@ if __name__ == "__main__":
          smiles_column=args.smiles_column, properties_of_interest=props,
          require_neutral_charge=args.require_neutral_charge,
          prefer_largest_fragment=args.prefer_largest_fragment)
+
