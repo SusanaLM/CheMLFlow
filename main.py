@@ -9,7 +9,7 @@ import os
 # get ChemBL bioactivity data.
 
 os.makedirs('data', exist_ok=True)
-os.makedirs('urease', exist_ok=True)
+os.makedirs('data/urease', exist_ok=True)
 
 script_path = os.path.join('GetData', 'get_ChEMBL_target_full.py')
 target_name = 'urease'
