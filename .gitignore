@@ -2,4 +2,41 @@
 logs
 *.log
 
+# macOS
+.DS_Store
 
+# Python / tooling
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+*.whl
+.Python
+.venv/
+.env/
+.envrc
+.tox/
+.nox/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+pip-wheel-metadata/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# Project outputs
+data/
+results/
+urease/
