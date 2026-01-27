@@ -40,3 +40,7 @@ coverage.xml
 data/
 results/
 urease/
+
+.main.py
+
+
