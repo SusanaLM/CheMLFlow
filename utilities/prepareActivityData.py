@@ -5,10 +5,11 @@ import logging
 from rdkit import Chem
 
 class DataPreparer:
-    def __init__(self, raw_data_file, preprocessed_file, curated_file):
+    def __init__(self, raw_data_file, preprocessed_file, curated_file, keep_all_columns=False):
         self.raw_data_file = raw_data_file
         self.preprocessed_file = preprocessed_file
         self.curated_file = curated_file
+        self.keep_all_columns = keep_all_columns
         logging.info(f"Initialized DataPreparer with raw data file: {self.raw_data_file}")
 
     def handle_missing_data_and_duplicates(self, smiles_column=None, properties_of_interest=None):
@@ -48,15 +49,21 @@ class DataPreparer:
             id_candidates = ['molecule_chembl_id', 'mol_id', 'compound_id', 'id', 'ID']
             id_col = next((c for c in id_candidates if c in df_clean.columns), None)
 
-            # Decide which columns to keep
-            present_props = [c for c in (properties_of_interest or []) if c in df_clean.columns]
-            selected_columns = []
-            if id_col: selected_columns.append(id_col)
-            selected_columns.append(smiles_col)
-            selected_columns.extend([c for c in present_props if c not in selected_columns])
+            if self.keep_all_columns:
+                selected_columns = df_clean.columns.tolist()
+                df_clean = df_clean[selected_columns]
+                logging.info("Keeping all columns for preprocessing.")
+            else:
+                # Decide which columns to keep
+                present_props = [c for c in (properties_of_interest or []) if c in df_clean.columns]
+                selected_columns = []
+                if id_col:
+                    selected_columns.append(id_col)
+                selected_columns.append(smiles_col)
+                selected_columns.extend([c for c in present_props if c not in selected_columns])
 
-            df_clean = df_clean[selected_columns]
-            logging.info(f"Selected columns for preprocessing: {selected_columns}")
+                df_clean = df_clean[selected_columns]
+                logging.info(f"Selected columns for preprocessing: {selected_columns}")
 
             # Save preprocessed data
             df_clean.to_csv(self.preprocessed_file, index=False)
@@ -94,11 +101,14 @@ class DataPreparer:
             labeled = np.select(conditions, choices, default='intermediate')
             df_clean['class'] = pd.Categorical(labeled, categories=['active', 'intermediate', 'inactive'], ordered=True)
 
-            # Keep typical useful columns if present
-            keep_cols = [c for c in ['molecule_chembl_id', 'canonical_smiles', 'standard_value', 'class'] if c in df_clean.columns]
-            if not keep_cols:
-                keep_cols = df_clean.columns.tolist()
-            df_clean[keep_cols].to_csv(self.curated_file, index=False)
+            if self.keep_all_columns:
+                df_clean.to_csv(self.curated_file, index=False)
+            else:
+                # Keep typical useful columns if present
+                keep_cols = [c for c in ['molecule_chembl_id', 'canonical_smiles', 'standard_value', 'class'] if c in df_clean.columns]
+                if not keep_cols:
+                    keep_cols = df_clean.columns.tolist()
+                df_clean[keep_cols].to_csv(self.curated_file, index=False)
             logging.info(f"Curated data with labels saved to {self.curated_file}")
         except Exception as e:
             logging.error(f"Error during labeling: {e}")
@@ -194,10 +204,11 @@ class DataPreparer:
 
 def main(raw_data_file, preprocessed_file, curated_file, curated_smiles_output,
          active_threshold, inactive_threshold,
-         smiles_column=None, properties_of_interest=None, require_neutral_charge=False, prefer_largest_fragment=True):
+         smiles_column=None, properties_of_interest=None, require_neutral_charge=False, prefer_largest_fragment=True,
+         keep_all_columns=False):
     """Main function to preprocess, optionally label, and clean SMILES data."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    preparer = DataPreparer(raw_data_file, preprocessed_file, curated_file)
+    preparer = DataPreparer(raw_data_file, preprocessed_file, curated_file, keep_all_columns=keep_all_columns)
     preparer.handle_missing_data_and_duplicates(smiles_column=smiles_column,
                                                 properties_of_interest=properties_of_interest)
     # Label if bioactivity present; otherwise pass-through
@@ -223,6 +234,8 @@ if __name__ == "__main__":
                         help="If set, drop molecules with non-zero formal charge.")
     parser.add_argument('--prefer_largest_fragment', action='store_true',
                         help="If set, keep the largest fragment by heavy-atom count when multiple fragments are present.")
+    parser.add_argument('--keep_all_columns', action='store_true',
+                        help="If set, keep all columns (do not drop to only selected properties).")
 
     args = parser.parse_args()
 
@@ -234,5 +247,5 @@ if __name__ == "__main__":
          args.active_threshold, args.inactive_threshold,
          smiles_column=args.smiles_column, properties_of_interest=props,
          require_neutral_charge=args.require_neutral_charge,
-         prefer_largest_fragment=args.prefer_largest_fragment)
-
+         prefer_largest_fragment=args.prefer_largest_fragment,
+         keep_all_columns=args.keep_all_columns)

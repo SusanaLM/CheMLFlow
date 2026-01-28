@@ -1,0 +1,34 @@
+# Default ChemBL pipeline
+pipeline_type: chembl
+pipeline:
+  nodes:
+    - get_data
+    - curate
+    - featurize.lipinski
+    - label.ic50
+    - analyze.stats
+    - analyze.eda
+    - featurize.rdkit
+    - train
+    - explain
+
+data_source: chembl
+source:
+  target_name: urease
+
+base_dir: data/urease
+thresholds:
+  active: 1000
+  inactive: 10000
+
+target_column: pIC50
+
+preprocess:
+  keep_all_columns: true
+curate:
+  properties: standard_value
+
+model:
+  type: random_forest
+  cv_folds: 3
+  search_iters: 50

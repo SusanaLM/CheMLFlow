@@ -2,7 +2,17 @@ import numpy as np
 import pandas as pd
 import argparse
 import logging
-from chembl_webresource_client.new_client import new_client
+import sys
+
+try:
+    from chembl_webresource_client.new_client import new_client
+except Exception as exc:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logging.error("ChEMBL API is unavailable: %s", exc)
+    print(
+        "ChEMBL API is unavailable right now. Please retry later or switch to a cached/local CSV."
+    )
+    raise SystemExit(1)
 
 
 class ChemblDataRetriever:
@@ -146,8 +156,11 @@ def main(target_name, output_file, bioactivity):
             logging.warning(f"No data to save for target: {target_name}")
 
     except Exception as e:
-        logging.error(f"An error occurred: {e}")
-        print(f"An error occurred: {e}")
+        logging.error("An error occurred: %s", e)
+        print(
+            "ChEMBL fetch failed. Please retry later or switch to a cached/local CSV."
+        )
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
