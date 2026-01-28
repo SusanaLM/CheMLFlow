@@ -9,7 +9,7 @@ from sklearn.feature_selection import VarianceThreshold
 from sklearn.model_selection import KFold
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import RobustScaler
-import pdb
+from typing import Iterable, Tuple, Dict, Any
 
 # ── 1) Load data ───────────────────────────────────────────────────────────────
 def load_data(features_file: str, labels_file: str):
@@ -50,13 +50,20 @@ def load_data(features_file: str, labels_file: str):
         sys.exit(1)
 
 # ── 2) Preprocess ──────────────────────────────────────────────────────────────
-def preprocess_data(X: pd.DataFrame,
+def preprocess_data(
+    X: pd.DataFrame,
     variance_threshold: float = 0.8 * (1 - 0.8),
     corr_threshold: float = 0.95,
     clip_range: tuple = (-1e10, 1e10),
-    ):
+    allow_full_fit: bool = False,
+):
     """Preprocess the data by scaling and removing low-variance and highly correlated features."""
     try:
+        if not allow_full_fit:
+            raise ValueError(
+                "preprocess_data fits on the full dataset and is deprecated. "
+                "Use fit_preprocessor/transform_preprocessor with a train/test split."
+            )
 
         # Scaling features using RobustScaler
         logging.info("Scaling features using RobustScaler.")
@@ -66,7 +73,7 @@ def preprocess_data(X: pd.DataFrame,
 
         # Removing low-variance features (on both training dataset and test) - OR DO BEFORE SCALING
         logging.info("Removing low-variance features.")
-        selector = VarianceThreshold(threshold=(0.8 * (1 - 0.8)))
+        selector = VarianceThreshold(threshold=variance_threshold)
         X_reduced = selector.fit_transform(X_scaled_df)
         features_after_variance = X_scaled_df.columns[selector.get_support(indices=True)]
         X_reduced_df = pd.DataFrame(X_reduced, columns=features_after_variance)
@@ -77,7 +84,7 @@ def preprocess_data(X: pd.DataFrame,
         corr_matrix = X_reduced_df.corr().abs()
         upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
         # Adjust the threshold to 0.95
-        to_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
+        to_drop = [column for column in upper.columns if any(upper[column] > corr_threshold)]
         X_final = X_reduced_df.drop(columns=to_drop)
         logging.info(f"Data reduced to {X_final.shape[1]} features after removing highly correlated features.")
         logging.info(f"Data shape after preprocessing: {X_final.shape}")
@@ -85,7 +92,7 @@ def preprocess_data(X: pd.DataFrame,
         # Clip extreme values to a safe range for float32 conversion.
         # This ensures that when the model or pandas casts the data to float32,
         # the values do not exceed the representable limits.
-        min_threshold, max_threshold = -1e10, 1e10  # Adjust these thresholds based on your data's expected range.
+        min_threshold, max_threshold = clip_range  # Adjust these thresholds based on your data's expected range.
         X_final = X_final.clip(lower=min_threshold, upper=max_threshold)
         logging.info(f"Data clipped to range [{min_threshold}, {max_threshold}].")
         logging.info(f"Final data range: min={X_final.min().min()}, max={X_final.max().max()}")
@@ -94,6 +101,56 @@ def preprocess_data(X: pd.DataFrame,
     except Exception as e:
         logging.error(f"Error during data preprocessing: {e}")
         sys.exit(1)
+
+
+def fit_preprocessor(
+    X_train: pd.DataFrame,
+    variance_threshold: float,
+    corr_threshold: float,
+    clip_range: tuple,
+) -> Dict[str, Any]:
+    """Fit preprocessing steps on training data only."""
+    scaler = RobustScaler()
+    X_scaled = scaler.fit_transform(X_train)
+    X_scaled_df = pd.DataFrame(X_scaled, columns=X_train.columns)
+
+    selector = VarianceThreshold(threshold=variance_threshold)
+    X_reduced = selector.fit_transform(X_scaled_df)
+    features_after_variance = X_scaled_df.columns[selector.get_support(indices=True)]
+    X_reduced_df = pd.DataFrame(X_reduced, columns=features_after_variance)
+
+    corr_matrix = X_reduced_df.corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [column for column in upper.columns if any(upper[column] > corr_threshold)]
+
+    return {
+        "scaler": scaler,
+        "selector": selector,
+        "variance_features": list(features_after_variance),
+        "corr_drop": to_drop,
+        "clip_range": clip_range,
+    }
+
+
+def transform_preprocessor(X: pd.DataFrame, preprocessor: Dict[str, Any]) -> pd.DataFrame:
+    """Apply a fitted preprocessor to new data."""
+    scaler = preprocessor["scaler"]
+    selector = preprocessor["selector"]
+    variance_features = preprocessor["variance_features"]
+    to_drop = preprocessor["corr_drop"]
+    clip_range = preprocessor["clip_range"]
+
+    X_scaled = scaler.transform(X)
+    X_scaled_df = pd.DataFrame(X_scaled, columns=X.columns)
+
+    X_reduced = selector.transform(X_scaled_df)
+    X_reduced_df = pd.DataFrame(X_reduced, columns=variance_features)
+
+    X_final = X_reduced_df.drop(columns=to_drop)
+
+    min_threshold, max_threshold = clip_range
+    X_final = X_final.clip(lower=min_threshold, upper=max_threshold)
+    return X_final
 
 # ── 3) Stable feature selection ────────────────────────────────────────────────
 def select_stable_features(X: pd.DataFrame,
@@ -131,6 +188,69 @@ def select_stable_features(X: pd.DataFrame,
         logging.error(f"Error during stable feature selection: {e}")
         sys.exit(1)
 
+
+def _find_target_column(columns: Iterable[str], target_column: str) -> tuple[str, int]:
+    target_lower = target_column.lower()
+    for idx, col in enumerate(columns):
+        if col.lower() == target_lower:
+            return col, idx
+    raise ValueError(f"The labels file must contain a '{target_column}' column.")
+
+
+def select_target_series(df: pd.DataFrame, target_column: str) -> pd.Series:
+    target_col, target_idx = _find_target_column(df.columns, target_column)
+    series = df.iloc[:, target_idx]
+    series.name = target_col
+    return series
+
+
+def _drop_smiles_columns(df: pd.DataFrame) -> pd.DataFrame:
+    drop_cols = [c for c in df.columns if c.lower() in {"smiles", "canonical_smiles"}]
+    if not drop_cols:
+        return df
+    return df.drop(columns=drop_cols)
+
+
+def load_features_labels(
+    features_file: str,
+    labels_file: str,
+    target_column: str,
+) -> Tuple[pd.DataFrame, pd.Series]:
+    """Load features and labels, align them, and drop duplicates and target columns."""
+    try:
+        logging.info(f"Loading features from {features_file}")
+        X = pd.read_csv(features_file)
+        logging.info(f"Loading labels ({target_column}) from {labels_file}")
+        y_df = pd.read_csv(labels_file)
+
+        if X.shape[0] != y_df.shape[0]:
+            raise ValueError("The number of samples in the features file and the labels file do not match.")
+
+        target_col, _ = _find_target_column(y_df.columns, target_column)
+        y = select_target_series(y_df, target_column)
+        X.replace([np.inf, -np.inf], np.nan, inplace=True)
+        y.replace([np.inf, -np.inf], np.nan, inplace=True)
+        valid_mask = ~X.isna().any(axis=1) & ~y.isna()
+
+        X_clean = X[valid_mask]
+        y_clean = y[valid_mask]
+
+        combined = pd.concat([X_clean, y_clean], axis=1)
+        combined_before = combined.shape[0]
+        combined = combined.drop_duplicates()
+        combined_after = combined.shape[0]
+        logging.info(f"Removed {combined_before - combined_after} duplicate entries.")
+
+        X_clean = combined.drop(columns=[target_col])
+        X_clean = _drop_smiles_columns(X_clean)
+        y_clean = combined[target_col]
+
+        logging.info(f"Data shape after initial cleaning: {X_clean.shape}")
+        return X_clean, y_clean
+    except Exception as e:
+        logging.error(f"Error loading data: {e}")
+        sys.exit(1)
+
 # ── 4) Data quality ───────────────────────────────────────────────────────────
 def verify_data_quality(X: pd.DataFrame, y: pd.Series):
     """Check for data quality issues."""
@@ -148,14 +268,14 @@ def verify_data_quality(X: pd.DataFrame, y: pd.Series):
 
 # ── 5) Leakage check ──────────────────────────────────────────────────────────
 def check_data_leakage(X_train: pd.DataFrame, X_test: pd.DataFrame):
-    """Check for data leakage between training and test sets."""
+    """Check for exact row overlap between training and test sets."""
     
     try:
-        logging.info("Checking for data leakage between training and test sets.")
+        logging.info("Checking for exact row overlap between training and test sets.")
         intersection = pd.merge(X_train, X_test, how='inner')
         if not intersection.empty:
-            logging.warning("Potential data leakage detected between training and test sets.")
+            logging.warning("Potential row overlap detected between training and test sets.")
         else:
-            logging.info("No data leakage detected.")
+            logging.info("No row overlap detected.")
     except Exception as e:
         logging.error(f"Error checking data leakage: {e}")
