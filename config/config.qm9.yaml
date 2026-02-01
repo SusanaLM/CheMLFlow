@@ -42,3 +42,6 @@ model:
   type: decision_tree
   cv_folds: 3
   search_iters: 50
+  use_hpo: true
+  hpo_trials: 30
+  patience: 20
