@@ -170,6 +170,7 @@ def run_explainability(
     y_test: pd.Series,
     model_type: str,
     output_dir: str,
+    background_samples: int = 100,
 ) -> None:
     _ensure_dir(output_dir)
 
@@ -189,11 +190,37 @@ def run_explainability(
     plt.close()
 
     try:
-        if model_type in ["xgboost", "ensemble"]:
-            explainer = shap.Explainer(estimator)
-        else:
+        if model_type in ["random_forest", "decision_tree", "xgboost"]:
             explainer = shap.TreeExplainer(estimator)
-        shap_values = explainer.shap_values(X_test)
+            shap_values = explainer.shap_values(X_test)
+        
+        elif model_type == "ensemble":
+            explainer = shap.Explainer(estimator.predict, X_test.iloc[:background_samples])
+            shap_values = explainer(X_test)
+        
+        elif model_type == "svm":
+            background = shap.sample(X_test, min(background_samples, len(X_test)))
+            explainer = shap.KernelExplainer(estimator.predict, background)
+            X_explain = X_test.iloc[:min(100, len(X_test))]
+            shap_values = explainer.shap_values(X_explain)
+            X_test = X_explain 
+        
+        elif model_type in ["deep_learning", "neural_network"]:
+            # Assumes estimator has a callable predict method
+            background = shap.sample(X_test, min(background_samples, len(X_test)))
+            explainer = shap.DeepExplainer(estimator, background)
+            shap_values = explainer.shap_values(X_test.iloc[:100])
+            X_test = X_test.iloc[:100]
+        
+        else:
+            background = shap.sample(X_test, min(background_samples, len(X_test)))
+            explainer = shap.KernelExplainer(estimator.predict, background)
+            X_explain = X_test.iloc[:min(100, len(X_test))]
+            shap_values = explainer.shap_values(X_explain)
+            X_test = X_explain
+
+        if hasattr(shap_values, 'values'):
+            shap_values = shap_values.values
         plt.figure(figsize=(10, 6))
         shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
         plt.savefig(os.path.join(output_dir, f"{model_type}_shap_summary.png"), bbox_inches="tight")
