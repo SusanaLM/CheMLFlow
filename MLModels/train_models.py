@@ -1,13 +1,17 @@
 import os
 import logging
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Dict, Any, Callable
 
 import joblib
 import numpy as np
 import pandas as pd
 import shap
 import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
 
 from sklearn.model_selection import RandomizedSearchCV, GridSearchCV
 from sklearn.ensemble import RandomForestRegressor, VotingRegressor
@@ -16,6 +20,11 @@ from sklearn.tree import DecisionTreeRegressor
 from xgboost import XGBRegressor
 from sklearn.metrics import r2_score, mean_absolute_error
 from sklearn.inspection import permutation_importance
+from sklearn.model_selection import train_test_split
+
+import optuna
+
+from simpleregressionnn import SimpleRegressionNN
 
 
 @dataclass
@@ -24,16 +33,91 @@ class TrainResult:
     params_path: str
     metrics_path: str
 
+@dataclass
+class DLSearchConfig:
+    model_class: Callable
+    search_space: Dict[str, Any]
+    default_params: Dict[str, Any]
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
+def _run_optuna(
+    config: DLSearchConfig,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    max_evals: int,
+    random_state: int,
+    patience: int,
+) -> Tuple[nn.Module, dict]:
+    
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train, y_train, test_size=0.15, random_state=random_state
+    )
+    
+    best_model = None
+    best_score = float("-inf")
+    
+    def objective(trial: optuna.Trial) -> float:
+        nonlocal best_model, best_score
+        
+        # Sample hyperparameters from search space
+        params = {}
+        for name, spec in config.search_space.items():
+            if spec["type"] == "categorical":
+                params[name] = trial.suggest_categorical(name, spec["choices"])
+            elif spec["type"] == "float":
+                params[name] = trial.suggest_float(
+                    name, spec["low"], spec["high"], log=spec.get("log", False)
+                )
+            elif spec["type"] == "int":
+                params[name] = trial.suggest_int(
+                    name, spec["low"], spec["high"], log=spec.get("log", False)
+                )
+        
+        model = config.model_class(params)
+        
+        # Train
+        result = _train_dl(
+            model=model,
+            X_train=X_tr,
+            y_train=y_tr,
+            random_state=random_state,
+            epochs=int(params.get("epochs", 100)),
+            batch_size=int(params.get("batch_size", 32)),
+            learning_rate=float(params.get("learning_rate", 1e-3)),
+            patience=patience,
+        )
+        
+        # Evaluate on validation set
+        trained_model = result["model"]
+        y_pred = _predict_dl(trained_model, X_val)
+        r2 = r2_score(y_val, y_pred)
+        
+        # Track best
+        if r2 > best_score:
+            best_score = r2
+            best_model = trained_model
+            logging.info(f"New best R2={r2:.4f} with params: {params}")
+        
+        return r2  # Optuna maximizes by default when direction="maximize"
+    
+    # Create and run study
+    sampler = optuna.samplers.TPESampler(seed=random_state)
+    study = optuna.create_study(direction="maximize", sampler=sampler)
+    study.optimize(objective, n_trials=max_evals, show_progress_bar=True)
+    
+    best_params = study.best_params
+    logging.info(f"Optuna complete. Best R2={best_score:.4f}, params={best_params}")
+    
+    return best_model, best_params
 
 def _initialize_model(
     model_type: str,
     random_state: int,
     cv_folds: int,
     search_iters: int,
+    input_dim: int = None,
 ):
     if model_type == "random_forest":
         param_dist = {
@@ -125,7 +209,106 @@ def _initialize_model(
             random_state=random_state,
         )
         return VotingRegressor([("rf", rf), ("xgb", xgb)], n_jobs=-1)
+    
+    if model_type == "dl_simple":
+        if input_dim is None:
+            raise ValueError("input_dim required for DL models")
+        return DLSearchConfig(
+            model_class=lambda params: SimpleRegressionNN(
+                input_dim=input_dim,
+                hidden_dim=params.get("hidden_dim", 256),
+            ),
+            search_space={
+                "hidden_dim": {"type": "categorical", "choices": [64, 128, 256, 512]},
+                "learning_rate": {"type": "float", "low": 1e-5, "high": 1e-2, "log": True},
+                "batch_size": {"type": "categorical", "choices": [16, 32, 64, 128]},
+                "epochs": {"type": "categorical", "choices": [100, 200, 300]},
+            },
+            default_params={
+                "hidden_dim": 256,
+                "learning_rate": 1e-3,
+                "batch_size": 32,
+                "epochs": 200,
+            },
+        )
     raise ValueError(f"Unsupported model type: {model_type}")
+
+# DL training helper functions
+def _get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def _is_dl_model(model_type: str) -> bool:
+    return model_type.startswith("dl_")
+def _train_dl(
+    model: nn.Module,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    random_state: int,
+    epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    patience: int,
+    ) -> Dict[str, Any]:
+    """Train a PyTorch model. Returns dict with model and best_params."""
+    device = _get_device()
+    model = model.to(device)
+    
+    X_t = torch.tensor(X_train, dtype=torch.float32, device=device)
+    y_t = torch.tensor(y_train.reshape(-1, 1), dtype=torch.float32, device=device)
+    
+    # Train/val split
+    n_val = max(1, int(0.1 * len(X_t)))
+    gen = torch.Generator().manual_seed(random_state)
+    idx = torch.randperm(len(X_t), generator=gen)
+    X_tr, X_val = X_t[idx[n_val:]], X_t[idx[:n_val]]
+    y_tr, y_val = y_t[idx[n_val:]], y_t[idx[:n_val]]
+    
+    loader = DataLoader(TensorDataset(X_tr, y_tr), batch_size=batch_size, shuffle=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.MSELoss()
+    
+    best_loss, best_state, wait = float('inf'), None, 0
+    
+    for epoch in range(1, epochs + 1):
+        model.train()
+        for bx, by in loader:
+            optimizer.zero_grad()
+            loss = criterion(model(bx).view(-1, 1), by)
+            loss.backward()
+            optimizer.step()
+        
+        model.eval()
+        with torch.no_grad():
+            val_loss = criterion(model(X_val).view(-1, 1), y_val).item()
+        
+        if val_loss < best_loss - 1e-6:
+            best_loss = val_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            wait = 0
+            if epoch % 20 == 0:
+                logging.info(f"[Epoch {epoch}] New best val_loss={val_loss:.4f}")
+        else:
+            wait += 1
+            if wait >= patience:
+                logging.info(f"Early stopping at epoch {epoch}")
+                break
+    
+    if best_state:
+        model.load_state_dict(best_state)
+    
+    return {"model": model, "best_params": {"epochs": epochs, "batch_size": batch_size, "learning_rate": learning_rate}}
+
+def _predict_dl(model: nn.Module, X: np.ndarray, batch_size: int = 64) -> np.ndarray:
+    """Predict with a PyTorch model."""
+    device = _get_device()
+    model = model.to(device).eval()
+    X_t = torch.tensor(X, dtype=torch.float32, device=device)
+    
+    preds = []
+    with torch.no_grad():
+        for i in range(0, len(X_t), batch_size):
+            out = model(X_t[i:i + batch_size]).cpu().numpy().flatten()
+            preds.append(out)
+    return np.concatenate(preds)
 
 
 def train_model(
@@ -138,45 +321,119 @@ def train_model(
     random_state: int = 42,
     cv_folds: int = 5,
     search_iters: int = 100,
+    use_hpo: bool = False,        
+    hpo_trials: int = 30,          
+    patience: int = 20,
 ) -> Tuple[object, TrainResult]:
     _ensure_dir(output_dir)
-    model = _initialize_model(model_type, random_state, cv_folds, search_iters)
-    logging.info("Training model.")
-    model.fit(X_train, y_train)
+    is_dl = _is_dl_model(model_type)
 
-    estimator = model.best_estimator_ if hasattr(model, "best_estimator_") else model
-    y_pred = estimator.predict(X_test)
+    model = _initialize_model(model_type, random_state, cv_folds, search_iters, input_dim=X_train.shape[1] if is_dl else None)
+    if isinstance(model, DLSearchConfig):
+        # ── DL Training ──
+        if use_hpo:
+            logging.info(f"Running optuna for {model_type} ({hpo_trials} evals)")
+            estimator, best_params = _run_optuna(
+                model, X_train.values, y_train.values, hpo_trials, random_state, patience
+            )
+        else:
+            logging.info(f"Training DL model: {model_type} (default params)")
+            nn_model = model.model_class(model.default_params)
+            result = _train_dl(
+                nn_model, X_train.values, y_train.values, random_state,
+                epochs=model.default_params["epochs"],
+                batch_size=model.default_params["batch_size"],
+                learning_rate=model.default_params["learning_rate"],
+                patience=patience,
+            )
+            estimator = result["model"]
+            best_params = result["best_params"]
+        
+        y_pred = _predict_dl(estimator, X_test.values)
+        model_path = os.path.join(output_dir, f"{model_type}_best_model.pth")
+        torch.save(estimator.state_dict(), model_path)
+    else:
+
+        logging.info(f"Training ML model: {model_type}")
+        model.fit(X_train, y_train)
+
+        estimator = model.best_estimator_ if hasattr(model, "best_estimator_") else model
+        y_pred = estimator.predict(X_test)
+        model_path = os.path.join(output_dir, f"{model_type}_best_model.pkl")
+        joblib.dump(estimator, model_path)
+        best_params = model.best_params_ if hasattr(model, "best_params_") else {}
+
     metrics = {
         "r2": float(r2_score(y_test, y_pred)),
         "mae": float(mean_absolute_error(y_test, y_pred)),
     }
 
-    model_path = os.path.join(output_dir, f"{model_type}_best_model.pkl")
     params_path = os.path.join(output_dir, f"{model_type}_best_params.pkl")
     metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")
-    joblib.dump(estimator, model_path)
-    if hasattr(model, "best_params_"):
-        joblib.dump(model.best_params_, params_path)
-    else:
-        joblib.dump({}, params_path)
+    joblib.dump(best_params, params_path)   
     pd.Series(metrics).to_json(metrics_path)
 
     return estimator, TrainResult(model_path, params_path, metrics_path)
 
+def load_model(model_path: str, model_type: str, input_dim: int = None) -> object:
+    is_dl = _is_dl_model(model_type)
+    
+    if is_dl:
+        if input_dim is None:
+            raise ValueError("input_dim required to load DL models")
+        
+        params_path = model_path.replace("_best_model.pth", "_best_params.pkl")
+        if os.path.exists(params_path):
+            saved_params = joblib.load(params_path)
+        else:
+            saved_params = {}
+
+        config = _initialize_model(model_type, random_state=42, cv_folds=5, 
+                                   search_iters=100, input_dim=input_dim)
+        
+        model_params = {**config.default_params, **saved_params}
+        
+        model = config.model_class(model_params)
+        model.load_state_dict(torch.load(model_path, weights_only=True))
+        model.eval()
+        return model
+    else:
+        return joblib.load(model_path)
 
 def run_explainability(
     estimator: object,
+    X_train: pd.DataFrame,
     X_test: pd.DataFrame,
     y_test: pd.Series,
     model_type: str,
     output_dir: str,
     background_samples: int = 100,
-) -> None:
+    ) -> None:
     _ensure_dir(output_dir)
+    is_dl = model_type.startswith("dl_")
 
-    result = permutation_importance(
-        estimator, X_test, y_test, n_repeats=10, random_state=42, n_jobs=-1
-    )
+    if is_dl:
+        class _SklearnWrapper:
+            def __init__(self, model):
+                self.model = model
+            def fit(self, X, y):
+                return self
+            def predict(self, X):
+                return _predict_dl(self.model, X.values if hasattr(X, 'values') else X)
+            def score(self, X, y):
+                y_pred = self.predict(X)
+                return r2_score(y, y_pred)
+        
+        wrapped_estimator = _SklearnWrapper(estimator)
+        result = permutation_importance(
+            wrapped_estimator, X_test, y_test, n_repeats=10, random_state=42, n_jobs=1
+        )
+    else:
+        result = permutation_importance(
+            estimator, X_test, y_test, n_repeats=10, random_state=42, n_jobs=-1
+        )
+
+
     importance_df = pd.DataFrame(
         {"feature": X_test.columns, "importance": result.importances_mean}
     ).sort_values(by="importance", ascending=False)
@@ -205,12 +462,26 @@ def run_explainability(
             shap_values = explainer.shap_values(X_explain)
             X_test = X_explain 
         
-        elif model_type in ["deep_learning", "neural_network"]:
-            # Assumes estimator has a callable predict method
-            background = shap.sample(X_test, min(background_samples, len(X_test)))
-            explainer = shap.DeepExplainer(estimator, background)
-            shap_values = explainer.shap_values(X_test.iloc[:100])
-            X_test = X_test.iloc[:100]
+        elif model_type.startswith("dl_"): 
+            device = _get_device()
+            estimator.to(device).eval()
+            
+            n_bg = min(background_samples, len(X_train))
+            n_ex = min(100, len(X_test))
+            
+            # Convert to numpy arrays (not tensors) for SHAP
+            X_bg_np = X_train.iloc[:n_bg].values.astype(np.float32)
+            X_ex_np = X_test.iloc[:n_ex].values.astype(np.float32)
+            
+            # Use KernelExplainer instead (more reliable for PyTorch)
+            def model_predict(X):
+                return _predict_dl(estimator, X)
+            
+            explainer = shap.KernelExplainer(model_predict, X_bg_np)
+            shap_values = explainer.shap_values(X_ex_np, nsamples=100)
+            
+            # Keep DataFrame for feature names in plot
+            X_test = X_test.iloc[:n_ex]
         
         else:
             background = shap.sample(X_test, min(background_samples, len(X_test)))

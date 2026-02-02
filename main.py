@@ -477,6 +477,8 @@ def run_node_train(context: dict) -> None:
     if not skip_quality_checks:
         data_preprocessing.check_data_leakage(X_train, X_test)
 
+    model_config = context.get("model_config", {})
+
     estimator, train_result = train_models.train_model(
         X_train,
         y_train,
@@ -487,6 +489,9 @@ def run_node_train(context: dict) -> None:
         random_state=random_state,
         cv_folds=cv_folds,
         search_iters=search_iters,
+    use_hpo=model_config.get("use_hpo", False),
+    hpo_trials=model_config.get("hpo_trials", 30),
+    patience=model_config.get("patience", 20),
     )
     context["trained_model_path"] = train_result.model_path
 
@@ -501,10 +506,14 @@ def run_node_explain(context: dict) -> None:
     model_type = context["model_type"]
     target_column = context["target_column"]
     paths = context["paths"]
+    is_dl = model_type.startswith("dl_")
 
     model_path = context.get("trained_model_path")
     if not model_path:
-        model_path = os.path.join(output_dir, f"{model_type}_best_model.pkl")
+        if is_dl:
+            model_path = os.path.join(output_dir, f"{model_type}_best_model.pth")
+        else:
+            model_path = os.path.join(output_dir, f"{model_type}_best_model.pkl")
 
     validate_contract(
         bind_output_path(EXPLAIN_INPUT_MODEL_CONTRACT, model_path),
@@ -528,11 +537,15 @@ def run_node_explain(context: dict) -> None:
     )
     test_size = context.get("preprocess_config", {}).get("test_size", 0.2)
     random_state = context.get("preprocess_config", {}).get("random_state", 42)
-    _, X_test, _, y_test = train_test_split(
+    X_train, X_test, _, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state
     )
-    estimator = joblib.load(model_path)
-    train_models.run_explainability(estimator, X_test, y_test, model_type, output_dir)
+    estimator = train_models.load_model(
+        model_path, 
+        model_type, 
+        input_dim=X_train.shape[1]
+    )
+    train_models.run_explainability(estimator, X_train, X_test, y_test, model_type, output_dir)
 
     validate_contract(
         bind_output_path(EXPLAIN_OUTPUT_CONTRACT, output_dir),
