@@ -45,3 +45,6 @@ model:
   use_hpo: true
   hpo_trials: 30
   patience: 20
+
+runs:
+  enabled: true

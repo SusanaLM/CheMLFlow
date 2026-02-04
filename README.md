@@ -18,17 +18,30 @@ Downstream steps enforce only the minimum required columns for their node (e.g.,
 
 git clone https://github.com/nijamudheen/CheMLFlow.git
 
-2. Create conda environment 
+2. Create conda environment (Python 3.12 recommended)
 
 cd CheMLFlow
 
-conda create -n chemlflow_env python=3.13
+conda create -n chemlflow_env_py312 python=3.12
 
-conda activate chemlflow_env
+conda activate chemlflow_env_py312
 
-3. Install dependencies
+3. Install dependencies (fast path on macOS)
 
-pip install -e .
+Install compiled deps from conda-forge first to avoid build issues:
+
+conda install -c conda-forge numpy scipy scikit-learn matplotlib seaborn lightgbm xgboost catboost rdkit shap numba llvmlite
+
+Then install Python deps from pip (without re-resolving compiled libs):
+
+pip install -r requirements.txt --no-deps
+
+Notes:
+- CatBoost is stable on Python 3.12. Python 3.13 often lacks wheels.
+- If you prefer `pip install -e .`, do it after the conda-forge installs above.
+
+Notes (macOS):
+- SHAP relies on numba/llvmlite. On macOS, conda-forge is the most reliable install path.
 
 4. Install RDKit from via conda or pip install
 
@@ -131,6 +144,43 @@ Notes:
 - Control dataset size via `qm9.max_rows` in `config/config.qm9.yaml`.
 - Model choice is controlled by `model.type` (e.g., `random_forest`, `svm`, `decision_tree`, `xgboost`, `ensemble`).
 
+### Pgp_Broccatelli (Local CSV → Morgan → CatBoost → AUROC)
+
+1. Activate your environment:
+
+conda activate chemlflow_env
+
+2. Run the pipeline:
+
+CHEMLFLOW_CONFIG=config/config.pgp.yaml python main.py
+
+3. Outputs:
+- Data artifacts: `data/pgp_broccatelli/`
+- Models + metrics: `runs/<timestamp>/` (or `run_dir` if configured)
+- Explainability PNGs (permutation importance + SHAP): `runs/<timestamp>/`
+
+Notes:
+- This config expects `local_data/pgp_broccatelli.csv`.
+- Export it once via:
+  - `python utilities/export_pgp_tdc.py local_data/pgp_broccatelli.csv`
+- If `pytdc` is not installed in the main env, run the export script in a small temporary env.
+- Split strategy defaults to `scaffold` (configurable in `split.strategy`).
+
+### ARA (Androgen Receptor Antagonist, AR.csv → Morgan → CatBoost → AUROC)
+
+1. Place the dataset at:
+
+`local_data/AR.csv`
+
+2. Run the pipeline:
+
+CHEMLFLOW_CONFIG=config/config.ara.yaml python main.py
+
+Notes:
+- Expected columns: `Smiles` and `Activity` (`active`/`inactive`).
+- Split strategy defaults to `scaffold` (configurable in `split.strategy`).
+- SOTA reference from literature: AUROC ≈ 0.945 (DeepAR).
+
 ### Common config knobs
 
 In `config/*.yaml`:
@@ -138,3 +188,7 @@ In `config/*.yaml`:
 - `model.cv_folds`, `model.search_iters`: CV + search effort
 - `preprocess.*`: preprocessing thresholds and split settings
 - `pipeline.nodes`: ordered list of steps (e.g., add/remove `explain`)
+- `task_type`: `regression` or `classification`
+- `split.*`: split strategy and sizes (e.g., `random`, `scaffold`, `tdc_scaffold`)
+- `featurize.*`: featurizer settings (e.g., Morgan radius/n_bits)
+- `runs.enabled`: use `runs/<timestamp>` instead of `results/`

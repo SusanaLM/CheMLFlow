@@ -210,6 +210,20 @@ FEATURIZE_RDKIT_LABELED_OUTPUT_LABELS_CONTRACT = ContractSpec(
     sample_model=DescriptorRow,
 )
 
+FEATURIZE_MORGAN_INPUT_CONTRACT = ContractSpec(
+    name="featurize_morgan_input",
+    description="Requires canonical_smiles; remove featurize.morgan if dataset lacks SMILES.",
+    required_columns=["canonical_smiles"],
+    sample_model=CuratedRow,
+)
+
+FEATURIZE_MORGAN_OUTPUT_CONTRACT = ContractSpec(
+    name="featurize_morgan_output",
+    description="Morgan fingerprint features generated from SMILES.",
+    min_columns=1,
+    sample_model=DescriptorRow,
+)
+
 PREPROCESS_FEATURES_INPUT_CONTRACT = ContractSpec(
     name="preprocess_features_input",
     description="Descriptor feature matrix for preprocessing.",
@@ -227,7 +241,7 @@ PREPROCESS_FEATURES_OUTPUT_CONTRACT = ContractSpec(
 PREPROCESS_LABELS_OUTPUT_CONTRACT = ContractSpec(
     name="preprocess_labels_output",
     description="Aligned labels for preprocessed features.",
-    required_any_of=[["pIC50", "gap", "standard_value"]],
+    required_any_of=[["pIC50", "gap", "standard_value", "label"]],
     sample_model=None,
 )
 
@@ -241,7 +255,7 @@ SELECT_FEATURES_INPUT_FEATURES_CONTRACT = ContractSpec(
 SELECT_FEATURES_INPUT_LABELS_CONTRACT = ContractSpec(
     name="select_features_input_labels",
     description="Labels for stable feature selection.",
-    required_any_of=[["pIC50", "gap", "standard_value"]],
+    required_any_of=[["pIC50", "gap", "standard_value", "label"]],
     sample_model=None,
 )
 

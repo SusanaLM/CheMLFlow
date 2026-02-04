@@ -1,0 +1,66 @@
+# Pgp_Broccatelli pipeline (TDC ADME classification)
+pipeline_type: adme
+task_type: classification
+pipeline:
+  nodes:
+    - get_data
+    - curate
+    - label.normalize
+    - split
+    - featurize.morgan
+    - train
+    - explain
+
+data_source: local_csv
+source:
+  path: local_data/pgp_broccatelli.csv
+
+base_dir: data/pgp_broccatelli
+thresholds:
+  active: 1000
+  inactive: 10000
+
+target_column: label
+
+curate:
+  properties: Activity
+  smiles_column: SMILES
+  dedupe_strategy: drop_conflicts
+  label_column: Activity
+  prefer_largest_fragment: true
+
+label:
+  source_column: Activity
+  target_column: label
+  positive:
+    - 1
+    - "1"
+    - active
+  negative:
+    - 0
+    - "0"
+    - inactive
+
+split:
+  strategy: scaffold
+  test_size: 0.2
+  val_size: 0.1
+  random_state: 42
+  stratify: true
+
+featurize:
+  radius: 2
+  n_bits: 2048
+
+model:
+  type: catboost_classifier
+  params:
+    depth: 6
+    learning_rate: 0.1
+    iterations: 500
+    loss_function: Logloss
+    eval_metric: AUC
+    verbose: true
+
+runs:
+  enabled: true
