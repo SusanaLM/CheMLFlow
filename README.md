@@ -26,35 +26,24 @@ conda create -n chemlflow_env_py312 python=3.12
 
 conda activate chemlflow_env_py312
 
-3. Install dependencies (fast path on macOS)
+3. Install dependencies (macOS‑reliable, single path)
 
-Install compiled deps from conda-forge first to avoid build issues:
+Install compiled deps from conda-forge first:
 
-conda install -c conda-forge numpy scipy scikit-learn matplotlib seaborn lightgbm xgboost catboost rdkit shap numba llvmlite
+conda install -c conda-forge numpy scipy scikit-learn matplotlib-base seaborn lightgbm xgboost catboost rdkit shap numba llvmlite
 
-Then install Python deps from pip (without re-resolving compiled libs):
+Then install Python deps from pip (don’t re-resolve compiled libs):
 
 pip install -r requirements.txt --no-deps
 
 Notes:
 - CatBoost is stable on Python 3.12. Python 3.13 often lacks wheels.
-- If you prefer `pip install -e .`, do it after the conda-forge installs above.
-
-Notes (macOS):
 - SHAP relies on numba/llvmlite. On macOS, conda-forge is the most reliable install path.
+- If `conda activate` fails, run `conda init zsh` once and restart your terminal (or `exec zsh`).
+- Run commands from the repo root (`CheMLFlow/`) so relative paths resolve.
+- If you see NumPy binary incompat errors after pip installs, reinstall numpy/numba/llvmlite/rdkit from conda-forge.
 
-4. Install RDKit from via conda or pip install
-
-Conda installation (recommended)
-
-conda install -c conda-forge rdkit
-
-pip installation (works for most applications)
-
-pip install rdkit 
-
-
-5. Install PyTorch and PyTorch Lightning with GPU support, and Optuna for hyperparameter optimization
+4. Optional: Install PyTorch + Optuna for DL models
 
 For Linux/Windows (check for cuda version available. for instance, cu121 here)
 
@@ -82,7 +71,7 @@ pip install pytorch-lightning
 
 pip install optuna
 
-6. Remove additional install files
+5. Remove additional install files
 
 make clean
 
@@ -100,6 +89,21 @@ These are not directly comparable (different datasets, descriptors, and splittin
 ## Running tests
 
 Scripts to run tests in CLI formats are in tests directory
+
+For E2E tests that spawn `main.py`, ensure the subprocess uses your conda Python:
+
+CHEMLFLOW_PYTHON=$(which python) pytest tests/test_e2e_pipelines.py -q
+
+## Running pipelines and finding results
+
+Run a pipeline by setting `CHEMLFLOW_CONFIG` and executing `main.py` from repo root:
+
+CHEMLFLOW_CONFIG=config/config.qm9.yaml python main.py
+
+Outputs:
+- If `runs.enabled: true`, results go to `runs/<timestamp>/`
+- Otherwise, results go to `results/`
+- Data artifacts always live under `data/<dataset>/`
 
 ## Quick start (pipelines)
 
