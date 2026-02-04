@@ -6,25 +6,24 @@ from typing import Tuple, Dict, Any, Callable
 import joblib
 import numpy as np
 import pandas as pd
-import shap
 import matplotlib.pyplot as plt
-
-import torch
-import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
 
 from sklearn.model_selection import RandomizedSearchCV, GridSearchCV
 from sklearn.ensemble import RandomForestRegressor, VotingRegressor
 from sklearn.svm import SVR
 from sklearn.tree import DecisionTreeRegressor
 from xgboost import XGBRegressor
-from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.metrics import (
+    r2_score,
+    mean_absolute_error,
+    roc_auc_score,
+    average_precision_score,
+    accuracy_score,
+    f1_score,
+    roc_curve,
+)
 from sklearn.inspection import permutation_importance
 from sklearn.model_selection import train_test_split
-
-import optuna
-
-from simpleregressionnn import SimpleRegressionNN
 
 
 @dataclass
@@ -42,6 +41,85 @@ class DLSearchConfig:
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
+
+def _safe_auc(y_true, y_score) -> float | None:
+    if len(np.unique(y_true)) < 2:
+        logging.warning("AUROC undefined for single-class test set.")
+        return None
+    return float(roc_auc_score(y_true, y_score))
+
+
+def _safe_auprc(y_true, y_score) -> float | None:
+    if len(np.unique(y_true)) < 2:
+        logging.warning("AUPRC undefined for single-class test set.")
+        return None
+    return float(average_precision_score(y_true, y_score))
+
+
+def _save_roc_curve(output_dir: str, model_type: str, y_true, y_score) -> str | None:
+    if len(np.unique(y_true)) < 2:
+        return None
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    plt.figure(figsize=(6, 5))
+    plt.plot(fpr, tpr, label="ROC")
+    plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.legend()
+    roc_path = os.path.join(output_dir, f"{model_type}_roc_curve.png")
+    plt.tight_layout()
+    plt.savefig(roc_path)
+    plt.close()
+    return roc_path
+
+
+def _ensure_binary_labels(series: pd.Series) -> pd.Series:
+    if isinstance(series, pd.DataFrame):
+        if series.shape[1] != 1:
+            raise ValueError("Expected a single label column for classification.")
+        series = series.iloc[:, 0]
+    values = series.dropna().unique()
+    if len(values) == 0:
+        raise ValueError("Empty label series for classification.")
+    if len(values) > 2:
+        raise ValueError(f"Expected binary labels; got {len(values)} classes.")
+
+    if set(values).issubset({0, 1}):
+        return series.astype(int)
+
+    def _coerce_numeric(val):
+        if isinstance(val, (int, float, np.generic)) and val in {0, 1}:
+            return int(val)
+        if isinstance(val, str):
+            token = val.strip().lower()
+            if token in {"0", "1"}:
+                return int(token)
+            try:
+                parsed = float(token)
+            except ValueError:
+                return None
+            if parsed in {0.0, 1.0}:
+                return int(parsed)
+        return None
+
+    def _normalize(v):
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
+    normalized = {_normalize(v) for v in values}
+    if normalized == {"active", "inactive"}:
+        mapping = {"active": 1, "inactive": 0}
+    elif normalized == {"inactive", "active"}:
+        mapping = {"active": 1, "inactive": 0}
+    else:
+        coerced = series.map(_coerce_numeric)
+        if coerced.notna().all():
+            return coerced.astype(int)
+        raise ValueError("Classification labels must be 0/1 or active/inactive; add label.normalize.")
+
+    return series.map(lambda v: mapping.get(_normalize(v)))
+
 def _run_optuna(
     config: DLSearchConfig,
     X_train: np.ndarray,
@@ -49,7 +127,11 @@ def _run_optuna(
     max_evals: int,
     random_state: int,
     patience: int,
-) -> Tuple[nn.Module, dict]:
+) -> Tuple[object, dict]:
+    try:
+        import optuna
+    except Exception as exc:
+        raise ImportError("optuna is required for DL hyperparameter search.") from exc
     
     X_tr, X_val, y_tr, y_val = train_test_split(
         X_train, y_train, test_size=0.15, random_state=random_state
@@ -213,6 +295,7 @@ def _initialize_model(
     if model_type == "dl_simple":
         if input_dim is None:
             raise ValueError("input_dim required for DL models")
+        from simpleregressionnn import SimpleRegressionNN
         return DLSearchConfig(
             model_class=lambda params: SimpleRegressionNN(
                 input_dim=input_dim,
@@ -234,12 +317,13 @@ def _initialize_model(
     raise ValueError(f"Unsupported model type: {model_type}")
 
 # DL training helper functions
-def _get_device() -> torch.device:
+def _get_device():
+    import torch
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def _is_dl_model(model_type: str) -> bool:
     return model_type.startswith("dl_")
 def _train_dl(
-    model: nn.Module,
+    model,
     X_train: np.ndarray,
     y_train: np.ndarray,
     random_state: int,
@@ -249,6 +333,9 @@ def _train_dl(
     patience: int,
     ) -> Dict[str, Any]:
     """Train a PyTorch model. Returns dict with model and best_params."""
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import TensorDataset, DataLoader
     device = _get_device()
     model = model.to(device)
     
@@ -297,8 +384,9 @@ def _train_dl(
     
     return {"model": model, "best_params": {"epochs": epochs, "batch_size": batch_size, "learning_rate": learning_rate}}
 
-def _predict_dl(model: nn.Module, X: np.ndarray, batch_size: int = 64) -> np.ndarray:
+def _predict_dl(model, X: np.ndarray, batch_size: int = 64) -> np.ndarray:
     """Predict with a PyTorch model."""
+    import torch
     device = _get_device()
     model = model.to(device).eval()
     X_t = torch.tensor(X, dtype=torch.float32, device=device)
@@ -324,11 +412,69 @@ def train_model(
     use_hpo: bool = False,        
     hpo_trials: int = 30,          
     patience: int = 20,
+    task_type: str = "regression",
+    model_config: Dict[str, Any] | None = None,
+    X_val: pd.DataFrame | None = None,
+    y_val: pd.Series | None = None,
 ) -> Tuple[object, TrainResult]:
     _ensure_dir(output_dir)
     is_dl = _is_dl_model(model_type)
+    model_config = model_config or {}
 
-    model = _initialize_model(model_type, random_state, cv_folds, search_iters, input_dim=X_train.shape[1] if is_dl else None)
+    if task_type == "classification" and model_type == "catboost_classifier":
+        from catboost import CatBoostClassifier
+
+        y_train = _ensure_binary_labels(y_train)
+        y_test = _ensure_binary_labels(y_test)
+        if y_val is not None:
+            y_val = _ensure_binary_labels(y_val)
+
+        params = {
+            "loss_function": "Logloss",
+            "eval_metric": "AUC",
+            "random_seed": random_state,
+            "verbose": False,
+        }
+        params.update(model_config.get("params", {}))
+        estimator = CatBoostClassifier(**params)
+        eval_set = None
+        if X_val is not None and y_val is not None and len(y_val) > 0:
+            eval_set = (X_val, y_val)
+        fit_kwargs = {}
+        if eval_set:
+            fit_kwargs["eval_set"] = eval_set
+            fit_kwargs["use_best_model"] = True
+        estimator.fit(X_train, y_train, **fit_kwargs)
+        y_pred_proba = estimator.predict_proba(X_test)[:, 1]
+        y_pred = estimator.predict(X_test)
+        model_path = os.path.join(output_dir, f"{model_type}_best_model.cbm")
+        estimator.save_model(model_path)
+        best_params = estimator.get_params()
+        metrics = {
+            "auc": _safe_auc(y_test, y_pred_proba),
+            "auprc": _safe_auprc(y_test, y_pred_proba),
+            "accuracy": float(accuracy_score(y_test, y_pred)),
+            "f1": float(f1_score(y_test, y_pred)),
+        }
+        roc_path = _save_roc_curve(output_dir, model_type, y_test, y_pred_proba)
+        if roc_path:
+            metrics["roc_curve_path"] = roc_path
+        params_path = os.path.join(output_dir, f"{model_type}_best_params.pkl")
+        metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")
+        joblib.dump(best_params, params_path)
+        pd.Series(metrics).to_json(metrics_path)
+        return estimator, TrainResult(model_path, params_path, metrics_path)
+
+    if task_type == "classification":
+        raise ValueError(f"Unsupported classification model type: {model_type}")
+
+    model = _initialize_model(
+        model_type,
+        random_state,
+        cv_folds,
+        search_iters,
+        input_dim=X_train.shape[1] if is_dl else None,
+    )
     if isinstance(model, DLSearchConfig):
         # ── DL Training ──
         if use_hpo:
@@ -350,6 +496,7 @@ def train_model(
             best_params = result["best_params"]
         
         y_pred = _predict_dl(estimator, X_test.values)
+        import torch
         model_path = os.path.join(output_dir, f"{model_type}_best_model.pth")
         torch.save(estimator.state_dict(), model_path)
     else:
@@ -379,6 +526,7 @@ def load_model(model_path: str, model_type: str, input_dim: int = None) -> objec
     is_dl = _is_dl_model(model_type)
     
     if is_dl:
+        import torch
         if input_dim is None:
             raise ValueError("input_dim required to load DL models")
         
@@ -397,8 +545,13 @@ def load_model(model_path: str, model_type: str, input_dim: int = None) -> objec
         model.load_state_dict(torch.load(model_path, weights_only=True))
         model.eval()
         return model
-    else:
-        return joblib.load(model_path)
+    if model_type == "catboost_classifier":
+        from catboost import CatBoostClassifier
+
+        model = CatBoostClassifier()
+        model.load_model(model_path)
+        return model
+    return joblib.load(model_path)
 
 def run_explainability(
     estimator: object,
@@ -412,7 +565,14 @@ def run_explainability(
     _ensure_dir(output_dir)
     is_dl = model_type.startswith("dl_")
 
+    try:
+        import shap
+    except Exception as exc:
+        logging.warning("SHAP is not available; skipping SHAP explainability. %s", exc)
+        return
+
     if is_dl:
+        import torch
         class _SklearnWrapper:
             def __init__(self, model):
                 self.model = model
@@ -447,7 +607,7 @@ def run_explainability(
     plt.close()
 
     try:
-        if model_type in ["random_forest", "decision_tree", "xgboost"]:
+        if model_type in ["random_forest", "decision_tree", "xgboost", "catboost_classifier"]:
             explainer = shap.TreeExplainer(estimator)
             shap_values = explainer.shap_values(X_test)
         

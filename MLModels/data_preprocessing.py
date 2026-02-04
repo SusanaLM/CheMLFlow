@@ -227,6 +227,8 @@ def load_features_labels(
             raise ValueError("The number of samples in the features file and the labels file do not match.")
 
         target_col, _ = _find_target_column(y_df.columns, target_column)
+        if target_col in X.columns:
+            X = X.drop(columns=[target_col])
         y = select_target_series(y_df, target_column)
         X.replace([np.inf, -np.inf], np.nan, inplace=True)
         y.replace([np.inf, -np.inf], np.nan, inplace=True)

@@ -39,8 +39,8 @@ coverage.xml
 # Project outputs
 data/
 results/
+runs/
 urease/
+local_data/
 
 .main.py
-
-

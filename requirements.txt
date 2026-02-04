@@ -1,5 +1,8 @@
-numpy>=2.2.5
+numpy>=1.26,<2
 pydantic>=2.9.0
+pydantic-core>=2.12.5
+annotated-types>=0.6.0
+typing-inspection>=0.4.2
 PyYAML>=6.0.1
 pandas>=2.2.3
 scipy>=1.15.2
@@ -7,6 +10,7 @@ scikit-learn>=1.6.1
 matplotlib>=3.10.1
 seaborn>=0.13.2
 chembl-webresource-client>=0.10.9
+easydict>=1.13
 Pillow>=11.2.1
 lazypredict>=0.2.16
 click>=8.1.8
@@ -14,5 +18,4 @@ lightgbm>=4.6.0
 tqdm>=4.67.1
 xgboost>=3.0.0
 shap>=0.47.2
-
-
+catboost>=1.2.7

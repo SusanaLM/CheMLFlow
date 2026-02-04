@@ -2,12 +2,15 @@ import argparse
 import json
 import logging
 import os
-import shutil
-import subprocess
 import sys
-import urllib.request
 
 import yaml
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from GetData.data_sources import get_data
 
 
 def load_config(path: str) -> dict:
@@ -15,66 +18,6 @@ def load_config(path: str) -> dict:
         if path.endswith((".yaml", ".yml")):
             return yaml.safe_load(f)
         return json.load(f)
-
-
-def fetch_chembl(output_file: str, source: dict) -> int:
-    target_name = source.get("target_name")
-    if not target_name:
-        logging.error("Missing source.target_name for data_source=chembl")
-        return 1
-
-    script_path = os.path.join("GetData", "get_ChEMBL_target_full.py")
-    result = subprocess.run(
-        [sys.executable, script_path, target_name, output_file],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logging.error("ChEMBL fetch failed. Please retry later or use local cached data.")
-        return result.returncode
-    return 0
-
-
-def fetch_local_csv(output_file: str, source: dict) -> int:
-    input_path = source.get("path")
-    if not input_path:
-        logging.error("Missing source.path for data_source=local_csv")
-        return 1
-
-    if not os.path.exists(input_path):
-        logging.error(f"Local CSV not found: {input_path}")
-        return 1
-
-    shutil.copyfile(input_path, output_file)
-    return 0
-
-
-def fetch_http_csv(output_file: str, source: dict) -> int:
-    url = source.get("url")
-    if not url:
-        logging.error("Missing source.url for data_source=http_csv")
-        return 1
-
-    try:
-        with urllib.request.urlopen(url) as resp, open(output_file, "wb") as out:
-            out.write(resp.read())
-    except Exception as exc:
-        logging.error(f"Failed to download CSV from {url}: {exc}")
-        return 1
-
-    return 0
-
-
-def get_data(output_file: str, data_source: str, source: dict) -> int:
-    if data_source == "chembl":
-        return fetch_chembl(output_file, source)
-    if data_source == "local_csv":
-        return fetch_local_csv(output_file, source)
-    if data_source == "http_csv":
-        return fetch_http_csv(output_file, source)
-
-    logging.error(f"Unknown data_source: {data_source}")
-    return 1
 
 
 def main() -> int:

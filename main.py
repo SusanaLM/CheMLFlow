@@ -1,9 +1,11 @@
 # an example workflow that uses ChemBL bioactivty data
 import csv
 import json
+import logging
 import os
 import subprocess
 import sys
+from datetime import datetime
 
 import yaml
 import pandas as pd
@@ -24,12 +26,12 @@ from contracts import (
     FEATURIZE_RDKIT_OUTPUT_CONTRACT,
     FEATURIZE_RDKIT_LABELED_INPUT_CONTRACT,
     FEATURIZE_RDKIT_LABELED_OUTPUT_LABELS_CONTRACT,
+    FEATURIZE_MORGAN_INPUT_CONTRACT,
+    FEATURIZE_MORGAN_OUTPUT_CONTRACT,
     PREPROCESS_FEATURES_INPUT_CONTRACT,
     PREPROCESS_FEATURES_OUTPUT_CONTRACT,
-    PREPROCESS_LABELS_OUTPUT_CONTRACT,
     PREPROCESS_ARTIFACTS_CONTRACT,
     SELECT_FEATURES_INPUT_FEATURES_CONTRACT,
-    SELECT_FEATURES_INPUT_LABELS_CONTRACT,
     SELECT_FEATURES_OUTPUT_CONTRACT,
     SELECT_FEATURES_LIST_CONTRACT,
     EXPLAIN_INPUT_MODEL_CONTRACT,
@@ -56,6 +58,7 @@ from contracts import (
 )
 from MLModels import data_preprocessing
 from MLModels import train_models
+from utilities import splitters
 
 def build_paths(base_dir: str) -> dict[str, str]:
     return {
@@ -63,17 +66,22 @@ def build_paths(base_dir: str) -> dict[str, str]:
         "raw_sample": os.path.join(base_dir, "raw_sample.csv"),
         "preprocessed": os.path.join(base_dir, "preprocessed.csv"),
         "curated": os.path.join(base_dir, "curated.csv"),
+        "curated_labeled": os.path.join(base_dir, "curated_labeled.csv"),
         "curated_smiles": os.path.join(base_dir, "curated_smiles.csv"),
         "lipinski": os.path.join(base_dir, "lipinski_results.csv"),
         "pic50_3class": os.path.join(base_dir, "bioactivity_3class_pIC50.csv"),
         "pic50_2class": os.path.join(base_dir, "bioactivity_2class_pIC50.csv"),
         "rdkit_descriptors": os.path.join(base_dir, "rdkit_descriptors.csv"),
         "rdkit_labeled": os.path.join(base_dir, "rdkit_descriptors_labeled.csv"),
+        "morgan_fingerprints": os.path.join(base_dir, "morgan_fingerprints.csv"),
+        "morgan_labeled": os.path.join(base_dir, "morgan_fingerprints_labeled.csv"),
+        "morgan_meta": os.path.join(base_dir, "morgan_meta.json"),
         "preprocessed_features": os.path.join(base_dir, "preprocessed_features.csv"),
         "preprocessed_labels": os.path.join(base_dir, "preprocessed_labels.csv"),
         "selected_features": os.path.join(base_dir, "selected_features.csv"),
         "selected_features_list": os.path.join(base_dir, "selected_features.txt"),
         "preprocess_artifacts": os.path.join(base_dir, "preprocess_artifacts.joblib"),
+        "split_dir": os.path.join(base_dir, "splits"),
     }
 
 
@@ -94,6 +102,19 @@ def sample_csv(input_path: str, output_path: str, max_rows: int) -> None:
             writer.writerow(row)
             if idx >= max_rows:
                 break
+
+
+def resolve_run_dir(config: dict) -> str:
+    run_dir = config.get("run_dir")
+    if run_dir:
+        return run_dir
+    runs = config.get("runs", {})
+    if runs.get("enabled"):
+        run_id = runs.get("id")
+        if not run_id:
+            run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        return os.path.join("runs", run_id)
+    return "results"
 
 
 def run_node_get_data(context: dict) -> None:
@@ -126,7 +147,10 @@ def run_node_curate(context: dict) -> None:
     target_column = context["target_column"]
     properties = curate_config.get("properties")
     if not properties:
-        properties = target_column if pipeline_type == "qm9" else "standard_value"
+        if pipeline_type == "qm9" or context.get("task_type") == "classification":
+            properties = target_column
+        else:
+            properties = "standard_value"
 
     script_path = os.path.join("utilities", "prepareActivityData.py")
     preprocessed_file = context["paths"]["preprocessed"]
@@ -146,6 +170,24 @@ def run_node_curate(context: dict) -> None:
         "--properties",
         properties,
     ]
+    smiles_column = curate_config.get("smiles_column")
+    if smiles_column:
+        cmd.extend(["--smiles_column", smiles_column])
+    dedupe_strategy = curate_config.get("dedupe_strategy")
+    if dedupe_strategy:
+        cmd.extend(["--dedupe_strategy", dedupe_strategy])
+    label_column = curate_config.get("label_column")
+    if not label_column and context.get("task_type") == "classification":
+        label_column = context["target_column"]
+    if label_column:
+        cmd.extend(["--label_column", label_column])
+    if curate_config.get("require_neutral_charge"):
+        cmd.append("--require_neutral_charge")
+    if "prefer_largest_fragment" in curate_config:
+        if curate_config.get("prefer_largest_fragment"):
+            cmd.append("--prefer_largest_fragment")
+        else:
+            cmd.append("--no_prefer_largest_fragment")
     if context["keep_all_columns"]:
         cmd.append("--keep_all_columns")
     subprocess.run(cmd)
@@ -188,6 +230,7 @@ def run_node_label_ic50(context: dict) -> None:
         bind_output_path(LABEL_IC50_OUTPUT_2CLASS_CONTRACT, output_file_2class),
         warn_only=True,
     )
+    context["labels_matrix"] = output_file_3class
 
 
 def run_node_analyze_stats(context: dict) -> None:
@@ -243,15 +286,19 @@ def run_node_featurize_rdkit(context: dict) -> None:
         bind_output_path(FEATURIZE_RDKIT_OUTPUT_CONTRACT, output_file),
         warn_only=True,
     )
+    context["feature_matrix"] = output_file
 
 
 def run_node_featurize_rdkit_labeled(context: dict) -> None:
     validate_contract(
-        bind_output_path(FEATURIZE_RDKIT_LABELED_INPUT_CONTRACT, context["paths"]["curated"]),
+        bind_output_path(
+            FEATURIZE_RDKIT_LABELED_INPUT_CONTRACT,
+            context.get("curated_path", context["paths"]["curated"]),
+        ),
         warn_only=False,
     )
     script_path = os.path.join("GenDescriptors", "RDKit_descriptors_labeled.py")
-    input_file = context["paths"]["curated"]
+    input_file = context.get("curated_path", context["paths"]["curated"])
     output_file = context["paths"]["rdkit_descriptors"]
     labeled_output_file = context["paths"]["rdkit_labeled"]
     subprocess.run(
@@ -270,9 +317,194 @@ def run_node_featurize_rdkit_labeled(context: dict) -> None:
         bind_output_path(FEATURIZE_RDKIT_LABELED_OUTPUT_LABELS_CONTRACT, labeled_output_file),
         warn_only=True,
     )
+    context["feature_matrix"] = labeled_output_file
+    context["labels_matrix"] = labeled_output_file
+
+
+def run_node_featurize_morgan(context: dict) -> None:
+    validate_contract(
+        bind_output_path(
+            FEATURIZE_MORGAN_INPUT_CONTRACT,
+            context.get("curated_path", context["paths"]["curated"]),
+        ),
+        warn_only=False,
+    )
+    script_path = os.path.join("GenDescriptors", "Morgan_fingerprints.py")
+    input_file = context.get("curated_path", context["paths"]["curated"])
+    output_file = context["paths"]["morgan_fingerprints"]
+    labeled_output = context["paths"]["morgan_labeled"]
+    featurize_config = context.get("featurize_config", {})
+    radius = featurize_config.get("radius", 2)
+    n_bits = featurize_config.get("n_bits", 2048)
+    cmd = [
+        sys.executable,
+        script_path,
+        input_file,
+        output_file,
+        "--radius",
+        str(radius),
+        "--n_bits",
+        str(n_bits),
+        "--labeled-output-file",
+        labeled_output,
+        "--property-columns",
+        context["target_column"],
+    ]
+    subprocess.run(cmd)
+    with open(context["paths"]["morgan_meta"], "w", encoding="utf-8") as meta_out:
+        json.dump(
+            {"radius": radius, "n_bits": n_bits},
+            meta_out,
+            indent=2,
+        )
+    validate_contract(
+        bind_output_path(FEATURIZE_MORGAN_OUTPUT_CONTRACT, output_file),
+        warn_only=True,
+    )
+    validate_contract(
+        make_target_column_contract(
+            name="featurize_morgan_labeled_output",
+            target_column=context["target_column"],
+            output_path=labeled_output,
+        ),
+        warn_only=True,
+    )
+    context["feature_matrix"] = labeled_output
+    context["labels_matrix"] = labeled_output
+
+
+def run_node_label_normalize(context: dict) -> None:
+    label_config = context.get("label_config", {})
+    source_column = label_config.get("source_column")
+    target_column = label_config.get("target_column", context["target_column"])
+    positive = label_config.get("positive")
+    negative = label_config.get("negative")
+    drop_unmapped = label_config.get("drop_unmapped", True)
+
+    def _ensure_list(value):
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        if isinstance(value, str):
+            return [v.strip() for v in value.split(",") if v.strip()]
+        return [str(value)]
+
+    positive_list = _ensure_list(positive)
+    negative_list = _ensure_list(negative)
+
+    if not source_column or not positive_list or not negative_list:
+        raise ValueError("label.normalize requires source_column, positive, and negative label lists.")
+
+    script_path = os.path.join("utilities", "label_normalize.py")
+    input_file = context.get("curated_path", context["paths"]["curated"])
+    output_file = context["paths"]["curated_labeled"]
+    cmd = [
+        sys.executable,
+        script_path,
+        input_file,
+        output_file,
+        "--source-column",
+        source_column,
+        "--target-column",
+        target_column,
+        "--positive",
+        ",".join(positive_list),
+        "--negative",
+        ",".join(negative_list),
+    ]
+    if drop_unmapped:
+        cmd.append("--drop-unmapped")
+    subprocess.run(cmd, check=True)
+    context["curated_path"] = output_file
+    context["target_column"] = target_column
+
+
+def run_node_split(context: dict) -> None:
+    split_config = context.get("split_config", {})
+    strategy = split_config.get("strategy", "random")
+    test_size = split_config.get("test_size", 0.2)
+    val_size = split_config.get("val_size", 0.1)
+    random_state = split_config.get("random_state", 42)
+    stratify = split_config.get("stratify", False)
+    stratify_column = split_config.get("stratify_column")
+    min_coverage = split_config.get("min_coverage")
+    allow_missing_val = split_config.get("allow_missing_val", True)
+    require_disjoint = split_config.get("require_disjoint", False)
+    if stratify and not stratify_column:
+        stratify_column = context.get("target_column")
+
+    curated_path = context.get("curated_path", context["paths"]["curated"])
+    curated_df = pd.read_csv(curated_path)
+    tdc_group = context.get("source", {}).get("group")
+    tdc_name = context.get("source", {}).get("name")
+    split_indices = splitters.build_split_indices(
+        strategy=strategy,
+        curated_df=curated_df,
+        test_size=test_size,
+        val_size=val_size,
+        random_state=random_state,
+        stratify_column=stratify_column,
+        tdc_group=tdc_group,
+        tdc_name=tdc_name,
+    )
+    normalized = {}
+    for key, value in split_indices.items():
+        lowered = key.lower()
+        if lowered in {"valid", "val", "validation"}:
+            normalized["val"] = value
+        elif lowered in {"test"}:
+            normalized["test"] = value
+        elif lowered in {"train"}:
+            normalized["train"] = value
+        else:
+            normalized[key] = value
+    normalized.setdefault("val", [])
+    os.makedirs(context["paths"]["split_dir"], exist_ok=True)
+    split_path = os.path.join(context["paths"]["split_dir"], f"{strategy}.json")
+    splitters.save_split_indices(normalized, split_path)
+    curated_count = len(curated_df)
+    train_set = set(normalized.get("train", []))
+    val_set = set(normalized.get("val", []))
+    test_set = set(normalized.get("test", []))
+    all_indices = set(train_set | val_set | test_set)
+    if not all_indices:
+        raise ValueError("Split mapping produced zero indices.")
+    if max(all_indices) >= curated_count:
+        raise ValueError("Split indices exceed curated dataset size.")
+    if min_coverage is not None:
+        coverage = len(all_indices) / max(1, curated_count)
+        if coverage < min_coverage:
+            raise ValueError(
+                f"Split coverage {coverage:.2%} below min_coverage={min_coverage:.2%}. "
+                "Check split mapping or strategy."
+            )
+    overlap = (train_set & val_set) | (train_set & test_set) | (val_set & test_set)
+    if overlap:
+        message = f"Split overlap detected across train/val/test: {len(overlap)} shared indices."
+        if require_disjoint:
+            raise ValueError(message)
+        logging.warning(message)
+    if not normalized.get("train"):
+        raise ValueError("Split mapping produced empty train split.")
+    if not normalized.get("test"):
+        raise ValueError("Split mapping produced empty test split.")
+    if val_size > 0 and not normalized.get("val"):
+        if strategy.startswith("tdc") and allow_missing_val:
+            pass
+        else:
+            raise ValueError("Split mapping produced empty validation split.")
+    context["split_indices"] = normalized
+    context["split_path"] = split_path
 
 
 def _resolve_feature_inputs(context: dict) -> tuple[str, str]:
+    feature_matrix = context.get("feature_matrix")
+    labels_matrix = context.get("labels_matrix")
+    if feature_matrix and labels_matrix:
+        return feature_matrix, labels_matrix
+    if feature_matrix and not labels_matrix:
+        return feature_matrix, context["paths"]["curated"]
     pipeline_type = context["pipeline_type"]
     if pipeline_type == "qm9":
         return context["paths"]["rdkit_labeled"], context["paths"]["rdkit_labeled"]
@@ -357,7 +589,13 @@ def run_node_preprocess_features(context: dict) -> None:
         warn_only=True,
     )
     validate_contract(
-        bind_output_path(PREPROCESS_LABELS_OUTPUT_CONTRACT, preprocessed_labels),
+        bind_output_path(
+            make_target_column_contract(
+                name="preprocess_labels_output_dynamic",
+                target_column=context["target_column"],
+            ),
+            preprocessed_labels,
+        ),
         warn_only=True,
     )
     validate_contract(
@@ -421,10 +659,11 @@ def run_node_select_features(context: dict) -> None:
 
 def run_node_train(context: dict) -> None:
     pipeline_type = context["pipeline_type"]
-    output_dir = "results"
+    output_dir = context["run_dir"]
     model_type = context["model_type"]
     target_column = context["target_column"]
     paths = context["paths"]
+    task_type = context.get("task_type", "regression")
 
     use_selected = context.get("selected_ready", False)
     use_preprocessed = context.get("preprocessed_ready", False)
@@ -437,6 +676,10 @@ def run_node_train(context: dict) -> None:
     if pipeline_type == "qm9":
         features_file = paths["rdkit_labeled"]
         labels_file = paths["rdkit_labeled"]
+    if context.get("feature_matrix"):
+        features_file = context["feature_matrix"]
+    if context.get("labels_matrix"):
+        labels_file = context["labels_matrix"]
     if use_selected:
         features_file = paths["selected_features"]
     elif use_preprocessed:
@@ -464,6 +707,8 @@ def run_node_train(context: dict) -> None:
     X, y = data_preprocessing.load_features_labels(
         features_file, labels_file, target_column
     )
+    if isinstance(y, pd.DataFrame):
+        y = data_preprocessing.select_target_series(y, target_column)
     if not skip_quality_checks:
         data_preprocessing.verify_data_quality(X, y)
 
@@ -471,9 +716,40 @@ def run_node_train(context: dict) -> None:
     random_state = context.get("preprocess_config", {}).get("random_state", 42)
     cv_folds = context.get("model_config", {}).get("cv_folds", 5)
     search_iters = context.get("model_config", {}).get("search_iters", 100)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state
-    )
+    split_indices = context.get("split_indices")
+    X_val = None
+    y_val = None
+    if split_indices:
+        train_idx = split_indices.get("train", [])
+        val_idx = split_indices.get("val", [])
+        test_idx = split_indices.get("test", [])
+        if not test_idx and val_idx:
+            test_idx = val_idx
+            val_idx = []
+        available = set(X.index)
+        train_idx = [i for i in train_idx if i in available]
+        test_idx = [i for i in test_idx if i in available]
+        val_idx = [i for i in val_idx if i in available]
+        if not train_idx or not test_idx:
+            raise ValueError("Split indices did not align with cleaned features/labels.")
+        X_train = X.loc[train_idx]
+        y_train = y.loc[train_idx]
+        X_test = X.loc[test_idx]
+        y_test = y.loc[test_idx]
+        if val_idx:
+            X_val = X.loc[val_idx]
+            y_val = y.loc[val_idx]
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=random_state
+        )
+
+    if isinstance(y_train, pd.DataFrame):
+        y_train = y_train.iloc[:, 0]
+    if isinstance(y_test, pd.DataFrame):
+        y_test = y_test.iloc[:, 0]
+    if isinstance(y_val, pd.DataFrame):
+        y_val = y_val.iloc[:, 0]
     if not skip_quality_checks:
         data_preprocessing.check_data_leakage(X_train, X_test)
 
@@ -489,9 +765,13 @@ def run_node_train(context: dict) -> None:
         random_state=random_state,
         cv_folds=cv_folds,
         search_iters=search_iters,
-    use_hpo=model_config.get("use_hpo", False),
-    hpo_trials=model_config.get("hpo_trials", 30),
-    patience=model_config.get("patience", 20),
+        use_hpo=model_config.get("use_hpo", False),
+        hpo_trials=model_config.get("hpo_trials", 30),
+        patience=model_config.get("patience", 20),
+        task_type=task_type,
+        model_config=model_config,
+        X_val=X_val,
+        y_val=y_val,
     )
     context["trained_model_path"] = train_result.model_path
 
@@ -502,7 +782,7 @@ def run_node_train(context: dict) -> None:
 
 
 def run_node_explain(context: dict) -> None:
-    output_dir = "results"
+    output_dir = context["run_dir"]
     model_type = context["model_type"]
     target_column = context["target_column"]
     paths = context["paths"]
@@ -512,6 +792,8 @@ def run_node_explain(context: dict) -> None:
     if not model_path:
         if is_dl:
             model_path = os.path.join(output_dir, f"{model_type}_best_model.pth")
+        elif model_type == "catboost_classifier":
+            model_path = os.path.join(output_dir, f"{model_type}_best_model.cbm")
         else:
             model_path = os.path.join(output_dir, f"{model_type}_best_model.pkl")
 
@@ -520,8 +802,8 @@ def run_node_explain(context: dict) -> None:
         warn_only=False,
     )
 
-    features_file = paths["rdkit_descriptors"]
-    labels_file = paths["pic50_3class"]
+    features_file = context.get("feature_matrix", paths["rdkit_descriptors"])
+    labels_file = context.get("labels_matrix", paths["pic50_3class"])
     if context["pipeline_type"] == "qm9":
         features_file = paths["rdkit_labeled"]
         labels_file = paths["rdkit_labeled"]
@@ -535,11 +817,26 @@ def run_node_explain(context: dict) -> None:
     X, y = data_preprocessing.load_features_labels(
         features_file, labels_file, target_column
     )
-    test_size = context.get("preprocess_config", {}).get("test_size", 0.2)
-    random_state = context.get("preprocess_config", {}).get("random_state", 42)
-    X_train, X_test, _, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state
-    )
+    split_indices = context.get("split_indices")
+    if split_indices:
+        train_idx = split_indices.get("train", [])
+        test_idx = split_indices.get("test", [])
+        if not test_idx:
+            test_idx = split_indices.get("val", [])
+        available = set(X.index)
+        train_idx = [i for i in train_idx if i in available]
+        test_idx = [i for i in test_idx if i in available]
+        if not train_idx or not test_idx:
+            raise ValueError("Split indices did not align with cleaned features/labels.")
+        X_train = X.loc[train_idx]
+        X_test = X.loc[test_idx]
+        y_test = y.loc[test_idx]
+    else:
+        test_size = context.get("preprocess_config", {}).get("test_size", 0.2)
+        random_state = context.get("preprocess_config", {}).get("random_state", 42)
+        X_train, X_test, _, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=random_state
+        )
     estimator = train_models.load_model(
         model_path, 
         model_type, 
@@ -556,12 +853,15 @@ def run_node_explain(context: dict) -> None:
 NODE_REGISTRY = {
     "get_data": run_node_get_data,
     "curate": run_node_curate,
+    "label.normalize": run_node_label_normalize,
+    "split": run_node_split,
     "featurize.lipinski": run_node_featurize_lipinski,
     "label.ic50": run_node_label_ic50,
     "analyze.stats": run_node_analyze_stats,
     "analyze.eda": run_node_analyze_eda,
     "featurize.rdkit": run_node_featurize_rdkit,
     "featurize.rdkit_labeled": run_node_featurize_rdkit_labeled,
+    "featurize.morgan": run_node_featurize_morgan,
     "preprocess.features": run_node_preprocess_features,
     "select.features": run_node_select_features,
     "train": run_node_train,
@@ -578,12 +878,15 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
     pipeline_type = config.get("pipeline_type", "chembl")
     base_dir = config["base_dir"]
     os.makedirs(base_dir, exist_ok=True)
+    run_dir = resolve_run_dir(config)
+    os.makedirs(run_dir, exist_ok=True)
 
     context = {
         "config_path": config_path,
         "base_dir": base_dir,
         "paths": build_paths(base_dir),
         "pipeline_type": pipeline_type,
+        "task_type": config.get("task_type", "regression"),
         "active_threshold": config["thresholds"]["active"],
         "inactive_threshold": config["thresholds"]["inactive"],
         "target_column": config.get("target_column", "pIC50"),
@@ -591,11 +894,19 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
         "qm9_config": config.get("qm9", {}),
         "curate_config": config.get("curate", {}),
         "preprocess_config": config.get("preprocess", {}),
+        "split_config": config.get("split", {}),
+        "featurize_config": config.get("featurize", {}),
+        "label_config": config.get("label", {}),
         "model_config": config.get("model", {}),
         "keep_all_columns": config.get("preprocess", {}).get(
             "keep_all_columns", config.get("keep_all_columns", False)
         ),
+        "source": config.get("source", {}),
+        "run_dir": run_dir,
     }
+
+    with open(os.path.join(run_dir, "run_config.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f, sort_keys=False)
 
     for node_name in nodes:
         node_fn = NODE_REGISTRY.get(node_name)

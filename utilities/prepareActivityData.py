@@ -12,7 +12,13 @@ class DataPreparer:
         self.keep_all_columns = keep_all_columns
         logging.info(f"Initialized DataPreparer with raw data file: {self.raw_data_file}")
 
-    def handle_missing_data_and_duplicates(self, smiles_column=None, properties_of_interest=None):
+    def handle_missing_data_and_duplicates(
+        self,
+        smiles_column=None,
+        properties_of_interest=None,
+        dedupe_strategy: str | None = None,
+        label_column: str | None = None,
+    ):
         """Load data, identify the SMILES column, handle missing values, and remove duplicates.
         - Auto-detect the SMILES column if not provided (try 'canonical_smiles', 'smiles', 'SMILES').
         - Keep only rows with non-null SMILES.
@@ -25,7 +31,14 @@ class DataPreparer:
             df = pd.read_csv(self.raw_data_file)
 
             # Detect the SMILES column
-            candidate_smiles = [smiles_column] if smiles_column else ['canonical_smiles', 'smiles', 'SMILES', 'Smiles']
+            candidate_smiles = [smiles_column] if smiles_column else [
+                "canonical_smiles",
+                "smiles",
+                "SMILES",
+                "Smiles",
+                "Drug",
+                "drug",
+            ]
             smiles_col = next((c for c in candidate_smiles if c and c in df.columns), None)
             if smiles_col is None:
                 raise ValueError("Could not find a SMILES column. Tried: " + ", ".join([c for c in candidate_smiles if c]))
@@ -41,9 +54,15 @@ class DataPreparer:
                 smiles_col = 'canonical_smiles'
 
             # Remove exact duplicates by SMILES text (pre-canonicalization)
-            before = len(df_clean)
-            df_clean = df_clean.drop_duplicates(subset=[smiles_col])
-            logging.info(f"Removed {before - len(df_clean)} duplicate rows based on '{smiles_col}'.")
+            if not dedupe_strategy or dedupe_strategy == "first":
+                before = len(df_clean)
+                df_clean = df_clean.drop_duplicates(subset=[smiles_col])
+                logging.info(f"Removed {before - len(df_clean)} duplicate rows based on '{smiles_col}'.")
+            else:
+                logging.info(
+                    "Skipping pre-canonicalization dedupe because dedupe_strategy=%s.",
+                    dedupe_strategy,
+                )
 
             # Always keep an ID column if present
             id_candidates = ['molecule_chembl_id', 'mol_id', 'compound_id', 'id', 'ID']
@@ -61,6 +80,8 @@ class DataPreparer:
                     selected_columns.append(id_col)
                 selected_columns.append(smiles_col)
                 selected_columns.extend([c for c in present_props if c not in selected_columns])
+                if label_column and label_column in df_clean.columns and label_column not in selected_columns:
+                    selected_columns.append(label_column)
 
                 df_clean = df_clean[selected_columns]
                 logging.info(f"Selected columns for preprocessing: {selected_columns}")
@@ -115,7 +136,14 @@ class DataPreparer:
             raise
 
 
-    def clean_smiles_column(self, curated_smiles_output, require_neutral_charge=False, prefer_largest_fragment=True):
+    def clean_smiles_column(
+        self,
+        curated_smiles_output,
+        require_neutral_charge=False,
+        prefer_largest_fragment=True,
+        dedupe_strategy: str | None = None,
+        label_column: str | None = None,
+    ):
         """Clean the 'canonical_smiles' column:
         - Canonicalize SMILES with RDKit if available.
         - For multi-fragment SMILES, keep the largest (by heavy-atom count) fragment by default (toggle with prefer_largest_fragment).
@@ -185,10 +213,38 @@ class DataPreparer:
             df = df[keep_mask].copy()
             logging.info(f"After sanitization/canonicalization: {len(df)} rows remain.")
 
-            # Drop duplicates after canonicalization
+            # Drop or reconcile duplicates after canonicalization
             before = len(df)
-            df = df.drop_duplicates(subset=['canonical_smiles'])
-            logging.info(f"Removed {before - len(df)} duplicates after canonicalization.")
+            if label_column and label_column in df.columns and dedupe_strategy in {"drop_conflicts", "majority"}:
+                grouped = df.groupby("canonical_smiles", dropna=False)
+                keep_rows = []
+                dropped = 0
+                for _, group in grouped:
+                    labels = group[label_column].dropna().unique()
+                    if len(labels) == 0:
+                        keep_rows.append(group.iloc[0])
+                        continue
+                    if len(labels) == 1:
+                        keep_rows.append(group.iloc[0])
+                        continue
+                    if dedupe_strategy == "drop_conflicts":
+                        dropped += len(group)
+                        continue
+                    counts = group[label_column].value_counts()
+                    if counts.iloc[0] == counts.iloc[1:2].max():
+                        dropped += len(group)
+                        continue
+                    winner = counts.idxmax()
+                    keep_rows.append(group[group[label_column] == winner].iloc[0])
+                df = pd.DataFrame(keep_rows)
+                logging.info(
+                    "Reconciled duplicates after canonicalization with strategy '%s' (dropped %s rows).",
+                    dedupe_strategy,
+                    dropped,
+                )
+            else:
+                df = df.drop_duplicates(subset=["canonical_smiles"])
+                logging.info(f"Removed {before - len(df)} duplicates after canonicalization.")
 
             # Save cleaned SMILES to a separate file
             df[['canonical_smiles']].to_csv(curated_smiles_output, index=False)
@@ -202,21 +258,40 @@ class DataPreparer:
             raise
 
 
-def main(raw_data_file, preprocessed_file, curated_file, curated_smiles_output,
-         active_threshold, inactive_threshold,
-         smiles_column=None, properties_of_interest=None, require_neutral_charge=False, prefer_largest_fragment=True,
-         keep_all_columns=False):
+def main(
+    raw_data_file,
+    preprocessed_file,
+    curated_file,
+    curated_smiles_output,
+    active_threshold,
+    inactive_threshold,
+    smiles_column=None,
+    properties_of_interest=None,
+    require_neutral_charge=False,
+    prefer_largest_fragment=True,
+    keep_all_columns=False,
+    dedupe_strategy=None,
+    label_column=None,
+):
     """Main function to preprocess, optionally label, and clean SMILES data."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     preparer = DataPreparer(raw_data_file, preprocessed_file, curated_file, keep_all_columns=keep_all_columns)
-    preparer.handle_missing_data_and_duplicates(smiles_column=smiles_column,
-                                                properties_of_interest=properties_of_interest)
+    preparer.handle_missing_data_and_duplicates(
+        smiles_column=smiles_column,
+        properties_of_interest=properties_of_interest,
+        dedupe_strategy=dedupe_strategy,
+        label_column=label_column,
+    )
     # Label if bioactivity present; otherwise pass-through
     preparer.label_bioactivity(active_threshold=active_threshold, inactive_threshold=inactive_threshold)
     # Canonicalize and filter
-    preparer.clean_smiles_column(curated_smiles_output,
-                                 require_neutral_charge=require_neutral_charge,
-                                 prefer_largest_fragment=prefer_largest_fragment)
+    preparer.clean_smiles_column(
+        curated_smiles_output,
+        require_neutral_charge=require_neutral_charge,
+        prefer_largest_fragment=prefer_largest_fragment,
+        dedupe_strategy=dedupe_strategy,
+        label_column=label_column,
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare and process molecular data (generalized, dataset-agnostic)."
@@ -234,8 +309,15 @@ if __name__ == "__main__":
                         help="If set, drop molecules with non-zero formal charge.")
     parser.add_argument('--prefer_largest_fragment', action='store_true',
                         help="If set, keep the largest fragment by heavy-atom count when multiple fragments are present.")
+    parser.add_argument('--no_prefer_largest_fragment', dest='prefer_largest_fragment', action='store_false',
+                        help="Disable largest-fragment preference and keep the first valid fragment.")
+    parser.set_defaults(prefer_largest_fragment=False)
     parser.add_argument('--keep_all_columns', action='store_true',
                         help="If set, keep all columns (do not drop to only selected properties).")
+    parser.add_argument('--dedupe_strategy', type=str, default=None,
+                        help="Duplicate handling after canonicalization: first|drop_conflicts|majority.")
+    parser.add_argument('--label_column', type=str, default=None,
+                        help="Label column name for dedupe resolution (required for conflict handling).")
 
     args = parser.parse_args()
 
@@ -243,9 +325,18 @@ if __name__ == "__main__":
     if args.properties:
         props = [p.strip() for p in args.properties.split(",") if p.strip()]
 
-    main(args.raw_data_file, args.preprocessed_file, args.curated_file, args.curated_smiles_output,
-         args.active_threshold, args.inactive_threshold,
-         smiles_column=args.smiles_column, properties_of_interest=props,
-         require_neutral_charge=args.require_neutral_charge,
-         prefer_largest_fragment=args.prefer_largest_fragment,
-         keep_all_columns=args.keep_all_columns)
+    main(
+        args.raw_data_file,
+        args.preprocessed_file,
+        args.curated_file,
+        args.curated_smiles_output,
+        args.active_threshold,
+        args.inactive_threshold,
+        smiles_column=args.smiles_column,
+        properties_of_interest=props,
+        require_neutral_charge=args.require_neutral_charge,
+        prefer_largest_fragment=args.prefer_largest_fragment,
+        keep_all_columns=args.keep_all_columns,
+        dedupe_strategy=args.dedupe_strategy,
+        label_column=args.label_column,
+    )
