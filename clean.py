@@ -48,7 +48,13 @@ def main() -> int:
         return 1
 
     config = load_config(str(config_path))
-    base_dir = Path(config["base_dir"])
+    base_dir_value = config.get("base_dir")
+    if base_dir_value is None:
+        base_dir_value = (config.get("global") or {}).get("base_dir")
+    if base_dir_value is None:
+        print("Config missing base_dir (expected at top-level or under global).")
+        return 1
+    base_dir = Path(base_dir_value)
 
     # Known outputs
     remove_path(base_dir, args.dry_run)

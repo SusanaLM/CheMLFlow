@@ -1,0 +1,57 @@
+# Flash point regression (existing descriptor columns)
+global:
+  pipeline_type: flash
+  task_type: regression
+  base_dir: data/flash
+  target_column: "FP Exp."
+  thresholds:
+    active: 1000
+    inactive: 10000
+  runs:
+    enabled: true
+
+pipeline:
+  nodes:
+    - get_data
+    - curate
+    - split
+    - use.curated_features
+    - preprocess.features
+    - select.features
+    - train
+    - explain
+
+get_data:
+  data_source: local_csv
+  source:
+    path: local_data/flash_dataset.csv
+
+curate:
+  properties: "FP Exp."
+  smiles_column: SMILES
+  prefer_largest_fragment: true
+
+preprocess:
+  keep_all_columns: true
+  categorical_features:
+    - Family
+  variance_threshold: 0.16
+  corr_threshold: 0.95
+  clip_range:
+    - -10000000000.0
+    - 10000000000.0
+  stable_features_k: 50
+  test_size: 0.2
+  random_state: 42
+
+split:
+  strategy: scaffold
+  test_size: 0.2
+  val_size: 0.1
+  random_state: 42
+  stratify: false
+
+model:
+  type: random_forest
+  cv_folds: 3
+  search_iters: 50

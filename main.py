@@ -117,6 +117,29 @@ def resolve_run_dir(config: dict) -> str:
         return os.path.join("runs", run_id)
     return "results"
 
+def _configure_logging(run_dir: str) -> None:
+    """Configure root logger to emit to stdout and to <run_dir>/run.log.
+
+    This must be defined before any pipeline runner calls it.
+    """
+    log_path = os.path.join(run_dir, "run.log")
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+
+    if not any(
+        isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == log_path
+        for h in logger.handlers
+    ):
+        file_handler = logging.FileHandler(log_path)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
 
 def run_node_get_data(context: dict) -> None:
     validate_contract(
@@ -196,6 +219,23 @@ def run_node_curate(context: dict) -> None:
     validate_contract(bind_output_path(CURATE_OUTPUT_CONTRACT, curated_file), warn_only=True)
     # Establish the canonical dataset path for downstream nodes.
     context["curated_path"] = curated_file
+
+
+def run_node_use_curated_features(context: dict) -> None:
+    curated_path = context.get("curated_path", context["paths"]["curated"])
+    validate_contract(
+        bind_output_path(
+            make_target_column_contract(
+                name="use_curated_features_input",
+                target_column=context["target_column"],
+                output_path=curated_path,
+            ),
+            curated_path,
+        ),
+        warn_only=False,
+    )
+    context["feature_matrix"] = curated_path
+    context["labels_matrix"] = curated_path
 
 
 def run_node_featurize_lipinski(context: dict) -> None:
@@ -547,9 +587,8 @@ def run_node_preprocess_features(context: dict) -> None:
         features_file,
         labels_file,
         context["target_column"],
+        context.get("categorical_features"),
     )
-    X_clean = X_clean.reset_index(drop=True)
-    y_clean = y_clean.reset_index(drop=True)
     data_preprocessing.verify_data_quality(X_clean, y_clean)
 
     variance_threshold, corr_threshold, clip_range, _, test_size, random_state = _preprocess_params(context)
@@ -563,25 +602,32 @@ def run_node_preprocess_features(context: dict) -> None:
         clip_range=clip_range,
     )
     X_train_pre = data_preprocessing.transform_preprocessor(X_train, preprocessor)
+    X_train_pre.index = X_train.index
     X_test_pre = data_preprocessing.transform_preprocessor(X_test, preprocessor)
+    X_test_pre.index = X_test.index
     X_preprocessed = (
         pd.concat([X_train_pre, X_test_pre])
         .sort_index()
-        .reset_index(drop=True)
     )
     y_aligned = (
         pd.concat([y_train, y_test])
         .sort_index()
-        .reset_index(drop=True)
     )
 
     preprocessed_features = context["paths"]["preprocessed_features"]
     preprocessed_labels = context["paths"]["preprocessed_labels"]
+    X_preprocessed = X_preprocessed.copy()
+    X_preprocessed[data_preprocessing.ROW_INDEX_COL] = X_preprocessed.index
     X_preprocessed.to_csv(preprocessed_features, index=False)
     y_values = y_aligned.values
     if hasattr(y_values, "ndim") and y_values.ndim > 1:
         y_values = y_values[:, 0]
-    pd.DataFrame({context["target_column"]: y_values}).to_csv(
+    pd.DataFrame(
+        {
+            context["target_column"]: y_values,
+            data_preprocessing.ROW_INDEX_COL: y_aligned.index,
+        }
+    ).to_csv(
         preprocessed_labels, index=False
     )
     joblib.dump(preprocessor, context["paths"]["preprocess_artifacts"])
@@ -626,10 +672,13 @@ def run_node_select_features(context: dict) -> None:
         warn_only=False,
     )
 
-    X = pd.read_csv(features_file)
-    y_df = pd.read_csv(labels_file)
     target_column = context["target_column"]
-    y = data_preprocessing.select_target_series(y_df, target_column)
+    X, y = data_preprocessing.load_features_labels(
+        features_file,
+        labels_file,
+        target_column,
+        context.get("categorical_features"),
+    )
 
     _, _, _, stable_k, test_size, random_state = _preprocess_params(context)
     X_train, X_test, y_train, y_test = train_test_split(
@@ -647,7 +696,9 @@ def run_node_select_features(context: dict) -> None:
     data_preprocessing.check_data_leakage(X_train, X_test)
 
     selected_features = context["paths"]["selected_features"]
-    X_selected.to_csv(selected_features, index=False)
+    X_selected_out = X_selected.copy()
+    X_selected_out[data_preprocessing.ROW_INDEX_COL] = X_selected_out.index
+    X_selected_out.to_csv(selected_features, index=False)
 
     validate_contract(
         bind_output_path(SELECT_FEATURES_OUTPUT_CONTRACT, selected_features),
@@ -707,7 +758,10 @@ def run_node_train(context: dict) -> None:
     )
 
     X, y = data_preprocessing.load_features_labels(
-        features_file, labels_file, target_column
+        features_file,
+        labels_file,
+        target_column,
+        context.get("categorical_features"),
     )
     if isinstance(y, pd.DataFrame):
         y = data_preprocessing.select_target_series(y, target_column)
@@ -733,14 +787,18 @@ def run_node_train(context: dict) -> None:
         test_idx = [i for i in test_idx if i in available]
         val_idx = [i for i in val_idx if i in available]
         if not train_idx or not test_idx:
-            raise ValueError("Split indices did not align with cleaned features/labels.")
-        X_train = X.loc[train_idx]
-        y_train = y.loc[train_idx]
-        X_test = X.loc[test_idx]
-        y_test = y.loc[test_idx]
-        if val_idx:
-            X_val = X.loc[val_idx]
-            y_val = y.loc[val_idx]
+            logging.warning(
+                "Split indices did not align with cleaned features/labels; falling back to random split."
+            )
+            split_indices = None
+        else:
+            X_train = X.loc[train_idx]
+            y_train = y.loc[train_idx]
+            X_test = X.loc[test_idx]
+            y_test = y.loc[test_idx]
+            if val_idx:
+                X_val = X.loc[val_idx]
+                y_val = y.loc[val_idx]
     else:
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_state
@@ -817,7 +875,10 @@ def run_node_explain(context: dict) -> None:
         labels_file = paths["preprocessed_labels"]
 
     X, y = data_preprocessing.load_features_labels(
-        features_file, labels_file, target_column
+        features_file,
+        labels_file,
+        target_column,
+        context.get("categorical_features"),
     )
     split_indices = context.get("split_indices")
     if split_indices:
@@ -829,10 +890,14 @@ def run_node_explain(context: dict) -> None:
         train_idx = [i for i in train_idx if i in available]
         test_idx = [i for i in test_idx if i in available]
         if not train_idx or not test_idx:
-            raise ValueError("Split indices did not align with cleaned features/labels.")
-        X_train = X.loc[train_idx]
-        X_test = X.loc[test_idx]
-        y_test = y.loc[test_idx]
+            logging.warning(
+                "Split indices did not align with cleaned features/labels; falling back to random split."
+            )
+            split_indices = None
+        else:
+            X_train = X.loc[train_idx]
+            X_test = X.loc[test_idx]
+            y_test = y.loc[test_idx]
     else:
         test_size = context.get("preprocess_config", {}).get("test_size", 0.2)
         random_state = context.get("preprocess_config", {}).get("random_state", 42)
@@ -855,6 +920,7 @@ def run_node_explain(context: dict) -> None:
 NODE_REGISTRY = {
     "get_data": run_node_get_data,
     "curate": run_node_curate,
+    "use.curated_features": run_node_use_curated_features,
     "label.normalize": run_node_label_normalize,
     "split": run_node_split,
     "featurize.lipinski": run_node_featurize_lipinski,
@@ -885,6 +951,15 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
     os.makedirs(base_dir, exist_ok=True)
     run_dir = resolve_run_dir(config)
     os.makedirs(run_dir, exist_ok=True)
+    _configure_logging(run_dir)
+
+    # If the pipeline uses curated tabular descriptors directly, keep all columns during curate
+    # so the downstream model has feature columns to train on.
+    keep_all_columns = config.get("preprocess", {}).get(
+        "keep_all_columns", config.get("keep_all_columns", False)
+    )
+    if "use.curated_features" in nodes:
+        keep_all_columns = True
 
     context = {
         "config_path": config_path,
@@ -903,9 +978,8 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
         "featurize_config": config.get("featurize", {}),
         "label_config": config.get("label", {}),
         "model_config": config.get("model", {}),
-        "keep_all_columns": config.get("preprocess", {}).get(
-            "keep_all_columns", config.get("keep_all_columns", False)
-        ),
+        "categorical_features": config.get("preprocess", {}).get("categorical_features", []),
+        "keep_all_columns": keep_all_columns,
         "source": config.get("get_data", {}).get("source", {}),
         "run_dir": run_dir,
     }
@@ -960,6 +1034,7 @@ def main() -> int:
 
     os.makedirs("data", exist_ok=True)
     os.makedirs(base_dir, exist_ok=True)
+    _configure_logging(run_dir)
 
     # step 1.
     # get raw data from a configured source.
@@ -1030,7 +1105,10 @@ def main() -> int:
         labels_file = labeled_output_file
         output_dir = "results"
         X, y = data_preprocessing.load_features_labels(
-            features_file, labels_file, target_column
+            features_file,
+            labels_file,
+            target_column,
+            preprocess_config.get("categorical_features", []),
         )
         test_size = preprocess_config.get("test_size", 0.2)
         random_state = preprocess_config.get("random_state", 42)

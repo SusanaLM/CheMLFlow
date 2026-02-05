@@ -41,6 +41,36 @@ class DLSearchConfig:
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
+def _resolve_n_jobs(model_config: Dict[str, Any] | None = None) -> int:
+    """Resolve parallelism level for scikit-learn/joblib.
+
+    Default to single-thread under pytest (subprocesses inherit PYTEST_CURRENT_TEST),
+    since some sandboxes/CI environments disallow the syscalls loky uses to size its pool.
+    """
+    model_config = model_config or {}
+
+    value = model_config.get("n_jobs")
+    if value is None:
+        env = os.environ.get("CHEMLFLOW_N_JOBS")
+        if env:
+            try:
+                value = int(env)
+            except ValueError:
+                logging.warning("Invalid CHEMLFLOW_N_JOBS=%r; falling back to defaults.", env)
+
+    if value is None:
+        value = 1 if os.environ.get("PYTEST_CURRENT_TEST") else -1
+
+    try:
+        value_int = int(value)
+    except (TypeError, ValueError):
+        logging.warning("Invalid n_jobs=%r; using 1.", value)
+        return 1
+    if value_int == 0:
+        logging.warning("n_jobs=0 is invalid; using 1.")
+        return 1
+    return value_int
+
 
 def _safe_auc(y_true, y_score) -> float | None:
     if len(np.unique(y_true)) < 2:
@@ -200,6 +230,7 @@ def _initialize_model(
     cv_folds: int,
     search_iters: int,
     input_dim: int = None,
+    n_jobs: int = -1,
 ):
     if model_type == "random_forest":
         param_dist = {
@@ -217,7 +248,7 @@ def _initialize_model(
             n_iter=search_iters,
             cv=cv_folds,
             scoring="r2",
-            n_jobs=-1,
+            n_jobs=n_jobs,
             random_state=random_state,
         )
     if model_type == "svm":
@@ -231,7 +262,7 @@ def _initialize_model(
             param_grid=param_grid_svm,
             cv=cv_folds,
             scoring="r2",
-            n_jobs=-1,
+            n_jobs=n_jobs,
         )
     if model_type == "decision_tree":
         param_dist_dt = {
@@ -247,7 +278,7 @@ def _initialize_model(
             n_iter=search_iters,
             cv=cv_folds,
             scoring="r2",
-            n_jobs=-1,
+            n_jobs=n_jobs,
             random_state=random_state,
         )
     if model_type == "xgboost":
@@ -267,7 +298,7 @@ def _initialize_model(
             n_iter=search_iters,
             cv=cv_folds,
             scoring="r2",
-            n_jobs=-1,
+            n_jobs=n_jobs,
             random_state=random_state,
         )
     if model_type == "ensemble":
@@ -290,7 +321,7 @@ def _initialize_model(
             reg_lambda=1,
             random_state=random_state,
         )
-        return VotingRegressor([("rf", rf), ("xgb", xgb)], n_jobs=-1)
+        return VotingRegressor([("rf", rf), ("xgb", xgb)], n_jobs=n_jobs)
     
     if model_type == "dl_simple":
         if input_dim is None:
@@ -420,6 +451,15 @@ def train_model(
     _ensure_dir(output_dir)
     is_dl = _is_dl_model(model_type)
     model_config = model_config or {}
+    n_jobs = _resolve_n_jobs(model_config)
+
+    logging.info(
+        "Training start: model=%s task=%s X_train=%s X_test=%s",
+        model_type,
+        task_type,
+        X_train.shape,
+        X_test.shape,
+    )
 
     if task_type == "classification" and model_type == "catboost_classifier":
         from catboost import CatBoostClassifier
@@ -463,6 +503,8 @@ def train_model(
         metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")
         joblib.dump(best_params, params_path)
         pd.Series(metrics).to_json(metrics_path)
+        logging.info("Training complete (classification): metrics=%s", metrics)
+        logging.info("Artifacts: model=%s metrics=%s params=%s", model_path, metrics_path, params_path)
         return estimator, TrainResult(model_path, params_path, metrics_path)
 
     if task_type == "classification":
@@ -474,6 +516,7 @@ def train_model(
         cv_folds,
         search_iters,
         input_dim=X_train.shape[1] if is_dl else None,
+        n_jobs=n_jobs,
     )
     if isinstance(model, DLSearchConfig):
         # ── DL Training ──
@@ -519,6 +562,8 @@ def train_model(
     metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")
     joblib.dump(best_params, params_path)   
     pd.Series(metrics).to_json(metrics_path)
+    logging.info("Training complete (regression): metrics=%s", metrics)
+    logging.info("Artifacts: model=%s metrics=%s params=%s", model_path, metrics_path, params_path)
 
     return estimator, TrainResult(model_path, params_path, metrics_path)
 
@@ -564,6 +609,7 @@ def run_explainability(
     ) -> None:
     _ensure_dir(output_dir)
     is_dl = model_type.startswith("dl_")
+    n_jobs = 1 if os.environ.get("PYTEST_CURRENT_TEST") else -1
 
     try:
         import shap
@@ -590,7 +636,7 @@ def run_explainability(
         )
     else:
         result = permutation_importance(
-            estimator, X_test, y_test, n_repeats=10, random_state=42, n_jobs=-1
+            estimator, X_test, y_test, n_repeats=10, random_state=42, n_jobs=n_jobs
         )
 
 

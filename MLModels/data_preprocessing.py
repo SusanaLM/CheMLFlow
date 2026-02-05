@@ -4,12 +4,13 @@ import sys
 import logging
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.model_selection import KFold
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import RobustScaler
-from typing import Iterable, Tuple, Dict, Any
+from typing import Iterable, Tuple, Dict, Any, Sequence
 
 # ── 1) Load data ───────────────────────────────────────────────────────────────
 def load_data(features_file: str, labels_file: str):
@@ -211,10 +212,23 @@ def _drop_smiles_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=drop_cols)
 
 
+def _one_hot_categorical(df: pd.DataFrame, categorical_features: Sequence[str] | None) -> pd.DataFrame:
+    if not categorical_features:
+        return df
+    cat_cols = [c for c in categorical_features if c in df.columns]
+    if not cat_cols:
+        return df
+    df = df.copy()
+    for col in cat_cols:
+        df[col] = df[col].fillna("missing").astype(str)
+    return pd.get_dummies(df, columns=cat_cols, dummy_na=False)
+
+
 def load_features_labels(
     features_file: str,
     labels_file: str,
     target_column: str,
+    categorical_features: Sequence[str] | None = None,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """Load features and labels, align them, and drop duplicates and target columns."""
     try:
@@ -223,6 +237,11 @@ def load_features_labels(
         logging.info(f"Loading labels ({target_column}) from {labels_file}")
         y_df = pd.read_csv(labels_file)
 
+        if ROW_INDEX_COL in X.columns:
+            X = X.set_index(ROW_INDEX_COL, drop=True)
+        if ROW_INDEX_COL in y_df.columns:
+            y_df = y_df.set_index(ROW_INDEX_COL, drop=True)
+
         if X.shape[0] != y_df.shape[0]:
             raise ValueError("The number of samples in the features file and the labels file do not match.")
 
@@ -230,6 +249,30 @@ def load_features_labels(
         if target_col in X.columns:
             X = X.drop(columns=[target_col])
         y = select_target_series(y_df, target_column)
+        if not X.index.equals(y.index):
+            y = y.reindex(X.index)
+        if y.dtype == object:
+            y_num = pd.to_numeric(y, errors="coerce")
+            if y_num.notna().sum() >= 0.9 * y.notna().sum():
+                y = y_num
+
+        # Drop SMILES-like columns from features.
+        X = _drop_smiles_columns(X)
+
+        # One-hot encode allow-listed categorical features.
+        X = _one_hot_categorical(X, categorical_features)
+
+        # Coerce feature columns to numeric; drop columns that become entirely NaN.
+        non_numeric = []
+        for col in X.columns:
+            if not is_numeric_dtype(X[col]):
+                X[col] = pd.to_numeric(X[col], errors="coerce")
+            if X[col].isna().all():
+                non_numeric.append(col)
+        if non_numeric:
+            logging.info("Dropping non-numeric feature columns: %s", non_numeric)
+            X = X.drop(columns=non_numeric)
+
         X.replace([np.inf, -np.inf], np.nan, inplace=True)
         y.replace([np.inf, -np.inf], np.nan, inplace=True)
         valid_mask = ~X.isna().any(axis=1) & ~y.isna()
@@ -244,7 +287,6 @@ def load_features_labels(
         logging.info(f"Removed {combined_before - combined_after} duplicate entries.")
 
         X_clean = combined.drop(columns=[target_col])
-        X_clean = _drop_smiles_columns(X_clean)
         y_clean = combined[target_col]
 
         logging.info(f"Data shape after initial cleaning: {X_clean.shape}")
@@ -281,3 +323,4 @@ def check_data_leakage(X_train: pd.DataFrame, X_test: pd.DataFrame):
             logging.info("No row overlap detected.")
     except Exception as e:
         logging.error(f"Error checking data leakage: {e}")
+ROW_INDEX_COL = "__row_index"

@@ -43,4 +43,7 @@ runs/
 urease/
 local_data/
 
+# CatBoost
+catboost_info/
+
 .main.py
