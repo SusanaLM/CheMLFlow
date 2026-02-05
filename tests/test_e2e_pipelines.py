@@ -33,7 +33,7 @@ def _run_pipeline(tmp_path: Path, config: dict) -> Path:
             f"stdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}"
         )
-    return Path(config["run_dir"])
+    return Path(config["global"]["run_dir"])
 
 
 def _assert_metrics(run_dir: Path, model_type: str, keys: List[str]) -> None:
@@ -47,15 +47,19 @@ def _assert_metrics(run_dir: Path, model_type: str, keys: List[str]) -> None:
 def test_e2e_qm9_fast(tmp_path: Path) -> None:
     run_dir = tmp_path / "run_qm9"
     config = {
-        "pipeline_type": "qm9",
-        "task_type": "regression",
-        "pipeline": {"nodes": ["get_data", "curate", "featurize.rdkit_labeled", "train"]},
-        "data_source": "local_csv",
-        "source": {"path": str(FIXTURES / "qm9_small.csv")},
-        "base_dir": str(tmp_path / "data_qm9"),
-        "run_dir": str(run_dir),
-        "thresholds": {"active": 1000, "inactive": 10000},
-        "target_column": "gap",
+        "global": {
+            "pipeline_type": "qm9",
+            "task_type": "regression",
+            "base_dir": str(tmp_path / "data_qm9"),
+            "target_column": "gap",
+            "thresholds": {"active": 1000, "inactive": 10000},
+            "run_dir": str(run_dir),
+        },
+        "pipeline": {"nodes": ["get_data", "curate", "featurize.rdkit", "train"]},
+        "get_data": {
+            "data_source": "local_csv",
+            "source": {"path": str(FIXTURES / "qm9_small.csv")},
+        },
         "curate": {"properties": "gap"},
         "model": {
             "type": "decision_tree",
@@ -73,17 +77,21 @@ def test_e2e_qm9_fast(tmp_path: Path) -> None:
 def test_e2e_ara_fast(tmp_path: Path) -> None:
     run_dir = tmp_path / "run_ara"
     config = {
-        "pipeline_type": "ara",
-        "task_type": "classification",
+        "global": {
+            "pipeline_type": "ara",
+            "task_type": "classification",
+            "base_dir": str(tmp_path / "data_ara"),
+            "target_column": "label",
+            "thresholds": {"active": 1000, "inactive": 10000},
+            "run_dir": str(run_dir),
+        },
         "pipeline": {
             "nodes": ["get_data", "curate", "label.normalize", "split", "featurize.morgan", "train"]
         },
-        "data_source": "local_csv",
-        "source": {"path": str(FIXTURES / "ara_small.csv")},
-        "base_dir": str(tmp_path / "data_ara"),
-        "run_dir": str(run_dir),
-        "thresholds": {"active": 1000, "inactive": 10000},
-        "target_column": "label",
+        "get_data": {
+            "data_source": "local_csv",
+            "source": {"path": str(FIXTURES / "ara_small.csv")},
+        },
         "curate": {
             "properties": "Activity",
             "smiles_column": "Smiles",
@@ -126,17 +134,21 @@ def test_e2e_ara_fast(tmp_path: Path) -> None:
 def test_e2e_pgp_fast(tmp_path: Path) -> None:
     run_dir = tmp_path / "run_pgp"
     config = {
-        "pipeline_type": "adme",
-        "task_type": "classification",
+        "global": {
+            "pipeline_type": "adme",
+            "task_type": "classification",
+            "base_dir": str(tmp_path / "data_pgp"),
+            "target_column": "label",
+            "thresholds": {"active": 1000, "inactive": 10000},
+            "run_dir": str(run_dir),
+        },
         "pipeline": {
             "nodes": ["get_data", "curate", "label.normalize", "split", "featurize.morgan", "train"]
         },
-        "data_source": "local_csv",
-        "source": {"path": str(FIXTURES / "pgp_small.csv")},
-        "base_dir": str(tmp_path / "data_pgp"),
-        "run_dir": str(run_dir),
-        "thresholds": {"active": 1000, "inactive": 10000},
-        "target_column": "label",
+        "get_data": {
+            "data_source": "local_csv",
+            "source": {"path": str(FIXTURES / "pgp_small.csv")},
+        },
         "curate": {
             "properties": "Activity",
             "smiles_column": "SMILES",

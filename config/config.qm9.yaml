@@ -1,29 +1,35 @@
 # QM9 pipeline (local dataset)
-pipeline_type: qm9
+global:
+  pipeline_type: qm9
+  task_type: regression
+  base_dir: data/qm9
+  target_column: gap
+  thresholds:
+    active: 1000
+    inactive: 10000
+  runs:
+    enabled: true
+
+# Pipeline node order
 pipeline:
   nodes:
     - get_data
     - curate
-    - featurize.rdkit_labeled
+    - featurize.rdkit
     - preprocess.features
     - select.features
     - train
     - explain
 
-data_source: local_csv
-source:
-  path: local_data/qm9.csv
-
-base_dir: data/qm9
-thresholds:
-  active: 1000
-  inactive: 10000
-
-target_column: gap
-
-qm9:
-  target_column: gap
+# Node configs
+get_data:
+  data_source: local_csv
+  source:
+    path: local_data/qm9.csv
   max_rows: 5000
+
+curate:
+  properties: gap
 
 preprocess:
   keep_all_columns: true
@@ -35,8 +41,6 @@ preprocess:
   stable_features_k: 50
   test_size: 0.2
   random_state: 42
-curate:
-  properties: gap
 
 model:
   type: decision_tree
@@ -45,6 +49,3 @@ model:
   use_hpo: true
   hpo_trials: 30
   patience: 20
-
-runs:
-  enabled: true

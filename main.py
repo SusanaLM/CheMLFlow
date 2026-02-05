@@ -105,10 +105,11 @@ def sample_csv(input_path: str, output_path: str, max_rows: int) -> None:
 
 
 def resolve_run_dir(config: dict) -> str:
-    run_dir = config.get("run_dir")
+    global_config = config.get("global", {})
+    run_dir = global_config.get("run_dir")
     if run_dir:
         return run_dir
-    runs = config.get("runs", {})
+    runs = global_config.get("runs", {})
     if runs.get("enabled"):
         run_id = runs.get("id")
         if not run_id:
@@ -135,9 +136,9 @@ def run_node_curate(context: dict) -> None:
     )
     raw_data_file = context["paths"]["raw"]
     pipeline_type = context["pipeline_type"]
-    qm9_config = context["qm9_config"]
+    get_data_config = context.get("get_data_config", {})
     if pipeline_type == "qm9":
-        max_rows = qm9_config.get("max_rows")
+        max_rows = get_data_config.get("max_rows")
         if max_rows:
             sampled_path = context["paths"]["raw_sample"]
             sample_csv(raw_data_file, sampled_path, int(max_rows))
@@ -193,15 +194,20 @@ def run_node_curate(context: dict) -> None:
     subprocess.run(cmd)
     validate_contract(bind_output_path(PREPROCESSED_CONTRACT, preprocessed_file), warn_only=True)
     validate_contract(bind_output_path(CURATE_OUTPUT_CONTRACT, curated_file), warn_only=True)
+    # Establish the canonical dataset path for downstream nodes.
+    context["curated_path"] = curated_file
 
 
 def run_node_featurize_lipinski(context: dict) -> None:
     validate_contract(
-        bind_output_path(FEATURIZE_LIPINSKI_INPUT_CONTRACT, context["paths"]["curated"]),
+        bind_output_path(
+            FEATURIZE_LIPINSKI_INPUT_CONTRACT,
+            context.get("curated_path", context["paths"]["curated"]),
+        ),
         warn_only=False,
     )
     script_path = os.path.join("utilities", "Lipinski_rules.py")
-    smiles_file = context["paths"]["curated"]
+    smiles_file = context.get("curated_path", context["paths"]["curated"])
     output_file = context["paths"]["lipinski"]
     subprocess.run([sys.executable, script_path, smiles_file, output_file])
     validate_contract(
@@ -231,6 +237,8 @@ def run_node_label_ic50(context: dict) -> None:
         warn_only=True,
     )
     context["labels_matrix"] = output_file_3class
+    # Treat the labeled pIC50 output as the canonical dataset for downstream nodes.
+    context["curated_path"] = output_file_3class
 
 
 def run_node_analyze_stats(context: dict) -> None:
@@ -275,28 +283,13 @@ def run_node_analyze_eda(context: dict) -> None:
 
 def run_node_featurize_rdkit(context: dict) -> None:
     validate_contract(
-        bind_output_path(FEATURIZE_RDKIT_INPUT_CONTRACT, context["paths"]["pic50_3class"]),
-        warn_only=False,
-    )
-    script_path = os.path.join("GenDescriptors", "RDKit_descriptors.py")
-    input_file = context["paths"]["pic50_3class"]
-    output_file = context["paths"]["rdkit_descriptors"]
-    subprocess.run([sys.executable, script_path, input_file, output_file])
-    validate_contract(
-        bind_output_path(FEATURIZE_RDKIT_OUTPUT_CONTRACT, output_file),
-        warn_only=True,
-    )
-    context["feature_matrix"] = output_file
-
-
-def run_node_featurize_rdkit_labeled(context: dict) -> None:
-    validate_contract(
         bind_output_path(
-            FEATURIZE_RDKIT_LABELED_INPUT_CONTRACT,
+            FEATURIZE_RDKIT_INPUT_CONTRACT,
             context.get("curated_path", context["paths"]["curated"]),
         ),
         warn_only=False,
     )
+    # Use labeled descriptors so features and target live in a single canonical file.
     script_path = os.path.join("GenDescriptors", "RDKit_descriptors_labeled.py")
     input_file = context.get("curated_path", context["paths"]["curated"])
     output_file = context["paths"]["rdkit_descriptors"]
@@ -314,11 +307,20 @@ def run_node_featurize_rdkit_labeled(context: dict) -> None:
         ]
     )
     validate_contract(
+        bind_output_path(FEATURIZE_RDKIT_OUTPUT_CONTRACT, output_file),
+        warn_only=True,
+    )
+    validate_contract(
         bind_output_path(FEATURIZE_RDKIT_LABELED_OUTPUT_LABELS_CONTRACT, labeled_output_file),
         warn_only=True,
     )
     context["feature_matrix"] = labeled_output_file
     context["labels_matrix"] = labeled_output_file
+
+
+def run_node_featurize_rdkit_labeled(context: dict) -> None:
+    # Backward-compatible alias: use the same implementation as featurize.rdkit.
+    run_node_featurize_rdkit(context)
 
 
 def run_node_featurize_morgan(context: dict) -> None:
@@ -875,8 +877,11 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
     if not nodes:
         return False
 
-    pipeline_type = config.get("pipeline_type", "chembl")
-    base_dir = config["base_dir"]
+    global_config = config.get("global")
+    if not global_config:
+        raise ValueError("global section is required in config")
+    pipeline_type = global_config.get("pipeline_type", "chembl")
+    base_dir = global_config["base_dir"]
     os.makedirs(base_dir, exist_ok=True)
     run_dir = resolve_run_dir(config)
     os.makedirs(run_dir, exist_ok=True)
@@ -886,12 +891,12 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
         "base_dir": base_dir,
         "paths": build_paths(base_dir),
         "pipeline_type": pipeline_type,
-        "task_type": config.get("task_type", "regression"),
-        "active_threshold": config["thresholds"]["active"],
-        "inactive_threshold": config["thresholds"]["inactive"],
-        "target_column": config.get("target_column", "pIC50"),
+        "task_type": global_config.get("task_type", "regression"),
+        "active_threshold": global_config["thresholds"]["active"],
+        "inactive_threshold": global_config["thresholds"]["inactive"],
+        "target_column": global_config.get("target_column", "pIC50"),
         "model_type": config["model"]["type"],
-        "qm9_config": config.get("qm9", {}),
+        "get_data_config": config.get("get_data", {}),
         "curate_config": config.get("curate", {}),
         "preprocess_config": config.get("preprocess", {}),
         "split_config": config.get("split", {}),
@@ -901,7 +906,7 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
         "keep_all_columns": config.get("preprocess", {}).get(
             "keep_all_columns", config.get("keep_all_columns", False)
         ),
-        "source": config.get("source", {}),
+        "source": config.get("get_data", {}).get("source", {}),
         "run_dir": run_dir,
     }
 
@@ -931,22 +936,27 @@ def main() -> int:
     if run_configured_pipeline_nodes(config, config_path):
         return 0
 
-    pipeline_type = config.get("pipeline_type", "chembl")
-    data_source = config["data_source"]
-    source = config.get("source", {})
-    base_dir = config["base_dir"]
-    active_threshold = config["thresholds"]["active"]
-    inactive_threshold = config["thresholds"]["inactive"]
+    global_config = config.get("global")
+    if not global_config:
+        print("Missing required global section in config.", file=sys.stderr)
+        return 1
+    pipeline_type = global_config.get("pipeline_type", "chembl")
+    get_data_config = config.get("get_data", {})
+    data_source = get_data_config.get("data_source")
+    source = get_data_config.get("source", {})
+    base_dir = global_config["base_dir"]
+    active_threshold = global_config["thresholds"]["active"]
+    inactive_threshold = global_config["thresholds"]["inactive"]
     model_type = config["model"]["type"]
-    qm9_config = config.get("qm9", {})
+    qm9_config = get_data_config
     preprocess_config = config.get("preprocess", {})
     keep_all_columns = preprocess_config.get(
         "keep_all_columns", config.get("keep_all_columns", False)
     )
     if pipeline_type == "qm9":
-        target_column = qm9_config.get("target_column", config.get("target_column", "gap"))
+        target_column = global_config.get("target_column", "gap")
     else:
-        target_column = config.get("target_column", "pIC50")
+        target_column = global_config.get("target_column", "pIC50")
 
     os.makedirs("data", exist_ok=True)
     os.makedirs(base_dir, exist_ok=True)

@@ -1,6 +1,16 @@
 # ARA pipeline (Androgen Receptor Antagonist classification)
-pipeline_type: ara
-task_type: classification
+global:
+  pipeline_type: ara
+  task_type: classification
+  base_dir: data/ara
+  target_column: label
+  thresholds:
+    active: 1000
+    inactive: 10000
+  runs:
+    enabled: true
+
+# Pipeline node order
 pipeline:
   nodes:
     - get_data
@@ -11,16 +21,11 @@ pipeline:
     - train
     - explain
 
-data_source: local_csv
-source:
-  path: local_data/AR.csv
-
-base_dir: data/ara
-thresholds:
-  active: 1000
-  inactive: 10000
-
-target_column: label
+# Node configs
+get_data:
+  data_source: local_csv
+  source:
+    path: local_data/AR.csv
 
 curate:
   properties: Activity
@@ -57,6 +62,3 @@ model:
     loss_function: Logloss
     eval_metric: AUC
     verbose: true
-
-runs:
-  enabled: true
