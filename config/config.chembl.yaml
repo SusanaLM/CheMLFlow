@@ -1,5 +1,16 @@
-# Default ChemBL pipeline
-pipeline_type: chembl
+# Default ChEMBL pipeline (urease)
+global:
+  pipeline_type: chembl
+  task_type: regression
+  base_dir: data/urease
+  target_column: pIC50
+  thresholds:
+    active: 1000
+    inactive: 10000
+  runs:
+    enabled: true
+
+# Pipeline node order
 pipeline:
   nodes:
     - get_data
@@ -12,26 +23,19 @@ pipeline:
     - train
     - explain
 
-data_source: chembl
-source:
-  target_name: urease
+# Node configs
+get_data:
+  data_source: chembl
+  source:
+    target_name: urease
 
-base_dir: data/urease
-thresholds:
-  active: 1000
-  inactive: 10000
-
-target_column: pIC50
+curate:
+  properties: standard_value
 
 preprocess:
   keep_all_columns: true
-curate:
-  properties: standard_value
 
 model:
   type: random_forest
   cv_folds: 3
   search_iters: 50
-
-runs:
-  enabled: true

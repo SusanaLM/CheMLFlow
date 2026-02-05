@@ -94,6 +94,10 @@ For E2E tests that spawn `main.py`, ensure the subprocess uses your conda Python
 
 CHEMLFLOW_PYTHON=$(which python) pytest tests/test_e2e_pipelines.py -q
 
+For full test runs, install pytest in your env:
+
+pip install pytest
+
 ## Running pipelines and finding results
 
 Run a pipeline by setting `CHEMLFLOW_CONFIG` and executing `main.py` from repo root:
@@ -101,9 +105,37 @@ Run a pipeline by setting `CHEMLFLOW_CONFIG` and executing `main.py` from repo r
 CHEMLFLOW_CONFIG=config/config.qm9.yaml python main.py
 
 Outputs:
-- If `runs.enabled: true`, results go to `runs/<timestamp>/`
+- If `global.runs.enabled: true`, results go to `runs/<timestamp>/`
 - Otherwise, results go to `results/`
 - Data artifacts always live under `data/<dataset>/`
+
+## Config structure (node‑style)
+
+Each node has its own config block, and global settings live under `global`:
+# - global: shared defaults used by multiple nodes
+# - pipeline: ordered list of nodes to execute
+# - node configs: per-node parameters (get_data, split, featurize, model, etc.)
+
+global:
+  pipeline_type: qm9
+  task_type: regression
+  base_dir: data/qm9
+  target_column: gap
+  thresholds:
+    active: 1000
+    inactive: 10000
+
+get_data:
+  data_source: local_csv
+  source:
+    path: local_data/qm9.csv
+
+split:
+  strategy: scaffold
+  test_size: 0.2
+  val_size: 0.1
+  random_state: 42
+  stratify: true
 
 ## Quick start (pipelines)
 
@@ -127,7 +159,7 @@ CHEMLFLOW_CONFIG=config/config.chembl.yaml python main.py
 
 Notes:
 - The ChEMBL API can be temporarily unavailable. If it returns a 500, retry later or
-  switch to `data_source: local_csv` with a cached file.
+  switch `get_data.data_source` to `local_csv` with a cached file.
 
 ### QM9 (Local CSV → RDKit → Preprocess → Select → Train → Explain)
 
@@ -145,7 +177,7 @@ CHEMLFLOW_CONFIG=config/config.qm9.yaml python main.py
 - Explainability PNGs (permutation importance + SHAP): `results/`
 
 Notes:
-- Control dataset size via `qm9.max_rows` in `config/config.qm9.yaml`.
+- Control dataset size via `get_data.max_rows` in `config/config.qm9.yaml`.
 - Model choice is controlled by `model.type` (e.g., `random_forest`, `svm`, `decision_tree`, `xgboost`, `ensemble`).
 
 ### Pgp_Broccatelli (Local CSV → Morgan → CatBoost → AUROC)
@@ -195,4 +227,4 @@ In `config/*.yaml`:
 - `task_type`: `regression` or `classification`
 - `split.*`: split strategy and sizes (e.g., `random`, `scaffold`, `tdc_scaffold`)
 - `featurize.*`: featurizer settings (e.g., Morgan radius/n_bits)
-- `runs.enabled`: use `runs/<timestamp>` instead of `results/`
+- `global.runs.enabled`: use `runs/<timestamp>` instead of `results/`

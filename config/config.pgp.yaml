@@ -1,6 +1,16 @@
-# Pgp_Broccatelli pipeline (TDC ADME classification)
-pipeline_type: adme
-task_type: classification
+# Pgp_Broccatelli pipeline (ADME classification)
+global:
+  pipeline_type: adme
+  task_type: classification
+  base_dir: data/pgp_broccatelli
+  target_column: label
+  thresholds:
+    active: 1000
+    inactive: 10000
+  runs:
+    enabled: true
+
+# Pipeline node order
 pipeline:
   nodes:
     - get_data
@@ -11,16 +21,11 @@ pipeline:
     - train
     - explain
 
-data_source: local_csv
-source:
-  path: local_data/pgp_broccatelli.csv
-
-base_dir: data/pgp_broccatelli
-thresholds:
-  active: 1000
-  inactive: 10000
-
-target_column: label
+# Node configs
+get_data:
+  data_source: local_csv
+  source:
+    path: local_data/pgp_broccatelli.csv
 
 curate:
   properties: Activity
@@ -61,6 +66,3 @@ model:
     loss_function: Logloss
     eval_metric: AUC
     verbose: true
-
-runs:
-  enabled: true

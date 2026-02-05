@@ -33,8 +33,12 @@ def main() -> int:
 
     if args.config:
         config = load_config(args.config)
-        data_source = config.get("data_source")
-        source = config.get("source", {})
+        get_data_config = config.get("get_data")
+        if not get_data_config:
+            logging.error("get_data section is required in config")
+            return 1
+        data_source = get_data_config.get("data_source")
+        source = get_data_config.get("source", {})
     else:
         data_source = args.data_source
         source = json.loads(args.source) if args.source else {}
