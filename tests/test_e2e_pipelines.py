@@ -186,3 +186,116 @@ def test_e2e_pgp_fast(tmp_path: Path) -> None:
     out_dir = _run_pipeline(tmp_path, config)
     _assert_metrics(out_dir, "catboost_classifier", ["auc", "auprc", "accuracy", "f1"])
     assert (out_dir / "run_config.yaml").exists()
+
+
+def test_e2e_flash_fast(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_flash"
+    config = {
+        "global": {
+            "pipeline_type": "flash",
+            "task_type": "regression",
+            "base_dir": str(tmp_path / "data_flash"),
+            "target_column": "FP Exp.",
+            "thresholds": {"active": 1000, "inactive": 10000},
+            "run_dir": str(run_dir),
+        },
+        "pipeline": {
+            "nodes": ["get_data", "curate", "split", "use.curated_features", "train"]
+        },
+        "get_data": {
+            "data_source": "local_csv",
+            "source": {"path": str(FIXTURES / "flash_small.csv")},
+        },
+        "curate": {
+            "properties": "FP Exp.",
+            "smiles_column": "SMILES",
+            "prefer_largest_fragment": True,
+        },
+        "split": {
+            "strategy": "random",
+            "test_size": 0.2,
+            "val_size": 0.0,
+            "random_state": 42,
+            "stratify": False,
+        },
+        "preprocess": {
+            "categorical_features": ["Family"],
+        },
+        "model": {
+            "type": "random_forest",
+            "cv_folds": 2,
+            "search_iters": 5,
+        },
+    }
+
+    out_dir = _run_pipeline(tmp_path, config)
+    _assert_metrics(out_dir, "random_forest", ["r2", "mae"])
+    assert (out_dir / "run_config.yaml").exists()
+
+
+def test_e2e_ysi_fast(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_ysi"
+    config = {
+        "global": {
+            "pipeline_type": "ysi",
+            "task_type": "regression",
+            "base_dir": str(tmp_path / "data_ysi"),
+            "target_column": "YSI",
+            "thresholds": {"active": 1000, "inactive": 10000},
+            "run_dir": str(run_dir),
+        },
+        "pipeline": {"nodes": ["get_data", "curate", "featurize.rdkit", "train"]},
+        "get_data": {
+            "data_source": "local_csv",
+            "source": {"path": str(FIXTURES / "ysi_small.csv")},
+        },
+        "curate": {
+            "properties": "YSI",
+            "smiles_column": "SMILES",
+            "prefer_largest_fragment": True,
+        },
+        "model": {
+            "type": "decision_tree",
+            "cv_folds": 2,
+            "search_iters": 5,
+            "use_hpo": False,
+        },
+    }
+
+    out_dir = _run_pipeline(tmp_path, config)
+    _assert_metrics(out_dir, "decision_tree", ["r2", "mae"])
+    assert (out_dir / "run_config.yaml").exists()
+
+
+def test_e2e_pah_fast(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_pah"
+    config = {
+        "global": {
+            "pipeline_type": "pah",
+            "task_type": "regression",
+            "base_dir": str(tmp_path / "data_pah"),
+            "target_column": "log_p",
+            "thresholds": {"active": 1000, "inactive": 10000},
+            "run_dir": str(run_dir),
+        },
+        "pipeline": {"nodes": ["get_data", "curate", "featurize.rdkit", "train"]},
+        "get_data": {
+            "data_source": "local_csv",
+            "source": {"path": str(FIXTURES / "pah_small.csv")},
+        },
+        "curate": {
+            "properties": "log_p",
+            "smiles_column": "smiles",
+            "prefer_largest_fragment": True,
+        },
+        "model": {
+            "type": "decision_tree",
+            "cv_folds": 2,
+            "search_iters": 5,
+            "use_hpo": False,
+        },
+    }
+
+    out_dir = _run_pipeline(tmp_path, config)
+    _assert_metrics(out_dir, "decision_tree", ["r2", "mae"])
+    assert (out_dir / "run_config.yaml").exists()

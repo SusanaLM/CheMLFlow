@@ -12,6 +12,24 @@ The pipeline is intended to be dataset‑agnostic for tabular ML tasks in chemis
 
 Downstream steps enforce only the minimum required columns for their node (e.g., `canonical_smiles` for RDKit, `target_column` for model training), and extra columns are allowed.
 
+### SMILES handling (important)
+
+- Raw SMILES strings are **never** used directly as numeric features.
+- If you want SMILES to drive the model, use a featurizer (e.g., RDKit/Morgan) to convert SMILES into numeric descriptors/fingerprints.
+- If you are using existing tabular descriptors, SMILES is only used for **canonicalization** and **scaffold splitting**, then dropped from the feature matrix.
+
+### Tabular descriptors (no featurizer)
+
+If your dataset already includes numeric descriptors, use the `use.curated_features` node to point training at the curated CSV directly (no RDKit/Morgan). You can also allowlist low‑cardinality categorical columns for one‑hot encoding via:
+
+```
+preprocess:
+  categorical_features:
+    - Family
+```
+
+`categorical_features` and `target_column` must match **column names in your dataset**.
+
 ## Installation
 
 1. Clone the repository
@@ -108,6 +126,7 @@ Outputs:
 - If `global.runs.enabled: true`, results go to `runs/<timestamp>/`
 - Otherwise, results go to `results/`
 - Data artifacts always live under `data/<dataset>/`
+- Each run writes a `run.log` file under the run directory.
 
 ## Config structure (node‑style)
 
@@ -179,6 +198,30 @@ CHEMLFLOW_CONFIG=config/config.qm9.yaml python main.py
 Notes:
 - Control dataset size via `get_data.max_rows` in `config/config.qm9.yaml`.
 - Model choice is controlled by `model.type` (e.g., `random_forest`, `svm`, `decision_tree`, `xgboost`, `ensemble`).
+
+### YSI (Sooting Index, local CSV → RDKit → Train → Explain)
+
+1. Ensure the dataset exists at:
+
+`local_data/ysi.csv`
+
+Expected columns include `SMILES` and `YSI`.
+
+2. Run the pipeline:
+
+CHEMLFLOW_CONFIG=config/config.ysi.yaml python main.py
+
+### PAH (logP, local CSV → RDKit → Train → Explain)
+
+1. Ensure the dataset exists at:
+
+`local_data/arockiaraj_pah_data.csv`
+
+Expected columns include `smiles` and `log_p`.
+
+2. Run the pipeline:
+
+CHEMLFLOW_CONFIG=config/config.pah.yaml python main.py
 
 ### Pgp_Broccatelli (Local CSV → Morgan → CatBoost → AUROC)
 

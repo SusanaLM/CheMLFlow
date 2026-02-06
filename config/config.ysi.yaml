@@ -1,0 +1,42 @@
+# YSI sooting index regression (local dataset)
+global:
+  pipeline_type: ysi
+  task_type: regression
+  base_dir: data/ysi
+  target_column: YSI
+  thresholds:
+    active: 1000
+    inactive: 10000
+  runs:
+    enabled: true
+
+pipeline:
+  nodes:
+    - get_data
+    - curate
+    - split
+    - featurize.rdkit
+    - train
+    - explain
+
+get_data:
+  data_source: local_csv
+  source:
+    path: local_data/ysi.csv
+
+curate:
+  properties: YSI
+  smiles_column: SMILES
+  prefer_largest_fragment: true
+
+split:
+  strategy: scaffold
+  test_size: 0.2
+  val_size: 0.1
+  random_state: 42
+  stratify: false
+
+model:
+  type: random_forest
+  cv_folds: 3
+  search_iters: 50
