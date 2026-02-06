@@ -37,11 +37,11 @@ coverage.xml
 .idea/
 
 # Project outputs
-data/
-results/
-runs/
-urease/
-local_data/
+/data/
+/results/
+/runs/
+/urease/
+/local_data/
 
 # CatBoost
 catboost_info/

@@ -199,6 +199,18 @@ Notes:
 - Control dataset size via `get_data.max_rows` in `config/config.qm9.yaml`.
 - Model choice is controlled by `model.type` (e.g., `random_forest`, `svm`, `decision_tree`, `xgboost`, `ensemble`).
 
+### YSI (Sooting Index, local CSV → RDKit → Train → Explain)
+
+1. Ensure the dataset exists at:
+
+`local_data/ysi.csv`
+
+Expected columns include `SMILES` and `YSI`.
+
+2. Run the pipeline:
+
+CHEMLFLOW_CONFIG=config/config.ysi.yaml python main.py
+
 ### Pgp_Broccatelli (Local CSV → Morgan → CatBoost → AUROC)
 
 1. Activate your environment:

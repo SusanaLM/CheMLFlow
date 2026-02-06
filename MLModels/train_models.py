@@ -69,6 +69,21 @@ def _resolve_n_jobs(model_config: Dict[str, Any] | None = None) -> int:
     if value_int == 0:
         logging.warning("n_jobs=0 is invalid; using 1.")
         return 1
+
+    # Some environments (notably sandboxed macOS setups) raise PermissionError on
+    # os.sysconf("SC_SEM_NSEMS_MAX"), which joblib/loky calls when starting a
+    # process pool. Fall back to single-thread execution to keep pipelines runnable.
+    if value_int != 1:
+        try:
+            os.sysconf("SC_SEM_NSEMS_MAX")
+        except PermissionError:
+            logging.warning(
+                "Parallel joblib backend is not permitted in this environment; forcing n_jobs=1."
+            )
+            return 1
+        except Exception:
+            # If sysconf is unavailable/unsupported, let joblib decide.
+            pass
     return value_int
 
 
@@ -609,7 +624,7 @@ def run_explainability(
     ) -> None:
     _ensure_dir(output_dir)
     is_dl = model_type.startswith("dl_")
-    n_jobs = 1 if os.environ.get("PYTEST_CURRENT_TEST") else -1
+    n_jobs = _resolve_n_jobs()
 
     try:
         import shap
