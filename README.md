@@ -211,6 +211,18 @@ Expected columns include `SMILES` and `YSI`.
 
 CHEMLFLOW_CONFIG=config/config.ysi.yaml python main.py
 
+### PAH (logP, local CSV → RDKit → Train → Explain)
+
+1. Ensure the dataset exists at:
+
+`local_data/arockiaraj_pah_data.csv`
+
+Expected columns include `smiles` and `log_p`.
+
+2. Run the pipeline:
+
+CHEMLFLOW_CONFIG=config/config.pah.yaml python main.py
+
 ### Pgp_Broccatelli (Local CSV → Morgan → CatBoost → AUROC)
 
 1. Activate your environment:

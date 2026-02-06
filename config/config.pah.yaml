@@ -1,0 +1,42 @@
+# PAH logP regression (local dataset)
+global:
+  pipeline_type: pah
+  task_type: regression
+  base_dir: data/pah
+  target_column: log_p
+  thresholds:
+    active: 1000
+    inactive: 10000
+  runs:
+    enabled: true
+
+pipeline:
+  nodes:
+    - get_data
+    - curate
+    - split
+    - featurize.rdkit
+    - train
+    - explain
+
+get_data:
+  data_source: local_csv
+  source:
+    path: local_data/arockiaraj_pah_data.csv
+
+curate:
+  properties: log_p
+  smiles_column: smiles
+  prefer_largest_fragment: true
+
+split:
+  strategy: random
+  test_size: 0.2
+  val_size: 0.1
+  random_state: 42
+  stratify: false
+
+model:
+  type: random_forest
+  cv_folds: 3
+  search_iters: 50

@@ -265,3 +265,37 @@ def test_e2e_ysi_fast(tmp_path: Path) -> None:
     out_dir = _run_pipeline(tmp_path, config)
     _assert_metrics(out_dir, "decision_tree", ["r2", "mae"])
     assert (out_dir / "run_config.yaml").exists()
+
+
+def test_e2e_pah_fast(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_pah"
+    config = {
+        "global": {
+            "pipeline_type": "pah",
+            "task_type": "regression",
+            "base_dir": str(tmp_path / "data_pah"),
+            "target_column": "log_p",
+            "thresholds": {"active": 1000, "inactive": 10000},
+            "run_dir": str(run_dir),
+        },
+        "pipeline": {"nodes": ["get_data", "curate", "featurize.rdkit", "train"]},
+        "get_data": {
+            "data_source": "local_csv",
+            "source": {"path": str(FIXTURES / "pah_small.csv")},
+        },
+        "curate": {
+            "properties": "log_p",
+            "smiles_column": "smiles",
+            "prefer_largest_fragment": True,
+        },
+        "model": {
+            "type": "decision_tree",
+            "cv_folds": 2,
+            "search_iters": 5,
+            "use_hpo": False,
+        },
+    }
+
+    out_dir = _run_pipeline(tmp_path, config)
+    _assert_metrics(out_dir, "decision_tree", ["r2", "mae"])
+    assert (out_dir / "run_config.yaml").exists()
