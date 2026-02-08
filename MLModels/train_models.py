@@ -406,8 +406,8 @@ def _initialize_model(
                 dropout=params.get("dropout", 0.2),
             ),
             search_space={
-                "hidden_size": {"type": "categorical", "choices": [128, 256, 512]},
-                "num_layers": {"type": "categorical", "choices": [1, 2, 3]},
+                "hidden_size": {"type": "categorical", "choices": [64, 128, 256]},
+                "num_layers": {"type": "categorical", "choices": [1, 2]},
                 "bidirectional": {"type": "categorical", "choices": [True, False]},
                 "dropout": {"type": "float", "low": 0.0, "high": 0.6, "log": False},
                 "learning_rate": {"type": "float", "low": 1e-5, "high": 1e-2, "log": True},
