@@ -566,6 +566,45 @@ def _preprocess_params(context: dict) -> tuple[float, float, tuple[float, float]
     return variance_threshold, corr_threshold, clip_range, stable_k, test_size, random_state
 
 
+def _resolve_split_partitions(
+    context: dict,
+    index: pd.Index,
+) -> tuple[list[int], list[int], list[int]] | None:
+    """
+    Resolve train/val/test indices against a cleaned feature/label index.
+
+    If split_indices exist in the context, we filter them down to rows that are
+    still present after cleaning (NaN/duplicate dropping). If a split becomes
+    empty after filtering, we raise instead of silently re-splitting elsewhere.
+    """
+    split_indices = context.get("split_indices")
+    if not split_indices:
+        return None
+
+    train_idx = list(split_indices.get("train", []) or [])
+    val_idx = list(split_indices.get("val", []) or [])
+    test_idx = list(split_indices.get("test", []) or [])
+    if not test_idx and val_idx:
+        # Some sources only provide train/val; treat val as test downstream.
+        test_idx, val_idx = val_idx, []
+
+    orig_counts = (len(train_idx), len(val_idx), len(test_idx))
+    available = set(index.tolist())
+    train_idx = [i for i in train_idx if i in available]
+    val_idx = [i for i in val_idx if i in available]
+    test_idx = [i for i in test_idx if i in available]
+
+    if not train_idx or not test_idx:
+        raise ValueError(
+            "split_indices did not align with cleaned features/labels (train/test empty after filtering). "
+            "Do not re-split downstream: run the 'split' node after any row-filtering/cleaning, or ensure "
+            f"your feature/label matrices preserve {data_preprocessing.ROW_INDEX_COL}. "
+            f"(available_rows={len(available)} split_counts(train,val,test)={orig_counts} "
+            f"filtered_counts(train,val,test)=({len(train_idx)},{len(val_idx)},{len(test_idx)}))"
+        )
+    return train_idx, val_idx, test_idx
+
+
 def run_node_preprocess_features(context: dict) -> None:
     features_file, labels_file = _resolve_feature_inputs(context)
     validate_contract(
@@ -592,27 +631,28 @@ def run_node_preprocess_features(context: dict) -> None:
     data_preprocessing.verify_data_quality(X_clean, y_clean)
 
     variance_threshold, corr_threshold, clip_range, _, test_size, random_state = _preprocess_params(context)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_clean, y_clean, test_size=test_size, random_state=random_state
-    )
+    partitions = _resolve_split_partitions(context, X_clean.index)
+    if partitions is None:
+        logging.warning(
+            "No split_indices found; preprocess.features will perform its own random split. "
+            "For reproducible pipelines, add the 'split' node before preprocessing."
+        )
+        X_train, _, y_train, _ = train_test_split(
+            X_clean, y_clean, test_size=test_size, random_state=random_state
+        )
+    else:
+        train_idx, _, _ = partitions
+        X_train = X_clean.loc[train_idx]
+        y_train = y_clean.loc[train_idx]
     preprocessor = data_preprocessing.fit_preprocessor(
         X_train,
         variance_threshold=variance_threshold,
         corr_threshold=corr_threshold,
         clip_range=clip_range,
     )
-    X_train_pre = data_preprocessing.transform_preprocessor(X_train, preprocessor)
-    X_train_pre.index = X_train.index
-    X_test_pre = data_preprocessing.transform_preprocessor(X_test, preprocessor)
-    X_test_pre.index = X_test.index
-    X_preprocessed = (
-        pd.concat([X_train_pre, X_test_pre])
-        .sort_index()
-    )
-    y_aligned = (
-        pd.concat([y_train, y_test])
-        .sort_index()
-    )
+    X_preprocessed = data_preprocessing.transform_preprocessor(X_clean, preprocessor)
+    X_preprocessed.index = X_clean.index
+    y_aligned = y_clean
 
     preprocessed_features = context["paths"]["preprocessed_features"]
     preprocessed_labels = context["paths"]["preprocessed_labels"]
@@ -681,9 +721,20 @@ def run_node_select_features(context: dict) -> None:
     )
 
     _, _, _, stable_k, test_size, random_state = _preprocess_params(context)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state
-    )
+    partitions = _resolve_split_partitions(context, X.index)
+    if partitions is None:
+        logging.warning(
+            "No split_indices found; select.features will perform its own random split. "
+            "For reproducible pipelines, add the 'split' node before feature selection."
+        )
+        X_train, X_test, y_train, _ = train_test_split(
+            X, y, test_size=test_size, random_state=random_state
+        )
+    else:
+        train_idx, _, test_idx = partitions
+        X_train = X.loc[train_idx]
+        y_train = y.loc[train_idx]
+        X_test = X.loc[test_idx]
     X_selected_train = data_preprocessing.select_stable_features(
         X_train,
         y_train,
@@ -717,6 +768,33 @@ def run_node_train(context: dict) -> None:
     target_column = context["target_column"]
     paths = context["paths"]
     task_type = context.get("task_type", "regression")
+    model_config = context.get("model_config", {})
+
+    # Chemprop is a SMILES-native model; it does not use tabular descriptors.
+    # For apples-to-apples benchmarking, we still rely on CheMLFlow's split_indices.
+    if model_type == "chemprop":
+        curated_path = context.get("curated_path", paths["curated"])
+        curated_df = pd.read_csv(curated_path)
+        split_indices = context.get("split_indices")
+        if not split_indices:
+            raise ValueError("chemprop training requires split_indices (run the 'split' node).")
+
+        _, train_result = train_models.train_chemprop_model(
+            curated_df=curated_df,
+            target_column=target_column,
+            split_indices=split_indices,
+            output_dir=output_dir,
+            random_state=int(context.get("split_config", {}).get("random_state", 42)),
+            task_type=task_type,
+            model_config=model_config,
+        )
+        context["trained_model_path"] = train_result.model_path
+
+        validate_contract(
+            bind_output_path(TRAIN_OUTPUT_CONTRACT, output_dir),
+            warn_only=True,
+        )
+        return
 
     use_selected = context.get("selected_ready", False)
     use_preprocessed = context.get("preprocessed_ready", False)
@@ -776,29 +854,16 @@ def run_node_train(context: dict) -> None:
     X_val = None
     y_val = None
     if split_indices:
-        train_idx = split_indices.get("train", [])
-        val_idx = split_indices.get("val", [])
-        test_idx = split_indices.get("test", [])
-        if not test_idx and val_idx:
-            test_idx = val_idx
-            val_idx = []
-        available = set(X.index)
-        train_idx = [i for i in train_idx if i in available]
-        test_idx = [i for i in test_idx if i in available]
-        val_idx = [i for i in val_idx if i in available]
-        if not train_idx or not test_idx:
-            logging.warning(
-                "Split indices did not align with cleaned features/labels; falling back to random split."
-            )
-            split_indices = None
-        else:
-            X_train = X.loc[train_idx]
-            y_train = y.loc[train_idx]
-            X_test = X.loc[test_idx]
-            y_test = y.loc[test_idx]
-            if val_idx:
-                X_val = X.loc[val_idx]
-                y_val = y.loc[val_idx]
+        partitions = _resolve_split_partitions(context, X.index)
+        assert partitions is not None  # for type checkers; guarded by split_indices above
+        train_idx, val_idx, test_idx = partitions
+        X_train = X.loc[train_idx]
+        y_train = y.loc[train_idx]
+        X_test = X.loc[test_idx]
+        y_test = y.loc[test_idx]
+        if val_idx:
+            X_val = X.loc[val_idx]
+            y_val = y.loc[val_idx]
     else:
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_state
@@ -812,8 +877,6 @@ def run_node_train(context: dict) -> None:
         y_val = y_val.iloc[:, 0]
     if not skip_quality_checks:
         data_preprocessing.check_data_leakage(X_train, X_test)
-
-    model_config = context.get("model_config", {})
 
     estimator, train_result = train_models.train_model(
         X_train,
@@ -847,6 +910,9 @@ def run_node_explain(context: dict) -> None:
     target_column = context["target_column"]
     paths = context["paths"]
     is_dl = model_type.startswith("dl_")
+    if model_type == "chemprop":
+        logging.warning("Explainability is not implemented for chemprop; skipping explain node.")
+        return
 
     model_path = context.get("trained_model_path")
     if not model_path:
@@ -882,22 +948,12 @@ def run_node_explain(context: dict) -> None:
     )
     split_indices = context.get("split_indices")
     if split_indices:
-        train_idx = split_indices.get("train", [])
-        test_idx = split_indices.get("test", [])
-        if not test_idx:
-            test_idx = split_indices.get("val", [])
-        available = set(X.index)
-        train_idx = [i for i in train_idx if i in available]
-        test_idx = [i for i in test_idx if i in available]
-        if not train_idx or not test_idx:
-            logging.warning(
-                "Split indices did not align with cleaned features/labels; falling back to random split."
-            )
-            split_indices = None
-        else:
-            X_train = X.loc[train_idx]
-            X_test = X.loc[test_idx]
-            y_test = y.loc[test_idx]
+        partitions = _resolve_split_partitions(context, X.index)
+        assert partitions is not None  # for type checkers; guarded by split_indices above
+        train_idx, _, test_idx = partitions
+        X_train = X.loc[train_idx]
+        X_test = X.loc[test_idx]
+        y_test = y.loc[test_idx]
     else:
         test_size = context.get("preprocess_config", {}).get("test_size", 0.2)
         random_state = context.get("preprocess_config", {}).get("random_state", 42)

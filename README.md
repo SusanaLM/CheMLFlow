@@ -271,3 +271,53 @@ In `config/*.yaml`:
 - `split.*`: split strategy and sizes (e.g., `random`, `scaffold`, `tdc_scaffold`)
 - `featurize.*`: featurizer settings (e.g., Morgan radius/n_bits)
 - `global.runs.enabled`: use `runs/<timestamp>` instead of `results/`
+
+## Chemprop backend (optional, classification only)
+
+CheMLFlow supports an in-process Chemprop D-MPNN backend behind `model.type: chemprop`.
+This path is SMILES-native (no descriptor generation) and uses CheMLFlow's `split_indices`
+from the `split` node for apples-to-apples split comparability.
+
+### Install
+
+Chemprop is an optional dependency (it typically brings in PyTorch and Lightning):
+
+- `pip install chemprop`
+- or, if you install CheMLFlow as a package: `pip install -e ".[chemprop]"`
+
+### Example config
+
+Use the included example: `config/config.pgp_chemprop.yaml`:
+
+```
+CHEMLFLOW_CONFIG=config/config.pgp_chemprop.yaml python main.py
+```
+
+### Target column
+
+Chemprop trains on the pipeline context's `target_column`:
+- set `global.target_column` as the canonical target name.
+- if you run `label.normalize`, you can set/override via `label.target_column` (the normalize node writes that column and updates the context).
+
+### SMILES column
+
+Chemprop expects SMILES in the curated dataset.
+Default is `canonical_smiles`. Override via `model.smiles_column` if needed.
+
+### Chemprop params
+
+Put these under `model.params` (all optional; defaults exist):
+- `max_epochs`
+- `batch_size`
+- `init_lr`, `max_lr`, `final_lr` (or `lr` as a fallback)
+- `mp_hidden_dim`
+- `mp_depth`
+- `ffn_hidden_dim`
+
+### Artifacts written
+
+Under the run directory (e.g., `runs/<timestamp>/`):
+- `chemprop_best_model.ckpt`
+- `chemprop_best_params.pkl` (do not load untrusted pickle/joblib files)
+- `chemprop_metrics.json`
+- `chemprop_predictions.csv`

@@ -6,6 +6,7 @@ import sys
 from typing import List
 
 import yaml
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -55,12 +56,18 @@ def test_e2e_qm9_fast(tmp_path: Path) -> None:
             "thresholds": {"active": 1000, "inactive": 10000},
             "run_dir": str(run_dir),
         },
-        "pipeline": {"nodes": ["get_data", "curate", "featurize.rdkit", "train"]},
+        "pipeline": {"nodes": ["get_data", "curate", "split", "featurize.rdkit", "train"]},
         "get_data": {
             "data_source": "local_csv",
             "source": {"path": str(FIXTURES / "qm9_small.csv")},
         },
         "curate": {"properties": "gap"},
+        "split": {
+            "strategy": "random",
+            "test_size": 0.2,
+            "val_size": 0.0,
+            "random_state": 42,
+        },
         "model": {
             "type": "decision_tree",
             "cv_folds": 2,
@@ -185,6 +192,64 @@ def test_e2e_pgp_fast(tmp_path: Path) -> None:
 
     out_dir = _run_pipeline(tmp_path, config)
     _assert_metrics(out_dir, "catboost_classifier", ["auc", "auprc", "accuracy", "f1"])
+    assert (out_dir / "run_config.yaml").exists()
+
+
+def test_e2e_pgp_chemprop_fast(tmp_path: Path) -> None:
+    pytest.importorskip("chemprop")
+
+    run_dir = tmp_path / "run_pgp_chemprop"
+    config = {
+        "global": {
+            "pipeline_type": "adme",
+            "task_type": "classification",
+            "base_dir": str(tmp_path / "data_pgp"),
+            "target_column": "label",
+            "thresholds": {"active": 1000, "inactive": 10000},
+            "run_dir": str(run_dir),
+        },
+        "pipeline": {
+            "nodes": ["get_data", "curate", "label.normalize", "split", "train"]
+        },
+        "get_data": {
+            "data_source": "local_csv",
+            "source": {"path": str(FIXTURES / "pgp_small.csv")},
+        },
+        "curate": {
+            "properties": "Activity",
+            "smiles_column": "SMILES",
+            "dedupe_strategy": "drop_conflicts",
+            "label_column": "Activity",
+            "prefer_largest_fragment": True,
+        },
+        "label": {
+            "source_column": "Activity",
+            "target_column": "label",
+            "positive": ["1", 1],
+            "negative": ["0", 0],
+        },
+        "split": {
+            "strategy": "random",
+            "test_size": 0.2,
+            "val_size": 0.0,
+            "random_state": 42,
+            "stratify": True,
+        },
+        "model": {
+            "type": "chemprop",
+            "params": {
+                "max_epochs": 2,
+                "batch_size": 16,
+                "max_lr": 1e-3,
+                "mp_hidden_dim": 64,
+                "ffn_hidden_dim": 64,
+                "mp_depth": 2,
+            },
+        },
+    }
+
+    out_dir = _run_pipeline(tmp_path, config)
+    _assert_metrics(out_dir, "chemprop", ["auc", "auprc", "accuracy", "f1"])
     assert (out_dir / "run_config.yaml").exists()
 
 
