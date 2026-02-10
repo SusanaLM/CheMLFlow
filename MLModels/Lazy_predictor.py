@@ -1,20 +1,22 @@
 import pandas as pd
 import argparse
 import logging
-from sklearn.model_selection import train_test_split
 from lazypredict.Supervised import LazyRegressor
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
+import json
+from pathlib import Path
+
+ROW_INDEX_COL = "__row_index"
 
 class LazyModelEvaluator:
     """Class to evaluate multiple regression models using LazyPredict and visualize the results."""
     
-    def __init__(self, features_file, labels_file, test_size=0.2, random_state=42):
+    def __init__(self, features_file, labels_file, split_indices_file: str):
         self.features_file = features_file
         self.labels_file = labels_file
-        self.test_size = test_size
-        self.random_state = random_state
+        self.split_indices_file = split_indices_file
         self.X_train = None
         self.X_test = None
         self.y_train = None
@@ -37,7 +39,14 @@ class LazyModelEvaluator:
             if 'pIC50' not in y_df.columns:
                 raise ValueError(f"The labels file must contain a 'pIC50' column.")
             
+            if ROW_INDEX_COL in X.columns:
+                X = X.set_index(ROW_INDEX_COL, drop=True)
+            if ROW_INDEX_COL in y_df.columns:
+                y_df = y_df.set_index(ROW_INDEX_COL, drop=True)
+
             y = y_df['pIC50']
+            if not X.index.equals(y.index):
+                y = y.reindex(X.index)
             logging.info(f"Successfully loaded features and labels data.")
             return X, y
         except Exception as e:
@@ -64,11 +73,43 @@ class LazyModelEvaluator:
             logging.error(f"Error during preprocessing: {e}")
             raise
 
+    def load_split_indices(self) -> dict:
+        """Load split indices from a JSON file produced by the pipeline split node."""
+        path = Path(self.split_indices_file)
+        split_indices = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(split_indices, dict):
+            raise ValueError(f"Invalid split_indices JSON (expected object): {path}")
+        return split_indices
+
     def split_data(self, X, y):
-        """Split the data into training and testing sets."""
-        logging.info(f"Splitting data with test size {self.test_size}.")
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(X, y, test_size=self.test_size, random_state=self.random_state)
-        logging.info(f"Data split into {self.X_train.shape[0]} training samples and {self.X_test.shape[0]} testing samples.")
+        """Apply a precomputed train/test split (no implicit splitting)."""
+        split_indices = self.load_split_indices()
+        train_idx = split_indices.get("train", [])
+        test_idx = split_indices.get("test", [])
+        if not train_idx or not test_idx:
+            raise ValueError(
+                "split_indices JSON must contain non-empty 'train' and 'test' lists. "
+                "Generate splits via the pipeline 'split' node."
+            )
+
+        available = set(X.index)
+        train_idx = [i for i in train_idx if i in available]
+        test_idx = [i for i in test_idx if i in available]
+        if not train_idx or not test_idx:
+            raise ValueError(
+                "Split indices did not align with cleaned features/labels. "
+                "Ensure the features/labels files preserve __row_index from the pipeline."
+            )
+
+        self.X_train = X.loc[train_idx]
+        self.X_test = X.loc[test_idx]
+        self.y_train = y.loc[train_idx]
+        self.y_test = y.loc[test_idx]
+        logging.info(
+            "Applied split_indices: train=%s test=%s",
+            self.X_train.shape[0],
+            self.X_test.shape[0],
+        )
 
     def fit_models(self):
         """Fit multiple regression models using LazyPredict and evaluate their performance."""
@@ -109,11 +150,11 @@ class LazyModelEvaluator:
             logging.error(f"Error generating bar plot: {e}")
             raise
 
-def main(features_file, labels_file, test_size, output_dir):
+def main(features_file, labels_file, split_indices_file: str, output_dir):
     logging.basicConfig(level=logging.INFO)
 
     # Initialize the LazyModelEvaluator class
-    evaluator = LazyModelEvaluator(features_file, labels_file, test_size)
+    evaluator = LazyModelEvaluator(features_file, labels_file, split_indices_file)
 
     # Load and preprocess data
     X, y = evaluator.load_data()
@@ -134,9 +175,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate multiple machine learning models using LazyPredict and visualize the results.")
     parser.add_argument('features_file', type=str, help="Input CSV file containing the features (X).")
     parser.add_argument('labels_file', type=str, help="Input CSV file containing the labels (y).")
-    parser.add_argument('--test_size', type=float, default=0.2, help="Test size for splitting the dataset.")
+    parser.add_argument(
+        '--split_indices_file',
+        type=str,
+        required=True,
+        help="Path to split_indices.json produced by the pipeline split node.",
+    )
     parser.add_argument('--output_dir', type=str, default='.', help="Directory to save the plots.")
     
     args = parser.parse_args()
     
-    main(args.features_file, args.labels_file, args.test_size, args.output_dir)
+    main(args.features_file, args.labels_file, args.split_indices_file, args.output_dir)

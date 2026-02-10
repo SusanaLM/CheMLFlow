@@ -17,6 +17,7 @@ pipeline:
     - curate
     - featurize.lipinski
     - label.ic50
+    - split
     - analyze.stats
     - analyze.eda
     - featurize.rdkit
@@ -31,6 +32,13 @@ get_data:
 
 curate:
   properties: standard_value
+
+split:
+  strategy: scaffold
+  test_size: 0.2
+  val_size: 0.1
+  random_state: 42
+  stratify: false
 
 preprocess:
   keep_all_columns: true

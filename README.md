@@ -154,7 +154,10 @@ split:
   test_size: 0.2
   val_size: 0.1
   random_state: 42
-  stratify: true
+  stratify: false
+
+Note: Train/val/test membership is defined only by the `split` node. Other nodes consume `split_indices`
+and will not create their own random splits.
 
 ## Quick start (pipelines)
 

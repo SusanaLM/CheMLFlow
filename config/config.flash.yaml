@@ -41,7 +41,6 @@ preprocess:
     - -10000000000.0
     - 10000000000.0
   stable_features_k: 50
-  test_size: 0.2
   random_state: 42
 
 split:
