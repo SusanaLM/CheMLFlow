@@ -6,6 +6,7 @@ import sys
 from typing import List
 
 import yaml
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,18 @@ def _run_pipeline(tmp_path: Path, config: dict) -> Path:
 
     env = os.environ.copy()
     env["CHEMLFLOW_CONFIG"] = str(config_path)
+    # Keep subprocess execution deterministic and avoid native thread/runtime flakiness
+    # (notably with torch/chemprop in CI-like environments).
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("MKL_NUM_THREADS", "1")
+    env.setdefault("OPENBLAS_NUM_THREADS", "1")
+    env.setdefault("NUMEXPR_NUM_THREADS", "1")
+    env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    env.setdefault("KMP_INIT_AT_FORK", "FALSE")
+    env.setdefault("MPLBACKEND", "Agg")
+    mpl_cfg = tmp_path / ".mplconfig"
+    mpl_cfg.mkdir(parents=True, exist_ok=True)
+    env.setdefault("MPLCONFIGDIR", str(mpl_cfg))
     python = os.environ.get("CHEMLFLOW_PYTHON", sys.executable)
     result = subprocess.run(
         [python, "main.py"],
@@ -30,6 +43,7 @@ def _run_pipeline(tmp_path: Path, config: dict) -> Path:
     if result.returncode != 0:
         raise AssertionError(
             "Pipeline failed.\n"
+            f"returncode: {result.returncode}\n"
             f"stdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}"
         )
@@ -192,6 +206,64 @@ def test_e2e_pgp_fast(tmp_path: Path) -> None:
 
     out_dir = _run_pipeline(tmp_path, config)
     _assert_metrics(out_dir, "catboost_classifier", ["auc", "auprc", "accuracy", "f1"])
+    assert (out_dir / "run_config.yaml").exists()
+
+
+def test_e2e_pgp_chemprop_fast(tmp_path: Path) -> None:
+    pytest.importorskip("chemprop")
+
+    run_dir = tmp_path / "run_pgp_chemprop"
+    config = {
+        "global": {
+            "pipeline_type": "adme",
+            "task_type": "classification",
+            "base_dir": str(tmp_path / "data_pgp"),
+            "target_column": "label",
+            "thresholds": {"active": 1000, "inactive": 10000},
+            "run_dir": str(run_dir),
+        },
+        "pipeline": {
+            "nodes": ["get_data", "curate", "label.normalize", "split", "train"]
+        },
+        "get_data": {
+            "data_source": "local_csv",
+            "source": {"path": str(FIXTURES / "pgp_small.csv")},
+        },
+        "curate": {
+            "properties": "Activity",
+            "smiles_column": "SMILES",
+            "dedupe_strategy": "drop_conflicts",
+            "label_column": "Activity",
+            "prefer_largest_fragment": True,
+        },
+        "label": {
+            "source_column": "Activity",
+            "target_column": "label",
+            "positive": ["1", 1],
+            "negative": ["0", 0],
+        },
+        "split": {
+            "strategy": "random",
+            "test_size": 0.2,
+            "val_size": 0.2,
+            "random_state": 42,
+            "stratify": True,
+        },
+        "model": {
+            "type": "chemprop",
+            "params": {
+                "max_epochs": 2,
+                "batch_size": 16,
+                "max_lr": 1e-3,
+                "mp_hidden_dim": 64,
+                "ffn_hidden_dim": 64,
+                "mp_depth": 2,
+            },
+        },
+    }
+
+    out_dir = _run_pipeline(tmp_path, config)
+    _assert_metrics(out_dir, "chemprop", ["auc", "auprc", "accuracy", "f1"])
     assert (out_dir / "run_config.yaml").exists()
 
 

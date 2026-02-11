@@ -19,3 +19,4 @@ tqdm>=4.67.1
 xgboost>=3.0.0
 shap>=0.47.2
 catboost>=1.2.7
+chemprop

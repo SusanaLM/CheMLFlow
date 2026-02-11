@@ -164,6 +164,267 @@ def _ensure_binary_labels(series: pd.Series) -> pd.Series:
 
     return series.map(lambda v: mapping.get(_normalize(v)))
 
+
+def _require_chemprop() -> None:
+    """Raise an actionable error if chemprop is not installed."""
+    try:
+        import chemprop  # noqa: F401
+    except Exception as exc:
+        raise ImportError(
+            "chemprop is required for model.type=chemprop. "
+            "Install it (and torch/lightning) e.g. `pip install chemprop`."
+        ) from exc
+
+
+def train_chemprop_model(
+    curated_df: pd.DataFrame,
+    target_column: str,
+    split_indices: Dict[str, Any],
+    output_dir: str,
+    random_state: int = 42,
+    task_type: str = "classification",
+    model_config: Dict[str, Any] | None = None,
+) -> Tuple[object, TrainResult]:
+    """Train a Chemprop D-MPNN model in-process (no CLI/subprocess).
+
+    This path is intentionally SMILES-native. It expects the curated dataset to include a
+    `canonical_smiles` column (or an override via model_config.smiles_column).
+
+    Artifacts written (consistent with other trainers):
+    - <output_dir>/chemprop_best_model.ckpt
+    - <output_dir>/chemprop_best_params.pkl
+    - <output_dir>/chemprop_metrics.json
+    - <output_dir>/chemprop_predictions.csv
+    """
+    _ensure_dir(output_dir)
+    _require_chemprop()
+    model_config = model_config or {}
+
+    if task_type != "classification":
+        raise ValueError("chemprop integration currently supports classification only.")
+
+    smiles_column = model_config.get("smiles_column", "canonical_smiles")
+    if smiles_column not in curated_df.columns:
+        raise ValueError(
+            f"chemprop requires smiles_column={smiles_column!r} in curated_df. "
+            "Ensure curate emits canonical_smiles or override model.smiles_column."
+        )
+    if target_column not in curated_df.columns:
+        raise ValueError(f"Target column {target_column!r} not found in curated_df.")
+
+    y_all = _ensure_binary_labels(curated_df[target_column])
+    # Keep a stable row_id (0..N-1) for joining predictions to the curated dataset.
+    df = curated_df.reset_index(drop=True).copy()
+    df["_row_id"] = df.index.astype(int)
+    df["_label"] = y_all.reset_index(drop=True).astype(int)
+
+    # Split indices are defined over curated_df row positions.
+    tr_idx = [int(i) for i in split_indices.get("train", [])]
+    va_idx = [int(i) for i in split_indices.get("val", [])]
+    te_idx = [int(i) for i in split_indices.get("test", [])]
+    if not te_idx and va_idx:
+        te_idx, va_idx = va_idx, []
+    if not tr_idx or not te_idx:
+        raise ValueError("chemprop training requires non-empty train and test splits.")
+    if not va_idx:
+        raise ValueError(
+            "chemprop training requires an explicit validation split from the split node. "
+            "Set split.val_size > 0."
+        )
+
+    # Hyperparameters.
+    params = dict(model_config.get("params", {}))
+    batch_size = int(params.get("batch_size", 64))
+    max_epochs = int(params.get("max_epochs", 30))
+    max_lr = float(params.get("max_lr", params.get("lr", 1e-3)))
+    init_lr = float(params.get("init_lr", max_lr / 10.0))
+    final_lr = float(params.get("final_lr", max_lr / 10.0))
+    ff_hidden = int(params.get("ffn_hidden_dim", 300))
+    mp_hidden = int(params.get("mp_hidden_dim", 300))
+    depth = int(params.get("mp_depth", 3))
+
+    # Under pytest we aggressively shrink runtime unless explicitly overridden.
+    if os.environ.get("PYTEST_CURRENT_TEST") and "max_epochs" not in params:
+        max_epochs = 2
+
+    logging.info(
+        "Training start (chemprop): task=%s N=%s train=%s val=%s test=%s",
+        task_type,
+        len(df),
+        len(tr_idx),
+        len(va_idx),
+        len(te_idx),
+    )
+
+    # Chemprop python API (v2). Keep imports local so base installs don't require chemprop deps.
+    import numpy as _np
+    import torch
+    from lightning import pytorch as pl
+    from lightning.pytorch import Trainer
+
+    from chemprop import data, featurizers, models, nn
+
+    pl.seed_everything(int(random_state), workers=True)
+
+    def _to_datapoints(rows: pd.DataFrame) -> list:
+        points = []
+        for smi, y in zip(rows[smiles_column].astype(str).tolist(), rows["_label"].tolist()):
+            points.append(data.MoleculeDatapoint.from_smi(smi, y=_np.array([float(y)], dtype=_np.float32)))
+        return points
+
+    all_points = _to_datapoints(df)
+    # Avoid chemprop split API differences by slicing datapoints directly with pipeline indices.
+    train_points = [all_points[i] for i in tr_idx]
+    val_points = [all_points[i] for i in va_idx]
+    test_points = [all_points[i] for i in te_idx]
+
+    mol_featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
+    train_data = data.MoleculeDataset(train_points, featurizer=mol_featurizer)
+    val_data = data.MoleculeDataset(val_points, featurizer=mol_featurizer)
+    test_data = data.MoleculeDataset(test_points, featurizer=mol_featurizer)
+    if hasattr(data, "build_dataloader"):
+        train_loader = data.build_dataloader(
+            train_data,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0,
+        )
+        val_loader = data.build_dataloader(
+            val_data,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+        test_loader = data.build_dataloader(
+            test_data,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+    else:
+        train_loader = data.MolGraphDataLoader(
+            train_data, mol_featurizer, batch_size=batch_size, shuffle=True, num_workers=0
+        )
+        val_loader = data.MolGraphDataLoader(
+            val_data, mol_featurizer, batch_size=batch_size, shuffle=False, num_workers=0
+        )
+        test_loader = data.MolGraphDataLoader(
+            test_data, mol_featurizer, batch_size=batch_size, shuffle=False, num_workers=0
+        )
+
+    import inspect
+
+    mp = nn.BondMessagePassing(d_h=mp_hidden, depth=depth)
+    agg = nn.MeanAggregation()
+
+    # Chemprop FFN constructor changed across versions:
+    # - older: BinaryClassificationFFN(..., d_mp=..., d_h=...)
+    # - newer: BinaryClassificationFFN(..., input_dim=..., hidden_dim=...)
+    ffn_sig = inspect.signature(nn.BinaryClassificationFFN.__init__)
+    ffn_kwargs: Dict[str, Any] = {"n_tasks": 1}
+    if "d_mp" in ffn_sig.parameters:
+        ffn_kwargs["d_mp"] = mp_hidden
+    if "input_dim" in ffn_sig.parameters:
+        ffn_kwargs["input_dim"] = mp_hidden
+    if "d_h" in ffn_sig.parameters:
+        ffn_kwargs["d_h"] = ff_hidden
+    if "hidden_dim" in ffn_sig.parameters:
+        ffn_kwargs["hidden_dim"] = ff_hidden
+    ffn = nn.BinaryClassificationFFN(**ffn_kwargs)
+    mpnn = models.MPNN(
+        message_passing=mp,
+        agg=agg,
+        predictor=ffn,
+        batch_norm=False,
+        metrics=None,
+        init_lr=init_lr,
+        max_lr=max_lr,
+        final_lr=final_lr,
+    )
+
+    trainer = Trainer(
+        max_epochs=max_epochs,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        deterministic=True,
+        accelerator="auto",
+        devices=1,
+    )
+    trainer.fit(mpnn, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+    # Predict probabilities on test split.
+    pred_batches = trainer.predict(mpnn, dataloaders=test_loader)
+    def _extract_tensor(obj):
+        if isinstance(obj, torch.Tensor):
+            return obj
+        if isinstance(obj, (list, tuple)) and obj:
+            return _extract_tensor(obj[0])
+        if isinstance(obj, dict) and obj:
+            # Best-effort: common key, else first value.
+            if "preds" in obj:
+                return _extract_tensor(obj["preds"])
+            return _extract_tensor(next(iter(obj.values())))
+        raise TypeError(f"Unsupported prediction batch type: {type(obj)!r}")
+
+    if isinstance(pred_batches, list):
+        preds_t = torch.cat([_extract_tensor(p).detach().cpu().reshape(-1, 1) for p in pred_batches], dim=0)
+        preds = preds_t.numpy().reshape(-1)
+    else:
+        preds = _extract_tensor(pred_batches).detach().cpu().numpy().reshape(-1)
+    preds = preds.astype(float)
+    if np.nanmin(preds) < 0.0 or np.nanmax(preds) > 1.0:
+        # Some configs may emit logits; convert to probabilities for metrics.
+        preds = 1.0 / (1.0 + np.exp(-preds))
+
+    y_true = df.loc[te_idx, "_label"].to_numpy(dtype=int)
+    y_pred = (preds >= 0.5).astype(int)
+
+    metrics = {
+        "auc": _safe_auc(y_true, preds),
+        "auprc": _safe_auprc(y_true, preds),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "f1": float(f1_score(y_true, y_pred)),
+        "max_epochs": int(max_epochs),
+        "batch_size": int(batch_size),
+        "init_lr": float(init_lr),
+        "max_lr": float(max_lr),
+        "final_lr": float(final_lr),
+        "mp_hidden_dim": int(mp_hidden),
+        "mp_depth": int(depth),
+        "ffn_hidden_dim": int(ff_hidden),
+    }
+
+    # Save artifacts.
+    model_path = os.path.join(output_dir, "chemprop_best_model.ckpt")
+    trainer.save_checkpoint(model_path)
+    params_path = os.path.join(output_dir, "chemprop_best_params.pkl")
+    metrics_path = os.path.join(output_dir, "chemprop_metrics.json")
+    best_params = {
+        "batch_size": batch_size,
+        "max_epochs": max_epochs,
+        "init_lr": init_lr,
+        "max_lr": max_lr,
+        "final_lr": final_lr,
+        "mp_hidden_dim": mp_hidden,
+        "mp_depth": depth,
+        "ffn_hidden_dim": ff_hidden,
+    }
+    joblib.dump(best_params, params_path)
+    pd.Series({k: v for k, v in metrics.items() if k in {"auc", "auprc", "accuracy", "f1"}}).to_json(metrics_path)
+
+    pred_path = os.path.join(output_dir, "chemprop_predictions.csv")
+    out_pred = df.loc[te_idx, ["_row_id", smiles_column, target_column]].copy()
+    out_pred.rename(columns={target_column: "y_true", smiles_column: "smiles"}, inplace=True)
+    out_pred["y_proba"] = preds
+    out_pred["y_pred"] = y_pred
+    out_pred.to_csv(pred_path, index=False)
+
+    logging.info("Training complete (chemprop): metrics=%s", {k: metrics[k] for k in ["auc", "auprc", "accuracy", "f1"]})
+    logging.info("Artifacts: model=%s metrics=%s params=%s preds=%s", model_path, metrics_path, params_path, pred_path)
+
+    return mpnn, TrainResult(model_path, params_path, metrics_path)
+
 def _run_optuna(
     config: DLSearchConfig,
     X_train: np.ndarray,
