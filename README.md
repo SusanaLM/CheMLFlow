@@ -281,12 +281,19 @@ CheMLFlow supports an in-process Chemprop D-MPNN backend behind `model.type: che
 This path is SMILES-native (no descriptor generation) and uses CheMLFlow's `split_indices`
 from the `split` node for apples-to-apples split comparability.
 
+Requirements for this path:
+- include the `split` node before `train` in `pipeline.nodes`
+- set a non-zero validation split (`split.val_size > 0`) so Chemprop has explicit train/val/test partitions
+
 ### Install
 
 Chemprop is an optional dependency (it typically brings in PyTorch and Lightning):
 
 - `pip install chemprop`
 - or, if you install CheMLFlow as a package: `pip install -e ".[chemprop]"`
+
+Chemprop's Python API can differ by installed version; CheMLFlow adapts common constructor
+differences at runtime for compatibility.
 
 ### Example config
 

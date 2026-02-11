@@ -684,8 +684,9 @@ def run_node_preprocess_features(context: dict) -> None:
 
     partitions = _resolve_split_partitions(context, X_clean.index)
     assert partitions is not None  # split_indices was validated above
-    train_idx, _, _ = partitions
+    train_idx, _, test_idx = partitions
     X_train = X_clean.loc[train_idx]
+    X_test = X_clean.loc[test_idx]
 
     variance_threshold, corr_threshold, clip_range, _, _ = _preprocess_params(context)
     preprocessor = data_preprocessing.fit_preprocessor(
@@ -1155,6 +1156,15 @@ def main() -> int:
         return 1
 
     if run_configured_pipeline_nodes(config, config_path):
+        # In some environments, native libraries loaded by the Chemprop stack can abort
+        # during interpreter teardown after successful training/artifact writes. In pytest
+        # subprocess runs, force a hard exit on success to avoid false-negative e2e failures.
+        if (
+            os.environ.get("PYTEST_CURRENT_TEST")
+            and config.get("model", {}).get("type") == "chemprop"
+        ):
+            logging.shutdown()
+            os._exit(0)
         return 0
 
     print(

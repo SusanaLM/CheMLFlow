@@ -273,23 +273,64 @@ def train_chemprop_model(
         return points
 
     all_points = _to_datapoints(df)
-    all_data = data.MoleculeDataset(all_points)
-    train_data, val_data, test_data = data.split_data_by_indices(all_data, tr_idx, va_idx, te_idx)
+    # Avoid chemprop split API differences by slicing datapoints directly with pipeline indices.
+    train_points = [all_points[i] for i in tr_idx]
+    val_points = [all_points[i] for i in va_idx]
+    test_points = [all_points[i] for i in te_idx]
 
     mol_featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
-    train_loader = data.MolGraphDataLoader(
-        train_data, mol_featurizer, batch_size=batch_size, shuffle=True, num_workers=0
-    )
-    val_loader = data.MolGraphDataLoader(
-        val_data, mol_featurizer, batch_size=batch_size, shuffle=False, num_workers=0
-    )
-    test_loader = data.MolGraphDataLoader(
-        test_data, mol_featurizer, batch_size=batch_size, shuffle=False, num_workers=0
-    )
+    train_data = data.MoleculeDataset(train_points, featurizer=mol_featurizer)
+    val_data = data.MoleculeDataset(val_points, featurizer=mol_featurizer)
+    test_data = data.MoleculeDataset(test_points, featurizer=mol_featurizer)
+    if hasattr(data, "build_dataloader"):
+        train_loader = data.build_dataloader(
+            train_data,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0,
+        )
+        val_loader = data.build_dataloader(
+            val_data,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+        test_loader = data.build_dataloader(
+            test_data,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+    else:
+        train_loader = data.MolGraphDataLoader(
+            train_data, mol_featurizer, batch_size=batch_size, shuffle=True, num_workers=0
+        )
+        val_loader = data.MolGraphDataLoader(
+            val_data, mol_featurizer, batch_size=batch_size, shuffle=False, num_workers=0
+        )
+        test_loader = data.MolGraphDataLoader(
+            test_data, mol_featurizer, batch_size=batch_size, shuffle=False, num_workers=0
+        )
+
+    import inspect
 
     mp = nn.BondMessagePassing(d_h=mp_hidden, depth=depth)
     agg = nn.MeanAggregation()
-    ffn = nn.BinaryClassificationFFN(n_tasks=1, d_mp=mp_hidden, d_h=ff_hidden)
+
+    # Chemprop FFN constructor changed across versions:
+    # - older: BinaryClassificationFFN(..., d_mp=..., d_h=...)
+    # - newer: BinaryClassificationFFN(..., input_dim=..., hidden_dim=...)
+    ffn_sig = inspect.signature(nn.BinaryClassificationFFN.__init__)
+    ffn_kwargs: Dict[str, Any] = {"n_tasks": 1}
+    if "d_mp" in ffn_sig.parameters:
+        ffn_kwargs["d_mp"] = mp_hidden
+    if "input_dim" in ffn_sig.parameters:
+        ffn_kwargs["input_dim"] = mp_hidden
+    if "d_h" in ffn_sig.parameters:
+        ffn_kwargs["d_h"] = ff_hidden
+    if "hidden_dim" in ffn_sig.parameters:
+        ffn_kwargs["hidden_dim"] = ff_hidden
+    ffn = nn.BinaryClassificationFFN(**ffn_kwargs)
     mpnn = models.MPNN(
         message_passing=mp,
         agg=agg,

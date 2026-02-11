@@ -19,6 +19,18 @@ def _run_pipeline(tmp_path: Path, config: dict) -> Path:
 
     env = os.environ.copy()
     env["CHEMLFLOW_CONFIG"] = str(config_path)
+    # Keep subprocess execution deterministic and avoid native thread/runtime flakiness
+    # (notably with torch/chemprop in CI-like environments).
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("MKL_NUM_THREADS", "1")
+    env.setdefault("OPENBLAS_NUM_THREADS", "1")
+    env.setdefault("NUMEXPR_NUM_THREADS", "1")
+    env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    env.setdefault("KMP_INIT_AT_FORK", "FALSE")
+    env.setdefault("MPLBACKEND", "Agg")
+    mpl_cfg = tmp_path / ".mplconfig"
+    mpl_cfg.mkdir(parents=True, exist_ok=True)
+    env.setdefault("MPLCONFIGDIR", str(mpl_cfg))
     python = os.environ.get("CHEMLFLOW_PYTHON", sys.executable)
     result = subprocess.run(
         [python, "main.py"],
@@ -31,6 +43,7 @@ def _run_pipeline(tmp_path: Path, config: dict) -> Path:
     if result.returncode != 0:
         raise AssertionError(
             "Pipeline failed.\n"
+            f"returncode: {result.returncode}\n"
             f"stdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}"
         )
@@ -232,7 +245,7 @@ def test_e2e_pgp_chemprop_fast(tmp_path: Path) -> None:
         "split": {
             "strategy": "random",
             "test_size": 0.2,
-            "val_size": 0.0,
+            "val_size": 0.2,
             "random_state": 42,
             "stratify": True,
         },
