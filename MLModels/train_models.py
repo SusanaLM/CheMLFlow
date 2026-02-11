@@ -219,7 +219,26 @@ def _run_optuna(
         
         # Evaluate on validation set
         trained_model = result["model"]
+
+        # Predict
         y_pred = _predict_dl(trained_model, X_val)
+
+        # NaN/Inf handling
+        y_true = np.asarray(y_val).reshape(-1)
+        y_hat = np.asarray(y_pred).reshape(-1)
+
+        if y_true.shape[0] != y_hat.shape[0]:
+            raise optuna.exceptions.TrialPruned(
+            f"Shape mismatch y_val={y_true.shape} y_pred={y_hat.shape}")
+
+        if not np.isfinite(y_true).all():
+            raise optuna.exceptions.TrialPruned("NaN/Inf in y_val (data issue)")
+
+        if not np.isfinite(y_hat).all():
+            # Common when training diverges for certain hyperparams
+            raise optuna.exceptions.TrialPruned("NaN/Inf in y_pred (diverged training)")
+
+
         r2 = r2_score(y_val, y_pred)
         
         # Track best
@@ -227,6 +246,16 @@ def _run_optuna(
             best_score = r2
             best_model = trained_model
             logging.info(f"New best R2={r2:.4f} with params: {params}")
+        
+        import gc
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        del model, result, y_pred
+        gc.collect()
         
         return r2  # Optuna maximizes by default when direction="maximize"
     
@@ -470,10 +499,10 @@ def _initialize_model(
             search_space={
                 "embed_dim": {"type": "categorical", "choices": [64, 128, 256]},
                 "n_heads": {"type": "categorical", "choices": [2, 4, 8]},
-                "n_layers": {"type": "categorical", "choices": [2, 3, 4, 6]},
+                "n_layers": {"type": "categorical", "choices": [3, 4]}, #  (deleted 6)
                 "dropout": {"type": "float", "low": 0.0, "high": 0.4, "log": False},
                 "learning_rate": {"type": "float", "low": 1e-5, "high": 1e-2, "log": True},
-                "batch_size": {"type": "categorical", "choices": [16, 32, 64, 128]},
+                "batch_size": {"type": "categorical", "choices": [16, 32]}, # Change to adapt to higher dimensional data (deleted 128, 64)
                 "epochs": {"type": "categorical", "choices": [100, 200, 300]},
             },
             default_params={
