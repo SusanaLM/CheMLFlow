@@ -23,7 +23,6 @@ from sklearn.metrics import (
     roc_curve,
 )
 from sklearn.inspection import permutation_importance
-from sklearn.model_selection import train_test_split
 
 
 @dataclass
@@ -177,25 +176,6 @@ def _require_chemprop() -> None:
         ) from exc
 
 
-def _split_indices_fallback(
-    indices: list[int],
-    val_fraction: float,
-    random_state: int,
-) -> tuple[list[int], list[int]]:
-    if val_fraction <= 0:
-        return indices, []
-    if len(indices) < 3:
-        # For tiny datasets, just keep everything in train.
-        return indices, []
-    rng = np.random.default_rng(random_state)
-    idx = np.array(indices, dtype=int)
-    rng.shuffle(idx)
-    n_val = max(1, int(round(val_fraction * len(idx))))
-    val_idx = idx[:n_val].tolist()
-    train_idx = idx[n_val:].tolist()
-    return train_idx, val_idx
-
-
 def train_chemprop_model(
     curated_df: pd.DataFrame,
     target_column: str,
@@ -247,7 +227,10 @@ def train_chemprop_model(
     if not tr_idx or not te_idx:
         raise ValueError("chemprop training requires non-empty train and test splits.")
     if not va_idx:
-        tr_idx, va_idx = _split_indices_fallback(tr_idx, val_fraction=0.1, random_state=random_state)
+        raise ValueError(
+            "chemprop training requires an explicit validation split from the split node. "
+            "Set split.val_size > 0."
+        )
 
     # Hyperparameters.
     params = dict(model_config.get("params", {}))
@@ -405,6 +388,8 @@ def _run_optuna(
     config: DLSearchConfig,
     X_train: np.ndarray,
     y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
     max_evals: int,
     random_state: int,
     patience: int,
@@ -414,9 +399,8 @@ def _run_optuna(
     except Exception as exc:
         raise ImportError("optuna is required for DL hyperparameter search.") from exc
     
-    X_tr, X_val, y_tr, y_val = train_test_split(
-        X_train, y_train, test_size=0.15, random_state=random_state
-    )
+    if X_val is None or y_val is None or len(y_val) == 0:
+        raise ValueError("DL hyperparameter search requires an explicit validation split (X_val/y_val).")
     
     best_model = None
     best_score = float("-inf")
@@ -443,9 +427,10 @@ def _run_optuna(
         # Train
         result = _train_dl(
             model=model,
-            X_train=X_tr,
-            y_train=y_tr,
-            random_state=random_state,
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
             epochs=int(params.get("epochs", 100)),
             batch_size=int(params.get("batch_size", 32)),
             learning_rate=float(params.get("learning_rate", 1e-3)),
@@ -763,7 +748,8 @@ def _train_dl(
     model,
     X_train: np.ndarray,
     y_train: np.ndarray,
-    random_state: int,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
     epochs: int,
     batch_size: int,
     learning_rate: float,
@@ -777,16 +763,14 @@ def _train_dl(
     model = model.to(device)
     
     X_t = torch.tensor(X_train, dtype=torch.float32, device=device)
-    y_t = torch.tensor(y_train.reshape(-1, 1), dtype=torch.float32, device=device)
+    y_t = torch.tensor(np.asarray(y_train).reshape(-1, 1), dtype=torch.float32, device=device)
+
+    if X_val is None or y_val is None:
+        raise ValueError("DL training requires X_val/y_val for early stopping.")
+    X_val_t = torch.tensor(X_val, dtype=torch.float32, device=device)
+    y_val_t = torch.tensor(np.asarray(y_val).reshape(-1, 1), dtype=torch.float32, device=device)
     
-    # Train/val split
-    n_val = max(1, int(0.1 * len(X_t)))
-    gen = torch.Generator().manual_seed(random_state)
-    idx = torch.randperm(len(X_t), generator=gen)
-    X_tr, X_val = X_t[idx[n_val:]], X_t[idx[:n_val]]
-    y_tr, y_val = y_t[idx[n_val:]], y_t[idx[:n_val]]
-    
-    loader = DataLoader(TensorDataset(X_tr, y_tr), batch_size=batch_size, shuffle=True)
+    loader = DataLoader(TensorDataset(X_t, y_t), batch_size=batch_size, shuffle=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     criterion = nn.MSELoss()
     
@@ -802,7 +786,7 @@ def _train_dl(
         
         model.eval()
         with torch.no_grad():
-            val_loss = criterion(model(X_val).view(-1, 1), y_val).item()
+            val_loss = criterion(model(X_val_t).view(-1, 1), y_val_t).item()
         
         if val_loss < best_loss - 1e-6:
             best_loss = val_loss
@@ -926,16 +910,32 @@ def train_model(
     )
     if isinstance(model, DLSearchConfig):
         # ── DL Training ──
+        if X_val is None or y_val is None or len(y_val) == 0:
+            raise ValueError(
+                "DL models require a validation split for early stopping/HPO. "
+                "Ensure the pipeline includes the split node and set split.val_size > 0."
+            )
         if use_hpo:
             logging.info(f"Running optuna for {model_type} ({hpo_trials} evals)")
             estimator, best_params = _run_optuna(
-                model, X_train.values, y_train.values, hpo_trials, random_state, patience
+                model,
+                X_train.values,
+                y_train.values,
+                X_val.values,
+                y_val.values,
+                hpo_trials,
+                random_state,
+                patience,
             )
         else:
             logging.info(f"Training DL model: {model_type} (default params)")
             nn_model = model.model_class(model.default_params)
             result = _train_dl(
-                nn_model, X_train.values, y_train.values, random_state,
+                nn_model,
+                X_train.values,
+                y_train.values,
+                X_val.values,
+                y_val.values,
                 epochs=model.default_params["epochs"],
                 batch_size=model.default_params["batch_size"],
                 learning_rate=model.default_params["learning_rate"],

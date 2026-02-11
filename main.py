@@ -10,7 +10,6 @@ from datetime import datetime
 import yaml
 import pandas as pd
 import joblib
-from sklearn.model_selection import train_test_split
 
 from contracts import (
     ANALYZE_EDA_INPUT_2CLASS_CONTRACT,
@@ -476,8 +475,38 @@ def run_node_split(context: dict) -> None:
     if stratify and not stratify_column:
         stratify_column = context.get("target_column")
 
+    def _safe_token(value: str) -> str:
+        out = []
+        for ch in str(value):
+            if ch.isalnum() or ch in {"_", "-"}:
+                out.append(ch)
+            else:
+                out.append("_")
+        return "".join(out)
+
+    def _fmt_float(value) -> str:
+        # 0.2 -> 0p2 for stable filenames
+        try:
+            return str(float(value)).replace(".", "p")
+        except Exception:
+            return _safe_token(str(value))
+
     curated_path = context.get("curated_path", context["paths"]["curated"])
     curated_df = pd.read_csv(curated_path)
+    if stratify:
+        if not stratify_column:
+            raise ValueError("split.stratify=true requires split.stratify_column to be set.")
+        if stratify_column not in curated_df.columns:
+            raise ValueError(
+                f"split.stratify_column={stratify_column!r} not found in curated data."
+            )
+        unique = curated_df[stratify_column].dropna().nunique()
+        # sklearn stratify expects discrete labels; guard against accidental regression stratification.
+        if unique > 20:
+            raise ValueError(
+                f"split.stratify_column={stratify_column!r} has {unique} unique values; "
+                "stratification requires a low-cardinality label column (e.g., binary class)."
+            )
     tdc_group = context.get("source", {}).get("group")
     tdc_name = context.get("source", {}).get("name")
     split_indices = splitters.build_split_indices(
@@ -503,8 +532,24 @@ def run_node_split(context: dict) -> None:
             normalized[key] = value
     normalized.setdefault("val", [])
     os.makedirs(context["paths"]["split_dir"], exist_ok=True)
-    split_path = os.path.join(context["paths"]["split_dir"], f"{strategy}.json")
-    splitters.save_split_indices(normalized, split_path)
+    split_filename_parts = [
+        _safe_token(strategy),
+        f"test{_fmt_float(test_size)}",
+        f"val{_fmt_float(val_size)}",
+        f"seed{_safe_token(random_state)}",
+    ]
+    if stratify and stratify_column:
+        split_filename_parts.append(f"strat_{_safe_token(stratify_column)}")
+    if strategy.startswith("tdc") and tdc_group and tdc_name:
+        split_filename_parts.append(f"tdc_{_safe_token(tdc_group)}_{_safe_token(tdc_name)}")
+    dataset_split_path = os.path.join(
+        context["paths"]["split_dir"],
+        "_".join(split_filename_parts) + ".json",
+    )
+    run_split_path = os.path.join(context["run_dir"], "split_indices.json")
+
+    splitters.save_split_indices(normalized, dataset_split_path)
+    splitters.save_split_indices(normalized, run_split_path)
     curated_count = len(curated_df)
     train_set = set(normalized.get("train", []))
     val_set = set(normalized.get("val", []))
@@ -537,7 +582,8 @@ def run_node_split(context: dict) -> None:
         else:
             raise ValueError("Split mapping produced empty validation split.")
     context["split_indices"] = normalized
-    context["split_path"] = split_path
+    context["split_path"] = run_split_path
+    context["dataset_split_path"] = dataset_split_path
 
 
 def _resolve_feature_inputs(context: dict) -> tuple[str, str]:
@@ -553,7 +599,7 @@ def _resolve_feature_inputs(context: dict) -> tuple[str, str]:
     return context["paths"]["rdkit_descriptors"], context["paths"]["pic50_3class"]
 
 
-def _preprocess_params(context: dict) -> tuple[float, float, tuple[float, float], int, float, int]:
+def _preprocess_params(context: dict) -> tuple[float, float, tuple[float, float], int, int]:
     preprocess_config = context.get("preprocess_config", {})
     variance_threshold = preprocess_config.get("variance_threshold", 0.8 * (1 - 0.8))
     corr_threshold = preprocess_config.get("corr_threshold", 0.95)
@@ -561,9 +607,8 @@ def _preprocess_params(context: dict) -> tuple[float, float, tuple[float, float]
     if isinstance(clip_range, list):
         clip_range = tuple(clip_range)
     stable_k = preprocess_config.get("stable_features_k", 50)
-    test_size = preprocess_config.get("test_size", 0.2)
     random_state = preprocess_config.get("random_state", 42)
-    return variance_threshold, corr_threshold, clip_range, stable_k, test_size, random_state
+    return variance_threshold, corr_threshold, clip_range, stable_k, random_state
 
 
 def _resolve_split_partitions(
@@ -606,6 +651,13 @@ def _resolve_split_partitions(
 
 
 def run_node_preprocess_features(context: dict) -> None:
+    split_indices = context.get("split_indices")
+    if not split_indices:
+        raise ValueError(
+            "preprocess.features requires split_indices from the split node. "
+            "Add 'split' before 'preprocess.features' in pipeline.nodes."
+        )
+
     features_file, labels_file = _resolve_feature_inputs(context)
     validate_contract(
         bind_output_path(PREPROCESS_FEATURES_INPUT_CONTRACT, features_file),
@@ -630,20 +682,12 @@ def run_node_preprocess_features(context: dict) -> None:
     )
     data_preprocessing.verify_data_quality(X_clean, y_clean)
 
-    variance_threshold, corr_threshold, clip_range, _, test_size, random_state = _preprocess_params(context)
     partitions = _resolve_split_partitions(context, X_clean.index)
-    if partitions is None:
-        logging.warning(
-            "No split_indices found; preprocess.features will perform its own random split. "
-            "For reproducible pipelines, add the 'split' node before preprocessing."
-        )
-        X_train, _, y_train, _ = train_test_split(
-            X_clean, y_clean, test_size=test_size, random_state=random_state
-        )
-    else:
-        train_idx, _, _ = partitions
-        X_train = X_clean.loc[train_idx]
-        y_train = y_clean.loc[train_idx]
+    assert partitions is not None  # split_indices was validated above
+    train_idx, _, _ = partitions
+    X_train = X_clean.loc[train_idx]
+
+    variance_threshold, corr_threshold, clip_range, _, _ = _preprocess_params(context)
     preprocessor = data_preprocessing.fit_preprocessor(
         X_train,
         variance_threshold=variance_threshold,
@@ -671,6 +715,7 @@ def run_node_preprocess_features(context: dict) -> None:
         preprocessed_labels, index=False
     )
     joblib.dump(preprocessor, context["paths"]["preprocess_artifacts"])
+    data_preprocessing.check_data_leakage(X_train, X_test)
 
     validate_contract(
         bind_output_path(PREPROCESS_FEATURES_OUTPUT_CONTRACT, preprocessed_features),
@@ -694,6 +739,13 @@ def run_node_preprocess_features(context: dict) -> None:
 
 
 def run_node_select_features(context: dict) -> None:
+    split_indices = context.get("split_indices")
+    if not split_indices:
+        raise ValueError(
+            "select.features requires split_indices from the split node. "
+            "Add 'split' before 'select.features' in pipeline.nodes."
+        )
+
     features_file = context["paths"]["preprocessed_features"]
     labels_file = context["paths"]["preprocessed_labels"]
 
@@ -720,21 +772,14 @@ def run_node_select_features(context: dict) -> None:
         context.get("categorical_features"),
     )
 
-    _, _, _, stable_k, test_size, random_state = _preprocess_params(context)
     partitions = _resolve_split_partitions(context, X.index)
-    if partitions is None:
-        logging.warning(
-            "No split_indices found; select.features will perform its own random split. "
-            "For reproducible pipelines, add the 'split' node before feature selection."
-        )
-        X_train, X_test, y_train, _ = train_test_split(
-            X, y, test_size=test_size, random_state=random_state
-        )
-    else:
-        train_idx, _, test_idx = partitions
-        X_train = X.loc[train_idx]
-        y_train = y.loc[train_idx]
-        X_test = X.loc[test_idx]
+    assert partitions is not None  # split_indices was validated above
+    train_idx, _, test_idx = partitions
+    X_train = X.loc[train_idx]
+    y_train = y.loc[train_idx]
+    X_test = X.loc[test_idx]
+
+    _, _, _, stable_k, random_state = _preprocess_params(context)
     X_selected_train = data_preprocessing.select_stable_features(
         X_train,
         y_train,
@@ -769,15 +814,23 @@ def run_node_train(context: dict) -> None:
     paths = context["paths"]
     task_type = context.get("task_type", "regression")
     model_config = context.get("model_config", {})
+    split_indices = context.get("split_indices")
+    if not split_indices:
+        raise ValueError(
+            "train requires split_indices from the split node. "
+            "Add 'split' before 'train' in pipeline.nodes."
+        )
 
     # Chemprop is a SMILES-native model; it does not use tabular descriptors.
     # For apples-to-apples benchmarking, we still rely on CheMLFlow's split_indices.
     if model_type == "chemprop":
         curated_path = context.get("curated_path", paths["curated"])
         curated_df = pd.read_csv(curated_path)
-        split_indices = context.get("split_indices")
-        if not split_indices:
-            raise ValueError("chemprop training requires split_indices (run the 'split' node).")
+        if not split_indices.get("val"):
+            raise ValueError(
+                "chemprop training requires an explicit validation split from the split node. "
+                "Set split.val_size > 0."
+            )
 
         _, train_result = train_models.train_chemprop_model(
             curated_df=curated_df,
@@ -846,28 +899,22 @@ def run_node_train(context: dict) -> None:
     if not skip_quality_checks:
         data_preprocessing.verify_data_quality(X, y)
 
-    test_size = context.get("preprocess_config", {}).get("test_size", 0.2)
     random_state = context.get("preprocess_config", {}).get("random_state", 42)
     cv_folds = context.get("model_config", {}).get("cv_folds", 5)
     search_iters = context.get("model_config", {}).get("search_iters", 100)
-    split_indices = context.get("split_indices")
     X_val = None
     y_val = None
-    if split_indices:
-        partitions = _resolve_split_partitions(context, X.index)
-        assert partitions is not None  # for type checkers; guarded by split_indices above
-        train_idx, val_idx, test_idx = partitions
-        X_train = X.loc[train_idx]
-        y_train = y.loc[train_idx]
-        X_test = X.loc[test_idx]
-        y_test = y.loc[test_idx]
-        if val_idx:
-            X_val = X.loc[val_idx]
-            y_val = y.loc[val_idx]
-    else:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state
-        )
+    partitions = _resolve_split_partitions(context, X.index)
+    assert partitions is not None  # split_indices was validated above
+    train_idx, val_idx, test_idx = partitions
+
+    X_train = X.loc[train_idx]
+    y_train = y.loc[train_idx]
+    X_test = X.loc[test_idx]
+    y_test = y.loc[test_idx]
+    if val_idx:
+        X_val = X.loc[val_idx]
+        y_val = y.loc[val_idx]
 
     if isinstance(y_train, pd.DataFrame):
         y_train = y_train.iloc[:, 0]
@@ -913,6 +960,12 @@ def run_node_explain(context: dict) -> None:
     if model_type == "chemprop":
         logging.warning("Explainability is not implemented for chemprop; skipping explain node.")
         return
+    split_indices = context.get("split_indices")
+    if not split_indices:
+        raise ValueError(
+            "explain requires split_indices from the split node. "
+            "Add 'split' before 'explain' in pipeline.nodes."
+        )
 
     model_path = context.get("trained_model_path")
     if not model_path:
@@ -946,20 +999,13 @@ def run_node_explain(context: dict) -> None:
         target_column,
         context.get("categorical_features"),
     )
-    split_indices = context.get("split_indices")
-    if split_indices:
-        partitions = _resolve_split_partitions(context, X.index)
-        assert partitions is not None  # for type checkers; guarded by split_indices above
-        train_idx, _, test_idx = partitions
-        X_train = X.loc[train_idx]
-        X_test = X.loc[test_idx]
-        y_test = y.loc[test_idx]
-    else:
-        test_size = context.get("preprocess_config", {}).get("test_size", 0.2)
-        random_state = context.get("preprocess_config", {}).get("random_state", 42)
-        X_train, X_test, _, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state
-        )
+    partitions = _resolve_split_partitions(context, X.index)
+    assert partitions is not None  # split_indices was validated above
+    train_idx, _, test_idx = partitions
+
+    X_train = X.loc[train_idx]
+    X_test = X.loc[test_idx]
+    y_test = y.loc[test_idx]
     estimator = train_models.load_model(
         model_path, 
         model_type, 
@@ -992,12 +1038,57 @@ NODE_REGISTRY = {
     "explain": run_node_explain,
 }
 
+_SPLIT_REQUIRED_FOR = {
+    "preprocess.features",
+    "select.features",
+    "train",
+    "explain",
+}
+
+_SPLIT_MUST_FOLLOW = {
+    "curate",
+    "label.normalize",
+    "label.ic50",
+}
+
+
+def validate_pipeline_nodes(nodes: list[str]) -> None:
+    """Validate pipeline node order and required dependencies.
+
+    This pipeline enforces a single source of truth for dataset splits: the split node.
+    """
+    uses_split_dependents = any(node in nodes for node in _SPLIT_REQUIRED_FOR)
+    split_positions = [i for i, node in enumerate(nodes) if node == "split"]
+    if len(split_positions) > 1:
+        raise ValueError("Pipeline must include at most one 'split' node.")
+
+    if uses_split_dependents and not split_positions:
+        raise ValueError(
+            "Pipeline includes nodes that require train/val/test membership, but is missing 'split'. "
+            "Add 'split' before preprocess.features/select.features/train/explain."
+        )
+
+    if not split_positions:
+        return
+
+    split_pos = split_positions[0]
+
+    for prerequisite in _SPLIT_MUST_FOLLOW:
+        if prerequisite in nodes and nodes.index(prerequisite) > split_pos:
+            raise ValueError(f"'split' must come after '{prerequisite}'.")
+
+    if uses_split_dependents:
+        for dep in _SPLIT_REQUIRED_FOR:
+            if dep in nodes and split_pos > nodes.index(dep):
+                raise ValueError(f"'split' must come before '{dep}'.")
+
 
 def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
     pipeline = config.get("pipeline", {})
     nodes = pipeline.get("nodes")
     if not nodes:
         return False
+    validate_pipeline_nodes(nodes)
 
     global_config = config.get("global")
     if not global_config:
@@ -1066,310 +1157,12 @@ def main() -> int:
     if run_configured_pipeline_nodes(config, config_path):
         return 0
 
-    global_config = config.get("global")
-    if not global_config:
-        print("Missing required global section in config.", file=sys.stderr)
-        return 1
-    pipeline_type = global_config.get("pipeline_type", "chembl")
-    get_data_config = config.get("get_data", {})
-    data_source = get_data_config.get("data_source")
-    source = get_data_config.get("source", {})
-    base_dir = global_config["base_dir"]
-    active_threshold = global_config["thresholds"]["active"]
-    inactive_threshold = global_config["thresholds"]["inactive"]
-    model_type = config["model"]["type"]
-    qm9_config = get_data_config
-    preprocess_config = config.get("preprocess", {})
-    keep_all_columns = preprocess_config.get(
-        "keep_all_columns", config.get("keep_all_columns", False)
+    print(
+        "Missing required pipeline definition. Add pipeline.nodes to the config and run the node-based pipeline. "
+        "Splitting is performed only by the 'split' node.",
+        file=sys.stderr,
     )
-    if pipeline_type == "qm9":
-        target_column = global_config.get("target_column", "gap")
-    else:
-        target_column = global_config.get("target_column", "pIC50")
-
-    os.makedirs("data", exist_ok=True)
-    os.makedirs(base_dir, exist_ok=True)
-    _configure_logging(run_dir)
-
-    # step 1.
-    # get raw data from a configured source.
-    script_path = os.path.join("GetData", "get_data.py")
-    output_file = os.path.join(base_dir, "raw.csv")
-    subprocess.run([sys.executable, script_path, output_file, "--config", config_path])
-    validate_contract(bind_output_path(GET_DATA_OUTPUT_CONTRACT, output_file), warn_only=True)
-
-    if pipeline_type == "qm9":
-        max_rows = qm9_config.get("max_rows")
-        raw_data_file = output_file
-        if max_rows:
-            sampled_path = os.path.join(base_dir, "raw_sample.csv")
-            sample_csv(output_file, sampled_path, int(max_rows))
-            raw_data_file = sampled_path
-
-        # preprocess and clean raw molecular data as required.
-        script_path = os.path.join("utilities", "prepareActivityData.py")
-        preprocessed_file = os.path.join(base_dir, "qm9_preprocessed.csv")
-        curated_file = os.path.join(base_dir, "qm9_curated_data.csv")
-        curated_smiles_output = os.path.join(base_dir, "qm9_curated_smiles.csv")
-        qm9_cmd = [
-            sys.executable,
-            script_path,
-            raw_data_file,
-            preprocessed_file,
-            curated_file,
-            curated_smiles_output,
-            "--active_threshold",
-            str(active_threshold),
-            "--inactive_threshold",
-            str(inactive_threshold),
-            "--properties",
-            target_column,
-        ]
-        if keep_all_columns:
-            qm9_cmd.append("--keep_all_columns")
-        subprocess.run(qm9_cmd)
-
-        # calculate RDKit descriptors (and include labels)
-        script_path = os.path.join("GenDescriptors", "RDKit_descriptors_labeled.py")
-        input_file = curated_file
-        output_file = os.path.join(base_dir, "qm9_with_RDKit_descriptors.csv")
-        labeled_output_file = os.path.join(base_dir, "qm9_RDKit_desc_labels.csv")
-        subprocess.run(
-            [
-                sys.executable,
-                script_path,
-                input_file,
-                output_file,
-                "--labeled-output-file",
-                labeled_output_file,
-                "--property-columns",
-                target_column,
-            ]
-        )
-        validate_contract(
-            ContractSpec(
-                name="qm9_labeled_descriptors",
-                required_columns=[target_column],
-                output_path=labeled_output_file,
-            ),
-            warn_only=True,
-        )
-
-        # train model (legacy pipeline path)
-        features_file = labeled_output_file
-        labels_file = labeled_output_file
-        output_dir = "results"
-        X, y = data_preprocessing.load_features_labels(
-            features_file,
-            labels_file,
-            target_column,
-            preprocess_config.get("categorical_features", []),
-        )
-        test_size = preprocess_config.get("test_size", 0.2)
-        random_state = preprocess_config.get("random_state", 42)
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state
-        )
-        train_models.train_model(
-            X_train,
-            y_train,
-            X_test,
-            y_test,
-            model_type,
-            output_dir,
-            random_state=random_state,
-        )
-        return 0
-
-
-    # step 2.
-    # preprocess and clean raw bioactivity data as required.
-    script_path = os.path.join("utilities", "prepareActivityData.py")
-    raw_data_file = os.path.join(base_dir, "raw.csv")
-    preprocessed_file = os.path.join(base_dir, "urease_preprocessed.csv")
-    curated_file = os.path.join(base_dir, "urease_bio_curated_data.csv")
-    curated_smiles_output = os.path.join(base_dir, "urease_bio_curated_smiles.csv")
-    chembl_cmd = [
-        sys.executable,
-        script_path,
-        raw_data_file,
-        preprocessed_file,
-        curated_file,
-        curated_smiles_output,
-        "--active_threshold",
-        str(active_threshold),
-        "--inactive_threshold",
-        str(inactive_threshold),
-        "--properties",
-        "standard_value",
-    ]
-    if keep_all_columns:
-        chembl_cmd.append("--keep_all_columns")
-    subprocess.run(chembl_cmd)
-    validate_contract(bind_output_path(PREPROCESSED_CONTRACT, preprocessed_file), warn_only=True)
-    validate_contract(bind_output_path(CURATE_OUTPUT_CONTRACT, curated_file), warn_only=True)
-
-
-    # step 3.
-    # Lipinski rules (rule of five) application.
-    script_path = os.path.join("utilities", "Lipinski_rules.py")
-    smiles_file = os.path.join(base_dir, "urease_bio_curated_data.csv")
-    output_file = os.path.join(base_dir, "lipinski_results.csv")
-    subprocess.run([sys.executable, script_path, smiles_file, output_file])
-    validate_contract(bind_output_path(LIPINSKI_CONTRACT, output_file), warn_only=True)
-    validate_contract(bind_output_path(IC50_INPUT_CONTRACT, output_file), warn_only=True)
-
-
-    # step 4
-    # bioactivity data normalisation and curation.
-    script_path = os.path.join("utilities", "IC50_pIC50.py")
-    input_file = os.path.join(base_dir, "lipinski_results.csv")
-    output_file_3class = os.path.join(base_dir, "bioactivity_3class_pIC50.csv")
-    output_file_2class = os.path.join(base_dir, "bioactivity_2class_pIC50.csv")
-    subprocess.run(
-        [sys.executable, script_path, input_file, output_file_3class, output_file_2class]
-    )
-    validate_contract(bind_output_path(PIC50_3CLASS_CONTRACT, output_file_3class), warn_only=True)
-    validate_contract(bind_output_path(PIC50_2CLASS_CONTRACT, output_file_2class), warn_only=True)
-
-
-    # step 5
-    # some statistical data analysis.
-    script_path = os.path.join("utilities", "stat_tests.py")
-    input_file = os.path.join(base_dir, "bioactivity_2class_pIC50.csv")
-    output_dir = base_dir
-    test_type = ["mannwhitney", "ttest", "chi2"]
-    descriptor = "pIC50"
-    for test in test_type:
-        subprocess.run(
-            [sys.executable, script_path, input_file, output_dir, test, descriptor]
-        )
-
-
-    # step 6
-    # some exploratory data analysis.
-    script_path = os.path.join("utilities", "EDA.py")
-    input_file_2class = os.path.join(base_dir, "bioactivity_2class_pIC50.csv")
-    input_file_3class = os.path.join(base_dir, "bioactivity_3class_pIC50.csv")
-    output_dir = base_dir
-    subprocess.run(
-        [sys.executable, script_path, input_file_2class, input_file_3class, output_dir]
-    )
-
-
-    # step 7
-    # calculate descriptors
-    # (a) RDKit descriptors
-    script_path = os.path.join("GenDescriptors", "RDKit_descriptors.py")
-    input_file = os.path.join(base_dir, "bioactivity_3class_pIC50.csv")
-    output_file = os.path.join(base_dir, "bioactivity_3class_with_RDKit_descriptors.csv")
-    subprocess.run([sys.executable, script_path, input_file, output_file])
-    validate_contract(bind_output_path(DESCRIPTORS_CONTRACT, output_file), warn_only=True)
-
-
-# # (b) PaDDEL descriptors
-# script_path = os.path.join('GenDescriptors', 'PaDEL_descriptors_only.py')
-# input_file = 'data/bioactivity_3class_pIC50.csv'
-# output_file = 'data/bioactivity_3class_with_PaDDEL_descriptors.csv'
-# chunk_size = 10
-# threads = 10
-# delay = 1
-# cpulimit = 90
-# subprocess.run(
-#     [
-#         'python', script_path, input_file, output_file,
-        
-#     ]
-# )
-# subprocess.run(['python', script_path, input_file, output_file,
-#                 '--chunk_size', str(chunk_size),
-#                 '--threads', str(threads),
-#                 '--delay', str(1),
-#                 '--cpulimit', str(cpulimit)])
-
-# # (c) mordred descriptors
-# # to implement
-
-
-# # step 8 
-# # Supervised ML and AI models
-# # Lazy predictors: iter0 performance of general ML models: queit lazy!
-# script_path = os.path.join('MLModels', 'Lazy_predictor.py')
-# features_file = 'data/COVID-19/bioactivity_3class_with_RDKit_descriptors.csv'
-# labels_file = 'data/COVID-19/bioactivity_3class_pIC50.csv'
-# test_size = 0.2
-# output_dir = 'results'
-# subprocess.run(['python', script_path, features_file, labels_file,
-#                 '--test_size', str(test_size),
-#                 '--output_dir', output_dir])
-
-# # (b) SVM, XGboost, random forest models with cross-validation
-# script_path = os.path.join('MLModels', 'MlModels_explainable_v3.py')
-# features_file = 'data/COVID-19/bioactivity_3class_with_RDKit_descriptors.csv'
-# labels_file = 'data/COVID-19/bioactivity_3class_pIC50.csv'
-# # ML_model = 'random_forest'
-# # ML_model = 'svm'
-# # ML_model = 'decision_tree'
-# ML_model = 'xgboost'
-# subprocess.run([
-#     'python', script_path, 
-#     features_file, labels_file, 
-#     ML_model
-# ])
-
-# # (b) SVM, XGboost, random forest models with cross-validation
-# script_path = os.path.join('MLModels', 'MlModels_explainable_v5.py')
-# features_file = 'data/COVID-19/bioactivity_3class_with_RDKit_descriptors.csv'
-# labels_file = 'data/COVID-19/bioactivity_3class_pIC50.csv'
-# output_dir = 'results'
-# # ML_model = 'random_forest'
-# # ML_model = 'svm'
-# # ML_model = 'decision_tree'
-# ML_model = 'xgboost'
-# subprocess.run([
-#     'python', script_path, 
-#     features_file, labels_file, 
-#     ML_model, output_dir
-# ])
-
-
-
-# (b) SVM, XGboost, random forest models with cross-validation
-    script_path = os.path.join("MLModels", "MlModels_explainable.py")
-    features_file = os.path.join(base_dir, "bioactivity_3class_with_RDKit_descriptors.csv")
-    labels_file = os.path.join(base_dir, "bioactivity_3class_pIC50.csv")
-    output_dir = "results"
-    ML_model = model_type
-# ML_model = 'svm'
-# ML_model = 'decision_tree'
-# ML_model = 'xgboost'
-    subprocess.run(
-        [
-            sys.executable,
-            script_path,
-            features_file,
-            labels_file,
-            ML_model,
-            output_dir,
-        ]
-    )
-    validate_contract(
-        ContractSpec(
-            name="model_labels",
-            required_columns=[target_column],
-            output_path=labels_file,
-        ),
-        warn_only=True,
-    )
-
-
-
-# # (c) Neural network models 
-
-
-
-    return 0
+    return 1
 
 
 if __name__ == "__main__":

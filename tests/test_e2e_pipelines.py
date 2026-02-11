@@ -67,6 +67,7 @@ def test_e2e_qm9_fast(tmp_path: Path) -> None:
             "test_size": 0.2,
             "val_size": 0.0,
             "random_state": 42,
+            "stratify": False,
         },
         "model": {
             "type": "decision_tree",
@@ -309,7 +310,7 @@ def test_e2e_ysi_fast(tmp_path: Path) -> None:
             "thresholds": {"active": 1000, "inactive": 10000},
             "run_dir": str(run_dir),
         },
-        "pipeline": {"nodes": ["get_data", "curate", "featurize.rdkit", "train"]},
+        "pipeline": {"nodes": ["get_data", "curate", "split", "featurize.rdkit", "train"]},
         "get_data": {
             "data_source": "local_csv",
             "source": {"path": str(FIXTURES / "ysi_small.csv")},
@@ -318,6 +319,13 @@ def test_e2e_ysi_fast(tmp_path: Path) -> None:
             "properties": "YSI",
             "smiles_column": "SMILES",
             "prefer_largest_fragment": True,
+        },
+        "split": {
+            "strategy": "random",
+            "test_size": 0.2,
+            "val_size": 0.0,
+            "random_state": 42,
+            "stratify": False,
         },
         "model": {
             "type": "decision_tree",
@@ -343,7 +351,7 @@ def test_e2e_pah_fast(tmp_path: Path) -> None:
             "thresholds": {"active": 1000, "inactive": 10000},
             "run_dir": str(run_dir),
         },
-        "pipeline": {"nodes": ["get_data", "curate", "featurize.rdkit", "train"]},
+        "pipeline": {"nodes": ["get_data", "curate", "split", "featurize.rdkit", "train"]},
         "get_data": {
             "data_source": "local_csv",
             "source": {"path": str(FIXTURES / "pah_small.csv")},
@@ -352,6 +360,13 @@ def test_e2e_pah_fast(tmp_path: Path) -> None:
             "properties": "log_p",
             "smiles_column": "smiles",
             "prefer_largest_fragment": True,
+        },
+        "split": {
+            "strategy": "random",
+            "test_size": 0.2,
+            "val_size": 0.0,
+            "random_state": 42,
+            "stratify": False,
         },
         "model": {
             "type": "decision_tree",
