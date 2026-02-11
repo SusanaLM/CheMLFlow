@@ -3,7 +3,7 @@ import logging
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import ShuffleSplit, StratifiedShuffleSplit
 
 try:
     from rdkit import Chem
@@ -77,21 +77,53 @@ def random_split_indices(
     random_state: int,
     stratify: Optional[np.ndarray] = None,
 ) -> Dict[str, List[int]]:
+    if not 0 < test_size < 1:
+        raise ValueError(f"test_size must be in (0, 1); got {test_size!r}")
+    if not 0 <= val_size < 1:
+        raise ValueError(f"val_size must be in [0, 1); got {val_size!r}")
+    if test_size + val_size >= 1:
+        raise ValueError("test_size + val_size must be < 1.")
+
     indices = np.arange(n_samples)
-    train_idx, test_idx = train_test_split(
-        indices,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=stratify,
-    )
-    if val_size > 0:
-        strat_train = stratify[train_idx] if stratify is not None else None
-        train_idx, val_idx = train_test_split(
-            train_idx,
-            test_size=val_size / (1 - test_size),
+    if stratify is not None:
+        splitter = StratifiedShuffleSplit(
+            n_splits=1,
+            test_size=test_size,
             random_state=random_state,
-            stratify=strat_train,
         )
+        train_pos, test_pos = next(splitter.split(indices, stratify))
+    else:
+        splitter = ShuffleSplit(
+            n_splits=1,
+            test_size=test_size,
+            random_state=random_state,
+        )
+        train_pos, test_pos = next(splitter.split(indices))
+    train_idx = indices[train_pos]
+    test_idx = indices[test_pos]
+    if val_size > 0:
+        val_fraction = val_size / (1 - test_size)
+        if not 0 < val_fraction < 1:
+            raise ValueError(
+                f"Derived val_fraction={val_fraction!r} from val_size/test_size is invalid."
+            )
+        if stratify is not None:
+            strat_train = stratify[train_idx]
+            splitter_val = StratifiedShuffleSplit(
+                n_splits=1,
+                test_size=val_fraction,
+                random_state=random_state,
+            )
+            train_pos2, val_pos = next(splitter_val.split(train_idx, strat_train))
+        else:
+            splitter_val = ShuffleSplit(
+                n_splits=1,
+                test_size=val_fraction,
+                random_state=random_state,
+            )
+            train_pos2, val_pos = next(splitter_val.split(train_idx))
+        val_idx = train_idx[val_pos]
+        train_idx = train_idx[train_pos2]
     else:
         val_idx = np.array([], dtype=int)
     return {

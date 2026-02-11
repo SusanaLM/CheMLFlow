@@ -1,0 +1,64 @@
+# Pgp_Broccatelli pipeline (ADME classification) using Chemprop D-MPNN (optional dependency)
+global:
+  pipeline_type: adme
+  task_type: classification
+  base_dir: data/pgp_broccatelli
+  target_column: label
+  thresholds:
+    active: 1000
+    inactive: 10000
+  runs:
+    enabled: true
+
+# Pipeline node order
+pipeline:
+  nodes:
+    - get_data
+    - curate
+    - label.normalize
+    - split
+    - train
+
+# Node configs
+get_data:
+  data_source: local_csv
+  source:
+    path: local_data/pgp_broccatelli.csv
+
+curate:
+  properties: Activity
+  smiles_column: SMILES
+  dedupe_strategy: drop_conflicts
+  label_column: Activity
+  prefer_largest_fragment: true
+
+label:
+  source_column: Activity
+  target_column: label
+  positive:
+    - 1
+    - "1"
+    - active
+  negative:
+    - 0
+    - "0"
+    - inactive
+
+split:
+  strategy: scaffold
+  test_size: 0.2
+  val_size: 0.1
+  random_state: 42
+  stratify: true
+
+model:
+  type: chemprop
+  smiles_column: canonical_smiles
+  params:
+    max_epochs: 30
+    batch_size: 64
+    max_lr: 0.001
+    mp_hidden_dim: 300
+    mp_depth: 3
+    ffn_hidden_dim: 300
+

@@ -7,6 +7,8 @@ import pandas as pd
 from rdkit import Chem, DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 
+ROW_INDEX_COL = "__row_index"
+
 
 def _find_smiles_column(columns: List[str]) -> Optional[str]:
     candidates = ["canonical_smiles", "smiles", "SMILES", "Smiles", "Drug", "drug"]
@@ -40,31 +42,44 @@ def main(
     if smiles_col is None:
         raise ValueError("Input file must contain a SMILES column.")
 
+    if ROW_INDEX_COL not in df.columns:
+        df[ROW_INDEX_COL] = df.index.astype(int)
+
     generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=n_bits)
 
     fps = []
-    valid_rows = []
+    valid_rows: List[int] = []
+    row_ids: List[int] = []
     for idx, smi in enumerate(df[smiles_col].astype(str).tolist()):
         arr = _morgan_fingerprint(smi, generator)
         if arr is None:
             continue
         fps.append(arr)
         valid_rows.append(idx)
+        row_ids.append(int(df.iloc[idx][ROW_INDEX_COL]))
 
     if not fps:
         raise ValueError("No valid SMILES for Morgan fingerprint generation.")
 
     fp_df = pd.DataFrame(fps, columns=[f"fp_{i}" for i in range(n_bits)])
+    fp_df[ROW_INDEX_COL] = row_ids
     fp_df.to_csv(output_file, index=False)
     logging.info("Morgan fingerprints saved to %s", output_file)
 
     if labeled_output_file:
         labels = df.iloc[valid_rows][[c for c in property_columns if c in df.columns]].copy()
+        labels[ROW_INDEX_COL] = [int(df.iloc[i][ROW_INDEX_COL]) for i in valid_rows]
         if labels.empty:
             logging.warning("No property columns found; labeled output will include fingerprints only.")
             combined = fp_df
         else:
-            combined = pd.concat([fp_df.reset_index(drop=True), labels.reset_index(drop=True)], axis=1)
+            combined = pd.concat(
+                [
+                    fp_df.reset_index(drop=True),
+                    labels.reset_index(drop=True).drop(columns=[ROW_INDEX_COL]),
+                ],
+                axis=1,
+            )
         combined.to_csv(labeled_output_file, index=False)
         logging.info("Labeled fingerprints saved to %s", labeled_output_file)
 

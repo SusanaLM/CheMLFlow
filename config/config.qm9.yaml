@@ -15,6 +15,7 @@ pipeline:
   nodes:
     - get_data
     - curate
+    - split
     - featurize.rdkit
     - preprocess.features
     - select.features
@@ -31,6 +32,13 @@ get_data:
 curate:
   properties: gap
 
+split:
+  strategy: scaffold
+  test_size: 0.2
+  val_size: 0.1
+  random_state: 42
+  stratify: false
+
 preprocess:
   keep_all_columns: true
   variance_threshold: 0.16
@@ -39,7 +47,6 @@ preprocess:
     - -10000000000.0
     - 10000000000.0
   stable_features_k: 50
-  test_size: 0.2
   random_state: 42
 
 model:
