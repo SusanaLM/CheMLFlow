@@ -229,6 +229,7 @@ def load_features_labels(
     labels_file: str,
     target_column: str,
     categorical_features: Sequence[str] | None = None,
+    exclude_columns: Sequence[str] | None = None,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """Load features and labels, align them, and drop duplicates and target columns."""
     try:
@@ -255,6 +256,15 @@ def load_features_labels(
             y_num = pd.to_numeric(y, errors="coerce")
             if y_num.notna().sum() >= 0.9 * y.notna().sum():
                 y = y_num
+
+        # Drop explicitly excluded columns (e.g., known leakage fields).
+        if exclude_columns:
+            # Preserve order while de-duplicating configured names.
+            configured = list(dict.fromkeys(str(col) for col in exclude_columns))
+            drop_cols = [col for col in configured if col in X.columns]
+            if drop_cols:
+                logging.info("Dropping user-excluded feature columns: %s", drop_cols)
+                X = X.drop(columns=drop_cols)
 
         # Drop SMILES-like columns from features.
         X = _drop_smiles_columns(X)

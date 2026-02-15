@@ -17,7 +17,6 @@ pipeline:
     - split
     - use.curated_features
     - preprocess.features
-    - select.features
     - train
     - explain
 
@@ -33,6 +32,15 @@ curate:
 
 preprocess:
   keep_all_columns: true
+  # Exclude known leakage/meta columns when training on experimental flash point.
+  exclude_columns:
+    - "FP Calc."
+    - "Std. Dev. (FP)"
+    - "CN Exp."
+    - "CN Calc."
+    - "Std. Dev. (CN)"
+    - "Set (FP)"
+    - "Set (CN)"
   categorical_features:
     - Family
   variance_threshold: 0.16
@@ -44,7 +52,7 @@ preprocess:
   random_state: 42
 
 split:
-  strategy: scaffold
+  strategy: random
   test_size: 0.2
   val_size: 0.1
   random_state: 42

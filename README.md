@@ -269,6 +269,7 @@ In `config/*.yaml`:
 - `model.type`: model selection
 - `model.cv_folds`, `model.search_iters`: CV + search effort
 - `preprocess.*`: preprocessing thresholds and split settings
+- `preprocess.exclude_columns`: optional list of feature columns to remove before modeling (useful to avoid leakage fields)
 - `pipeline.nodes`: ordered list of steps (e.g., add/remove `explain`)
 - `task_type`: `regression` or `classification`
 - `split.*`: split strategy and sizes (e.g., `random`, `scaffold`, `tdc_scaffold`)

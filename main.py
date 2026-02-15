@@ -611,6 +611,19 @@ def _preprocess_params(context: dict) -> tuple[float, float, tuple[float, float]
     return variance_threshold, corr_threshold, clip_range, stable_k, random_state
 
 
+def _exclude_feature_columns(context: dict) -> list[str]:
+    preprocess_config = context.get("preprocess_config", {})
+    raw = preprocess_config.get("exclude_columns", context.get("exclude_columns", []))
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple, set)):
+        raise ValueError("preprocess.exclude_columns must be a list of column names.")
+    cols = [str(col).strip() for col in raw]
+    return [col for col in cols if col]
+
+
 def _resolve_split_partitions(
     context: dict,
     index: pd.Index,
@@ -679,6 +692,7 @@ def run_node_preprocess_features(context: dict) -> None:
         labels_file,
         context["target_column"],
         context.get("categorical_features"),
+        exclude_columns=_exclude_feature_columns(context),
     )
     data_preprocessing.verify_data_quality(X_clean, y_clean)
 
@@ -771,6 +785,7 @@ def run_node_select_features(context: dict) -> None:
         labels_file,
         target_column,
         context.get("categorical_features"),
+        exclude_columns=_exclude_feature_columns(context),
     )
 
     partitions = _resolve_split_partitions(context, X.index)
@@ -894,6 +909,7 @@ def run_node_train(context: dict) -> None:
         labels_file,
         target_column,
         context.get("categorical_features"),
+        exclude_columns=_exclude_feature_columns(context),
     )
     if isinstance(y, pd.DataFrame):
         y = data_preprocessing.select_target_series(y, target_column)
@@ -999,6 +1015,7 @@ def run_node_explain(context: dict) -> None:
         labels_file,
         target_column,
         context.get("categorical_features"),
+        exclude_columns=_exclude_feature_columns(context),
     )
     partitions = _resolve_split_partitions(context, X.index)
     assert partitions is not None  # split_indices was validated above
