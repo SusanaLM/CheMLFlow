@@ -268,6 +268,7 @@ Notes:
 In `config/*.yaml`:
 - `model.type`: model selection
 - `model.cv_folds`, `model.search_iters`: CV + search effort
+- `model.plot_split_performance`: optional bool; when true, saves train/val/test metrics JSON + plot in the run output dir
 - `preprocess.*`: preprocessing thresholds and split settings
 - `preprocess.exclude_columns`: optional list of feature columns to remove before modeling (useful to avoid leakage fields)
 - `pipeline.nodes`: ordered list of steps (e.g., add/remove `explain`)

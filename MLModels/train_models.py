@@ -1,3 +1,4 @@
+import json
 import os
 import logging
 from dataclasses import dataclass
@@ -115,6 +116,74 @@ def _save_roc_curve(output_dir: str, model_type: str, y_true, y_score) -> str | 
     plt.savefig(roc_path)
     plt.close()
     return roc_path
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _safe_r2(y_true, y_pred) -> float | None:
+    try:
+        return float(r2_score(y_true, y_pred))
+    except ValueError:
+        return None
+
+
+def _safe_mae(y_true, y_pred) -> float | None:
+    try:
+        return float(mean_absolute_error(y_true, y_pred))
+    except ValueError:
+        return None
+
+
+def _save_split_metrics_artifacts(
+    output_dir: str,
+    model_type: str,
+    split_metrics: Dict[str, Dict[str, float | None]],
+) -> tuple[str | None, str | None]:
+    if not split_metrics:
+        return None, None
+
+    split_order = [name for name in ("train", "val", "test") if name in split_metrics]
+    if not split_order:
+        split_order = list(split_metrics.keys())
+
+    metrics_json_path = os.path.join(output_dir, f"{model_type}_split_metrics.json")
+    with open(metrics_json_path, "w", encoding="utf-8") as f:
+        json.dump(split_metrics, f, indent=2)
+
+    df = pd.DataFrame.from_dict(split_metrics, orient="index")
+    df = df.reindex(split_order)
+    df = df.apply(pd.to_numeric, errors="coerce")
+    metric_names = [name for name in df.columns if df[name].notna().any()]
+    if not metric_names:
+        return metrics_json_path, None
+
+    fig, axes = plt.subplots(
+        nrows=len(metric_names),
+        ncols=1,
+        figsize=(8, max(3, 2.6 * len(metric_names))),
+        squeeze=False,
+    )
+    for idx, metric_name in enumerate(metric_names):
+        ax = axes[idx, 0]
+        values = df[metric_name]
+        ax.bar(df.index.astype(str), values.values)
+        ax.set_title(metric_name)
+        ax.set_ylabel(metric_name)
+        ax.grid(axis="y", alpha=0.25)
+
+    fig.tight_layout()
+    plot_path = os.path.join(output_dir, f"{model_type}_split_metrics.png")
+    fig.savefig(plot_path)
+    plt.close(fig)
+    return metrics_json_path, plot_path
 
 
 def _ensure_binary_labels(series: pd.Series) -> pd.Series:
@@ -911,6 +980,7 @@ def train_model(
     _ensure_dir(output_dir)
     is_dl = _is_dl_model(model_type)
     model_config = model_config or {}
+    plot_split_performance = _as_bool(model_config.get("plot_split_performance", False))
     n_jobs = _resolve_n_jobs(model_config)
 
     logging.info(
@@ -956,6 +1026,35 @@ def train_model(
             "accuracy": float(accuracy_score(y_test, y_pred)),
             "f1": float(f1_score(y_test, y_pred)),
         }
+        if plot_split_performance:
+            split_metrics: Dict[str, Dict[str, float | None]] = {
+                "train": {
+                    "auc": _safe_auc(y_train, estimator.predict_proba(X_train)[:, 1]),
+                    "auprc": _safe_auprc(y_train, estimator.predict_proba(X_train)[:, 1]),
+                    "accuracy": float(accuracy_score(y_train, estimator.predict(X_train))),
+                    "f1": float(f1_score(y_train, estimator.predict(X_train))),
+                },
+                "test": metrics.copy(),
+            }
+            if X_val is not None and y_val is not None and len(y_val) > 0:
+                y_val_proba = estimator.predict_proba(X_val)[:, 1]
+                y_val_pred = estimator.predict(X_val)
+                split_metrics["val"] = {
+                    "auc": _safe_auc(y_val, y_val_proba),
+                    "auprc": _safe_auprc(y_val, y_val_proba),
+                    "accuracy": float(accuracy_score(y_val, y_val_pred)),
+                    "f1": float(f1_score(y_val, y_val_pred)),
+                }
+            split_metrics_path, split_plot_path = _save_split_metrics_artifacts(
+                output_dir,
+                model_type,
+                split_metrics,
+            )
+            if split_metrics_path:
+                metrics["split_metrics_path"] = split_metrics_path
+            if split_plot_path:
+                metrics["split_metrics_plot_path"] = split_plot_path
+
         roc_path = _save_roc_curve(output_dir, model_type, y_test, y_pred_proba)
         if roc_path:
             metrics["roc_curve_path"] = roc_path
@@ -1033,6 +1132,40 @@ def train_model(
         "r2": float(r2_score(y_test, y_pred)),
         "mae": float(mean_absolute_error(y_test, y_pred)),
     }
+    if plot_split_performance:
+        if is_dl:
+            y_train_pred = _predict_dl(estimator, X_train.values)
+            y_test_pred = _predict_dl(estimator, X_test.values)
+            y_val_pred = _predict_dl(estimator, X_val.values) if X_val is not None else None
+        else:
+            y_train_pred = estimator.predict(X_train)
+            y_test_pred = estimator.predict(X_test)
+            y_val_pred = estimator.predict(X_val) if X_val is not None else None
+
+        split_metrics: Dict[str, Dict[str, float | None]] = {
+            "train": {
+                "r2": _safe_r2(y_train, y_train_pred),
+                "mae": _safe_mae(y_train, y_train_pred),
+            },
+            "test": {
+                "r2": _safe_r2(y_test, y_test_pred),
+                "mae": _safe_mae(y_test, y_test_pred),
+            },
+        }
+        if X_val is not None and y_val is not None and len(y_val) > 0 and y_val_pred is not None:
+            split_metrics["val"] = {
+                "r2": _safe_r2(y_val, y_val_pred),
+                "mae": _safe_mae(y_val, y_val_pred),
+            }
+        split_metrics_path, split_plot_path = _save_split_metrics_artifacts(
+            output_dir,
+            model_type,
+            split_metrics,
+        )
+        if split_metrics_path:
+            metrics["split_metrics_path"] = split_metrics_path
+        if split_plot_path:
+            metrics["split_metrics_plot_path"] = split_plot_path
 
     params_path = os.path.join(output_dir, f"{model_type}_best_params.pkl")
     metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")

@@ -62,3 +62,4 @@ model:
   type: random_forest
   cv_folds: 3
   search_iters: 50
+  plot_split_performance: true
