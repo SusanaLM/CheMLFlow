@@ -269,6 +269,7 @@ In `config/*.yaml`:
 - `model.type`: model selection
 - `model.cv_folds`, `model.search_iters`: CV + search effort
 - `model.plot_split_performance`: optional bool; when true, saves train/val/test metrics JSON + plot in the run output dir
+- `model.foundation*`: Chemprop foundation settings (`foundation`, `foundation_checkpoint`, `freeze_encoder`)
 - `preprocess.*`: preprocessing thresholds and split settings
 - `preprocess.exclude_columns`: optional list of feature columns to remove before modeling (useful to avoid leakage fields)
 - `pipeline.nodes`: ordered list of steps (e.g., add/remove `explain`)
@@ -305,6 +306,43 @@ Use the included example: `config/config.pgp_chemprop.yaml`:
 CHEMLFLOW_CONFIG=config/config.pgp_chemprop.yaml python main.py
 ```
 
+This bundled example defaults to `model.foundation: none` so it runs without
+an external foundation checkpoint file.
+
+### CheMeleon foundation checkpoint
+
+- Zenodo record (CheMeleon weights): https://zenodo.org/records/15460715
+- Download into this repo:
+
+```
+mkdir -p models
+curl -L https://zenodo.org/records/15460715/files/chemeleon_mp.pt -o models/chemeleon_mp.pt
+```
+
+- Expected file size after download: about `33 MB` (observed `33.2M`).
+- Verify:
+
+```
+ls -lh models/chemeleon_mp.pt
+```
+
+### Foundation fine-tuning knobs
+
+For `model.type: chemprop` (classification path), you can enable CheMeleon initialization:
+- `model.foundation`: `none` (default) or `chemeleon`
+- `model.foundation_checkpoint`: local path to `chemeleon_mp.pt` (required when `foundation=chemeleon`)
+- `model.freeze_encoder`: whether to freeze message-passing weights after loading foundation weights (default `false`)
+
+Example:
+
+```yaml
+model:
+  type: chemprop
+  foundation: chemeleon
+  foundation_checkpoint: models/chemeleon_mp.pt
+  freeze_encoder: false
+```
+
 ### Target column
 
 Chemprop trains on the pipeline context's `target_column`:
@@ -331,5 +369,5 @@ Put these under `model.params` (all optional; defaults exist):
 Under the run directory (e.g., `runs/<timestamp>/`):
 - `chemprop_best_model.ckpt`
 - `chemprop_best_params.pkl` (do not load untrusted pickle/joblib files)
-- `chemprop_metrics.json`
+- `chemprop_metrics.json` (includes metrics and Chemprop/foundation run settings)
 - `chemprop_predictions.csv`

@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import shutil
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any, Callable
 
@@ -245,6 +246,36 @@ def _require_chemprop() -> None:
         ) from exc
 
 
+def _resolve_chemprop_foundation_config(model_config: Dict[str, Any]) -> tuple[str, str | None, bool]:
+    foundation = str(model_config.get("foundation", "none")).strip().lower()
+    if foundation in {"", "none"}:
+        foundation = "none"
+    if foundation not in {"none", "chemeleon"}:
+        raise ValueError(
+            "model.foundation must be one of: 'none', 'chemeleon'."
+        )
+
+    freeze_encoder = _as_bool(model_config.get("freeze_encoder", False))
+    checkpoint_path: str | None = None
+    if foundation == "chemeleon":
+        raw_path = model_config.get("foundation_checkpoint")
+        if not raw_path or not str(raw_path).strip():
+            raise ValueError(
+                "model.foundation_checkpoint is required when model.foundation='chemeleon'."
+            )
+        checkpoint_path = os.path.expanduser(str(raw_path).strip())
+        if not os.path.isfile(checkpoint_path):
+            raise ValueError(
+                f"model.foundation_checkpoint does not exist or is not a file: {checkpoint_path}"
+            )
+    elif freeze_encoder:
+        raise ValueError(
+            "model.freeze_encoder=true requires model.foundation='chemeleon'."
+        )
+
+    return foundation, checkpoint_path, freeze_encoder
+
+
 def train_chemprop_model(
     curated_df: pd.DataFrame,
     target_column: str,
@@ -268,6 +299,7 @@ def train_chemprop_model(
     _ensure_dir(output_dir)
     _require_chemprop()
     model_config = model_config or {}
+    foundation_mode, foundation_checkpoint, freeze_encoder = _resolve_chemprop_foundation_config(model_config)
 
     if task_type != "classification":
         raise ValueError("chemprop integration currently supports classification only.")
@@ -330,6 +362,7 @@ def train_chemprop_model(
     import torch
     from lightning import pytorch as pl
     from lightning.pytorch import Trainer
+    from lightning.pytorch.callbacks import ModelCheckpoint
 
     from chemprop import data, featurizers, models, nn
 
@@ -383,7 +416,48 @@ def train_chemprop_model(
 
     import inspect
 
-    mp = nn.BondMessagePassing(d_h=mp_hidden, depth=depth)
+    foundation_hparams: Dict[str, Any] | None = None
+    if foundation_mode == "chemeleon":
+        assert foundation_checkpoint is not None  # validated by _resolve_chemprop_foundation_config
+        payload = torch.load(foundation_checkpoint, map_location="cpu", weights_only=True)
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Invalid CheMeleon checkpoint payload in {foundation_checkpoint}: expected dict."
+            )
+        if "hyper_parameters" not in payload or "state_dict" not in payload:
+            raise ValueError(
+                f"Invalid CheMeleon checkpoint payload in {foundation_checkpoint}: expected keys 'hyper_parameters' and 'state_dict'."
+            )
+        hyper_parameters = payload["hyper_parameters"]
+        state_dict = payload["state_dict"]
+        if not isinstance(hyper_parameters, dict):
+            raise ValueError(
+                f"Invalid CheMeleon checkpoint payload in {foundation_checkpoint}: 'hyper_parameters' must be a dict."
+            )
+        foundation_hparams = hyper_parameters
+        mp = nn.BondMessagePassing(**hyper_parameters)
+        mp.load_state_dict(state_dict)
+        if freeze_encoder:
+            for param in mp.parameters():
+                param.requires_grad = False
+            # Keep frozen encoder layers in eval mode to avoid stochastic behavior.
+            mp.eval()
+        logging.info(
+            "Chemprop foundation init: mode=%s checkpoint=%s freeze_encoder=%s",
+            foundation_mode,
+            foundation_checkpoint,
+            freeze_encoder,
+        )
+    else:
+        mp = nn.BondMessagePassing(d_h=mp_hidden, depth=depth)
+
+    mp_output_dim = int(getattr(mp, "output_dim", mp_hidden))
+    configured_or_ckpt_depth = (
+        foundation_hparams.get("depth")
+        if isinstance(foundation_hparams, dict) and "depth" in foundation_hparams
+        else depth
+    )
+    mp_depth_effective = int(getattr(mp, "depth", configured_or_ckpt_depth))
     agg = nn.MeanAggregation()
 
     # Chemprop FFN constructor changed across versions:
@@ -392,9 +466,9 @@ def train_chemprop_model(
     ffn_sig = inspect.signature(nn.BinaryClassificationFFN.__init__)
     ffn_kwargs: Dict[str, Any] = {"n_tasks": 1}
     if "d_mp" in ffn_sig.parameters:
-        ffn_kwargs["d_mp"] = mp_hidden
+        ffn_kwargs["d_mp"] = mp_output_dim
     if "input_dim" in ffn_sig.parameters:
-        ffn_kwargs["input_dim"] = mp_hidden
+        ffn_kwargs["input_dim"] = mp_output_dim
     if "d_h" in ffn_sig.parameters:
         ffn_kwargs["d_h"] = ff_hidden
     if "hidden_dim" in ffn_sig.parameters:
@@ -411,19 +485,42 @@ def train_chemprop_model(
         final_lr=final_lr,
     )
 
+    checkpointing = ModelCheckpoint(
+        dirpath=output_dir,
+        filename="chemprop-best-{epoch:02d}-{val_loss:.4f}",
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+        save_last=True,
+    )
+    callbacks = [checkpointing]
+    if foundation_mode == "chemeleon" and freeze_encoder:
+        from lightning.pytorch.callbacks import Callback
+
+        class _FrozenEncoderEvalCallback(Callback):
+            """Keep frozen encoder modules in eval mode across Lightning train/eval toggles."""
+
+            def on_train_epoch_start(self, trainer, pl_module) -> None:  # type: ignore[override]
+                for attr_name in ("message_passing", "mp", "encoder"):
+                    module = getattr(pl_module, attr_name, None)
+                    if isinstance(module, torch.nn.Module):
+                        module.eval()
+
+        callbacks.append(_FrozenEncoderEvalCallback())
     trainer = Trainer(
         max_epochs=max_epochs,
         logger=False,
-        enable_checkpointing=False,
+        enable_checkpointing=True,
         enable_progress_bar=False,
         deterministic=True,
         accelerator="auto",
         devices=1,
+        callbacks=callbacks,
     )
     trainer.fit(mpnn, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
     # Predict probabilities on test split.
-    pred_batches = trainer.predict(mpnn, dataloaders=test_loader)
+    pred_batches = trainer.predict(dataloaders=test_loader, ckpt_path="best")
     def _extract_tensor(obj):
         if isinstance(obj, torch.Tensor):
             return obj
@@ -459,14 +556,21 @@ def train_chemprop_model(
         "init_lr": float(init_lr),
         "max_lr": float(max_lr),
         "final_lr": float(final_lr),
-        "mp_hidden_dim": int(mp_hidden),
-        "mp_depth": int(depth),
+        "mp_hidden_dim": int(mp_output_dim),
+        "mp_depth": int(mp_depth_effective),
         "ffn_hidden_dim": int(ff_hidden),
+        "foundation": foundation_mode,
+        "foundation_checkpoint": foundation_checkpoint,
+        "freeze_encoder": bool(freeze_encoder),
     }
 
     # Save artifacts.
     model_path = os.path.join(output_dir, "chemprop_best_model.ckpt")
-    trainer.save_checkpoint(model_path)
+    best_model_path = checkpointing.best_model_path
+    if best_model_path and os.path.isfile(best_model_path):
+        shutil.copyfile(best_model_path, model_path)
+    else:
+        trainer.save_checkpoint(model_path)
     params_path = os.path.join(output_dir, "chemprop_best_params.pkl")
     metrics_path = os.path.join(output_dir, "chemprop_metrics.json")
     best_params = {
@@ -475,12 +579,16 @@ def train_chemprop_model(
         "init_lr": init_lr,
         "max_lr": max_lr,
         "final_lr": final_lr,
-        "mp_hidden_dim": mp_hidden,
-        "mp_depth": depth,
+        "mp_hidden_dim": mp_output_dim,
+        "mp_depth": mp_depth_effective,
         "ffn_hidden_dim": ff_hidden,
+        "foundation": foundation_mode,
+        "foundation_checkpoint": foundation_checkpoint,
+        "freeze_encoder": bool(freeze_encoder),
     }
     joblib.dump(best_params, params_path)
-    pd.Series({k: v for k, v in metrics.items() if k in {"auc", "auprc", "accuracy", "f1"}}).to_json(metrics_path)
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
 
     pred_path = os.path.join(output_dir, "chemprop_predictions.csv")
     out_pred = df.loc[te_idx, ["_row_id", smiles_column, target_column]].copy()
