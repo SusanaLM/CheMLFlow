@@ -60,6 +60,7 @@ Notes:
 - If `conda activate` fails, run `conda init zsh` once and restart your terminal (or `exec zsh`).
 - Run commands from the repo root (`CheMLFlow/`) so relative paths resolve.
 - If you see NumPy binary incompat errors after pip installs, reinstall numpy/numba/llvmlite/rdkit from conda-forge.
+- `pytdc` is optional and is not installed by `requirements.txt`.
 
 4. Optional: Install PyTorch + Optuna for DL models
 
@@ -89,7 +90,21 @@ pip install pytorch-lightning
 
 pip install optuna
 
-5. Remove additional install files
+5. Optional: Install TDC (`pytdc`) for PGP export/benchmark workflows
+
+Install in your active environment:
+
+pip install pytdc
+
+Quick import check:
+
+python -c "from tdc.benchmark_group import admet_group; print('pytdc ok')"
+
+Troubleshooting:
+- If you want to keep the main env frozen after `pip install -r requirements.txt --no-deps`, use a small separate env for `pytdc` export tasks.
+- If import errors mention `huggingface_hub`, install/upgrade it in that same env: `pip install -U huggingface_hub`
+
+6. Remove additional install files
 
 make clean
 
@@ -248,6 +263,34 @@ Notes:
 - If `pytdc` is not installed in the main env, run the export script in a small temporary env.
 - Split strategy defaults to `scaffold` (configurable in `split.strategy`).
 
+### Pgp_Broccatelli (TDC Benchmark Workflow via `train.tdc`)
+
+This mode runs an explicit leaderboard-style TDC benchmark loop (multiple seeds + `evaluate_many`),
+instead of a single local train/test run.
+
+1. Ensure `pytdc` is installed:
+
+`pip install pytdc`
+
+Verify:
+
+`python -c "from tdc.benchmark_group import admet_group; print('pytdc ok')"`
+
+2. Run the benchmark config:
+
+`CHEMLFLOW_CONFIG=config/config.pgp_tdc_benchmark.yaml python main.py`
+
+3. Outputs:
+- Run directory: `runs/<timestamp>/`
+- TDC artifacts: `runs/<timestamp>/tdc_benchmark/`
+- Aggregate results: `runs/<timestamp>/tdc_benchmark/tdc_benchmark_results.json`
+- Summary CSV: `runs/<timestamp>/tdc_benchmark/tdc_benchmark_summary.csv`
+
+Notes:
+- This node currently supports `model.type: catboost_classifier`.
+- The run log prints a high-visibility banner when TDC benchmark mode is active.
+- If your environment is intentionally minimal (`--no-deps` flow), you can run this in a dedicated env with `pytdc` installed.
+
 ### ARA (Androgen Receptor Antagonist, AR.csv → Morgan → CatBoost → AUROC)
 
 1. Place the dataset at:
@@ -279,6 +322,7 @@ In `config/*.yaml`:
 - `global.runs.enabled`: use `runs/<timestamp>` instead of `results/`
 - `global.debug`: when `true`, enables debug-style training logs; when `false` (default), classification runs are kept quiet to keep `run.log` readable
 - `global.log_level`: optional explicit logging level (e.g., `DEBUG`, `INFO`); if set to `DEBUG`, it also enables verbose classification training output
+- `train_tdc.*`: settings for `train.tdc` benchmark workflow (`group`, `benchmarks`, `split_type`, `seeds`)
 
 For CatBoost classification (`model.type: catboost_classifier`):
 - With `global.debug: false`, CheMLFlow forces quiet CatBoost output even if `model.params.verbose: true`.
