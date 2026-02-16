@@ -53,6 +53,10 @@ split:
 
 model:
   type: chemprop
+  # foundation: none
+  foundation: chemeleon
+  foundation_checkpoint: models/chemeleon_mp.pt
+  freeze_encoder: false
   smiles_column: canonical_smiles
   params:
     max_epochs: 30
@@ -61,4 +65,3 @@ model:
     mp_hidden_dim: 300
     mp_depth: 3
     ffn_hidden_dim: 300
-

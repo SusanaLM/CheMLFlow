@@ -55,6 +55,9 @@ def test_pgp_chemprop_example_config_is_valid_yaml() -> None:
 
     model_cfg = config.get("model") or {}
     assert model_cfg.get("type") == "chemprop"
+    foundation_mode = str(model_cfg.get("foundation", "none")).strip().lower()
+    assert foundation_mode == "none", "Default example should run without external foundation checkpoint."
+    assert not model_cfg.get("foundation_checkpoint")
 
     nodes = _load_nodes(config)
     assert "split" in nodes, "Chemprop training requires split_indices; include the split node."
