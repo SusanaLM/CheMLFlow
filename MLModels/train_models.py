@@ -1089,6 +1089,7 @@ def train_model(
     is_dl = _is_dl_model(model_type)
     model_config = model_config or {}
     plot_split_performance = _as_bool(model_config.get("plot_split_performance", False))
+    debug_logging = _as_bool(model_config.get("_debug_logging", False))
     n_jobs = _resolve_n_jobs(model_config)
 
     logging.info(
@@ -1114,6 +1115,13 @@ def train_model(
             "verbose": False,
         }
         params.update(model_config.get("params", {}))
+        if not debug_logging:
+            if any(key in params for key in ("verbose", "verbose_eval", "logging_level", "silent")):
+                logging.info("Global debug logging is off; forcing quiet CatBoost training output.")
+            params.pop("verbose_eval", None)
+            params.pop("logging_level", None)
+            params.pop("silent", None)
+            params["verbose"] = False
         estimator = CatBoostClassifier(**params)
         eval_set = None
         if X_val is not None and y_val is not None and len(y_val) > 0:

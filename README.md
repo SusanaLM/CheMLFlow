@@ -277,6 +277,12 @@ In `config/*.yaml`:
 - `split.*`: split strategy and sizes (e.g., `random`, `scaffold`, `tdc_scaffold`)
 - `featurize.*`: featurizer settings (e.g., Morgan radius/n_bits)
 - `global.runs.enabled`: use `runs/<timestamp>` instead of `results/`
+- `global.debug`: when `true`, enables debug-style training logs; when `false` (default), classification runs are kept quiet to keep `run.log` readable
+- `global.log_level`: optional explicit logging level (e.g., `DEBUG`, `INFO`); if set to `DEBUG`, it also enables verbose classification training output
+
+For CatBoost classification (`model.type: catboost_classifier`):
+- With `global.debug: false`, CheMLFlow forces quiet CatBoost output even if `model.params.verbose: true`.
+- To see per-iteration CatBoost logs, set `global.debug: true` (or `global.log_level: DEBUG`).
 
 ## Chemprop backend (optional, classification only)
 

@@ -116,18 +116,46 @@ def resolve_run_dir(config: dict) -> str:
         return os.path.join("runs", run_id)
     return "results"
 
-def _configure_logging(run_dir: str) -> None:
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _resolve_log_level(global_config: dict) -> int:
+    configured = global_config.get("log_level")
+    if configured is not None:
+        if isinstance(configured, int):
+            return configured
+        if isinstance(configured, str):
+            level = getattr(logging, configured.strip().upper(), None)
+            if isinstance(level, int):
+                return level
+    if _as_bool(global_config.get("debug", False)):
+        return logging.DEBUG
+    return logging.INFO
+
+
+def _configure_logging(run_dir: str, level: int = logging.INFO) -> None:
     """Configure root logger to emit to stdout and to <run_dir>/run.log.
 
     This must be defined before any pipeline runner calls it.
     """
     log_path = os.path.join(run_dir, "run.log")
     logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+    logger.setLevel(level)
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
-    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+    if not any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in logger.handlers
+    ):
         stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(level)
         stream_handler.setFormatter(formatter)
         logger.addHandler(stream_handler)
 
@@ -136,8 +164,12 @@ def _configure_logging(run_dir: str) -> None:
         for h in logger.handlers
     ):
         file_handler = logging.FileHandler(log_path)
+        file_handler.setLevel(level)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
+
+    for handler in logger.handlers:
+        handler.setLevel(level)
 
 
 def run_node_get_data(context: dict) -> None:
@@ -942,6 +974,9 @@ def run_node_train(context: dict) -> None:
     if not skip_quality_checks:
         data_preprocessing.check_data_leakage(X_train, X_test)
 
+    train_model_config = dict(model_config)
+    train_model_config["_debug_logging"] = context.get("debug_logging", False)
+
     estimator, train_result = train_models.train_model(
         X_train,
         y_train,
@@ -956,7 +991,7 @@ def run_node_train(context: dict) -> None:
         hpo_trials=model_config.get("hpo_trials", 30),
         patience=model_config.get("patience", 20),
         task_type=task_type,
-        model_config=model_config,
+        model_config=train_model_config,
         X_val=X_val,
         y_val=y_val,
     )
@@ -1116,7 +1151,9 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
     os.makedirs(base_dir, exist_ok=True)
     run_dir = resolve_run_dir(config)
     os.makedirs(run_dir, exist_ok=True)
-    _configure_logging(run_dir)
+    log_level = _resolve_log_level(global_config)
+    _configure_logging(run_dir, level=log_level)
+    debug_logging = _as_bool(global_config.get("debug", False)) or log_level <= logging.DEBUG
 
     # If the pipeline uses curated tabular descriptors directly, keep all columns during curate
     # so the downstream model has feature columns to train on.
@@ -1147,6 +1184,7 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
         "keep_all_columns": keep_all_columns,
         "source": config.get("get_data", {}).get("source", {}),
         "run_dir": run_dir,
+        "debug_logging": debug_logging,
     }
 
     with open(os.path.join(run_dir, "run_config.yaml"), "w", encoding="utf-8") as f:

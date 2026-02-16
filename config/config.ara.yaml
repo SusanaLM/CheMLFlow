@@ -4,6 +4,7 @@ global:
   task_type: classification
   base_dir: data/ara
   target_column: label
+  debug: false
   thresholds:
     active: 1000
     inactive: 10000
