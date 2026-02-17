@@ -63,3 +63,6 @@ model:
     loss_function: Logloss
     eval_metric: AUC
     verbose: true
+  use_hpo: true
+  hpo_trials: 30
+  patience: 20

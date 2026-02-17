@@ -63,3 +63,6 @@ model:
   cv_folds: 3
   search_iters: 50
   plot_split_performance: true
+  use_hpo: true
+  hpo_trials: 30
+  patience: 20
