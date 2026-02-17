@@ -611,6 +611,7 @@ def _run_optuna(
     max_evals: int,
     random_state: int,
     patience: int,
+    task_type: str = "regression",
 ) -> Tuple[object, dict]:
     try:
         import optuna
@@ -653,6 +654,7 @@ def _run_optuna(
             batch_size=int(params.get("batch_size", 32)),
             learning_rate=float(params.get("learning_rate", 1e-3)),
             patience=patience,
+            task_type=task_type
         )
         
         # Evaluate on validation set
@@ -660,6 +662,15 @@ def _run_optuna(
 
         # Predict
         y_pred = _predict_dl(trained_model, X_val)
+
+        if task_type == "classification":
+            y_true = np.asarray(y_val).reshape(-1).astype(int)
+            y_proba = 1.0 / (1.0 + np.exp(-np.asarray(y_pred).reshape(-1)))
+            score = _safe_auc(y_true, y_proba)
+            if score is None:
+                raise optuna.exceptions.TrialPruned("AUC undefined (single-class val set)")
+        else:
+            score = float(r2_score(y_val, y_pred))
 
         # NaN/Inf handling
         y_true = np.asarray(y_val).reshape(-1)
@@ -673,17 +684,13 @@ def _run_optuna(
             raise optuna.exceptions.TrialPruned("NaN/Inf in y_val (data issue)")
 
         if not np.isfinite(y_hat).all():
-            # Common when training diverges for certain hyperparams
             raise optuna.exceptions.TrialPruned("NaN/Inf in y_pred (diverged training)")
 
-
-        r2 = r2_score(y_val, y_pred)
-        
         # Track best
-        if r2 > best_score:
-            best_score = r2
+        if score > best_score:
+            best_score = score
             best_model = trained_model
-            logging.info(f"New best R2={r2:.4f} with params: {params}")
+            logging.info(f"New best score={score:.4f} with params: {params}")
         
         import gc
         try:
@@ -695,7 +702,7 @@ def _run_optuna(
         del model, result, y_pred
         gc.collect()
         
-        return r2  # Optuna maximizes by default when direction="maximize"
+        return score # Optuna maximizes by default when direction="maximize"
     
     # Create and run study
     sampler = optuna.samplers.TPESampler(seed=random_state)
@@ -703,7 +710,7 @@ def _run_optuna(
     study.optimize(objective, n_trials=max_evals, show_progress_bar=True)
     
     best_params = study.best_params
-    logging.info(f"Optuna complete. Best R2={best_score:.4f}, params={best_params}")
+    logging.info(f"Optuna complete. Best score={best_score:.4f}, params={best_params}")
     
     return best_model, best_params
 
@@ -809,9 +816,9 @@ def _initialize_model(
     if model_type == "dl_simple":
         if input_dim is None:
             raise ValueError("input_dim required for DL models")
-        from DLModels.simpleregressionnn import SimpleRegressionNN
+        from DLModels.simplenn import SimpleNN
         return DLSearchConfig(
-            model_class=lambda params: SimpleRegressionNN(
+            model_class=lambda params: SimpleNN(
                 input_dim=input_dim,
                 hidden_dim=params.get("hidden_dim", 256),
                 use_tropical=params.get("use_tropical", False),
@@ -1001,6 +1008,7 @@ def _train_dl(
     batch_size: int,
     learning_rate: float,
     patience: int,
+    task_type: str = "regression",
     ) -> Dict[str, Any]:
     """Train a PyTorch model. Returns dict with model and best_params."""
     import torch
@@ -1010,16 +1018,25 @@ def _train_dl(
     model = model.to(device)
     
     X_t = torch.tensor(X_train, dtype=torch.float32, device=device)
-    y_t = torch.tensor(np.asarray(y_train).reshape(-1, 1), dtype=torch.float32, device=device)
+    # y_t = torch.tensor(np.asarray(y_train).reshape(-1, 1), dtype=torch.float32, device=device)
 
     if X_val is None or y_val is None:
         raise ValueError("DL training requires X_val/y_val for early stopping.")
     X_val_t = torch.tensor(X_val, dtype=torch.float32, device=device)
-    y_val_t = torch.tensor(np.asarray(y_val).reshape(-1, 1), dtype=torch.float32, device=device)
+    # y_val_t = torch.tensor(np.asarray(y_val).reshape(-1, 1), dtype=torch.float32, device=device)
+
+    if task_type == "classification":
+        y_t = torch.tensor(np.asarray(y_train).reshape(-1), dtype=torch.float32, device=device)
+        y_val_t = torch.tensor(np.asarray(y_val).reshape(-1), dtype=torch.float32, device=device)
+        criterion = nn.BCEWithLogitsLoss()
+    else:
+        y_t = torch.tensor(np.asarray(y_train).reshape(-1, 1), dtype=torch.float32, device=device)
+        y_val_t = torch.tensor(np.asarray(y_val).reshape(-1, 1), dtype=torch.float32, device=device)
+        criterion = nn.MSELoss()
     
     loader = DataLoader(TensorDataset(X_t, y_t), batch_size=batch_size, shuffle=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss()
+    # criterion = nn.MSELoss()
     
     best_loss, best_state, wait = float('inf'), None, 0
     
@@ -1027,13 +1044,23 @@ def _train_dl(
         model.train()
         for bx, by in loader:
             optimizer.zero_grad()
-            loss = criterion(model(bx).view(-1, 1), by)
+            # loss = criterion(model(bx).view(-1, 1), by)
+            out = model(bx)
+            if task_type == "classification":
+                loss = criterion(out.view(-1), by.view(-1))
+            else:
+                loss = criterion(out.view(-1, 1), by)
             loss.backward()
             optimizer.step()
         
         model.eval()
         with torch.no_grad():
-            val_loss = criterion(model(X_val_t).view(-1, 1), y_val_t).item()
+            # val_loss = criterion(model(X_val_t).view(-1, 1), y_val_t).item()
+            outv = model(X_val_t)
+            if task_type == "classification":
+                val_loss = criterion(outv.view(-1), y_val_t.view(-1)).item()
+            else:
+                val_loss = criterion(outv.view(-1, 1), y_val_t).item()
         
         if val_loss < best_loss - 1e-6:
             best_loss = val_loss
@@ -1181,8 +1208,14 @@ def train_model(
         logging.info("Training complete (classification): metrics=%s", metrics)
         logging.info("Artifacts: model=%s metrics=%s params=%s", model_path, metrics_path, params_path)
         return estimator, TrainResult(model_path, params_path, metrics_path)
+    
+    if task_type == "classification" and is_dl:
+        y_train = _ensure_binary_labels(y_train)
+        y_test = _ensure_binary_labels(y_test)
+        if y_val is not None:
+            y_val = _ensure_binary_labels(y_val)
 
-    if task_type == "classification":
+    if task_type == "classification" and not (model_type == "catboost_classifier" or is_dl):
         raise ValueError(f"Unsupported classification model type: {model_type}")
 
     model = _initialize_model(
@@ -1211,6 +1244,7 @@ def train_model(
                 hpo_trials,
                 random_state,
                 patience,
+                task_type=task_type,
             )
         else:
             logging.info(f"Training DL model: {model_type} (default params)")
@@ -1225,6 +1259,7 @@ def train_model(
                 batch_size=model.default_params["batch_size"],
                 learning_rate=model.default_params["learning_rate"],
                 patience=patience,
+                task_type=task_type,
             )
             estimator = result["model"]
             best_params = result["best_params"]
@@ -1244,40 +1279,115 @@ def train_model(
         joblib.dump(estimator, model_path)
         best_params = model.best_params_ if hasattr(model, "best_params_") else {}
 
-    metrics = {
-        "r2": float(r2_score(y_test, y_pred)),
-        "mae": float(mean_absolute_error(y_test, y_pred)),
-    }
-    if plot_split_performance:
-        if is_dl:
-            y_train_pred = _predict_dl(estimator, X_train.values)
-            y_test_pred = _predict_dl(estimator, X_test.values)
-            y_val_pred = _predict_dl(estimator, X_val.values) if X_val is not None else None
-        else:
-            y_train_pred = estimator.predict(X_train)
-            y_test_pred = estimator.predict(X_test)
-            y_val_pred = estimator.predict(X_val) if X_val is not None else None
+    if task_type == "classification":
+        y_pred_proba = 1.0 / (1.0 + np.exp(-np.asarray(y_pred).reshape(-1)))
+        y_pred_label = (y_pred_proba >= 0.5).astype(int)
+        y_true = np.asarray(y_test).reshape(-1).astype(int)
 
-        split_metrics: Dict[str, Dict[str, float | None]] = {
-            "train": {
-                "r2": _safe_r2(y_train, y_train_pred),
-                "mae": _safe_mae(y_train, y_train_pred),
-            },
-            "test": {
-                "r2": _safe_r2(y_test, y_test_pred),
-                "mae": _safe_mae(y_test, y_test_pred),
-            },
+        metrics = {
+            "auc": _safe_auc(y_true, y_pred_proba),
+            "auprc": _safe_auprc(y_true, y_pred_proba),
+            "accuracy": float(accuracy_score(y_true, y_pred_label)),
+            "f1": float(f1_score(y_true, y_pred_label)),
         }
-        if X_val is not None and y_val is not None and len(y_val) > 0 and y_val_pred is not None:
-            split_metrics["val"] = {
-                "r2": _safe_r2(y_val, y_val_pred),
-                "mae": _safe_mae(y_val, y_val_pred),
+        roc_path = _save_roc_curve(output_dir, model_type, y_true, y_pred_proba)
+        if roc_path:
+            metrics["roc_curve_path"] = roc_path
+
+        pred_path = os.path.join(output_dir, f"{model_type}_predictions.csv")
+        pd.DataFrame({
+            "y_true": y_true,
+            "y_score": np.asarray(y_pred).reshape(-1),
+            "y_proba": y_pred_proba,
+            "y_pred": y_pred_label,
+        }).to_csv(pred_path, index=False)
+    else:
+        metrics = {
+            "r2": float(r2_score(y_test, y_pred)),
+            "mae": float(mean_absolute_error(y_test, y_pred)),
+        }
+
+    if plot_split_performance:
+        split_metrics: Dict[str, Dict[str, float | None]] = {}
+
+        if task_type == "classification":
+            # --- TRAIN predictions ---
+            if model_type == "catboost_classifier":
+                tr_proba = estimator.predict_proba(X_train)[:, 1]
+                tr_pred = estimator.predict(X_train)
+            elif is_dl:
+                tr_logits = _predict_dl(estimator, X_train.values)
+                tr_proba = 1.0 / (1.0 + np.exp(-np.asarray(tr_logits).reshape(-1)))
+                tr_pred = (tr_proba >= 0.5).astype(int)
+            else:
+                tr_proba, tr_pred = None, None
+
+            y_tr = np.asarray(y_train).reshape(-1).astype(int)
+            split_metrics["train"] = {
+                "auc": _safe_auc(y_tr, tr_proba) if tr_proba is not None else None,
+                "auprc": _safe_auprc(y_tr, tr_proba) if tr_proba is not None else None,
+                "accuracy": float(accuracy_score(y_tr, tr_pred)) if tr_pred is not None else None,
+                "f1": float(f1_score(y_tr, tr_pred)) if tr_pred is not None else None,
             }
-        split_metrics_path, split_plot_path = _save_split_metrics_artifacts(
-            output_dir,
-            model_type,
-            split_metrics,
-        )
+
+            # --- TEST predictions ---
+            if model_type == "catboost_classifier":
+                te_proba = estimator.predict_proba(X_test)[:, 1]
+                te_pred = estimator.predict(X_test)
+            elif is_dl:
+                te_logits = _predict_dl(estimator, X_test.values)
+                te_proba = 1.0 / (1.0 + np.exp(-np.asarray(te_logits).reshape(-1)))
+                te_pred = (te_proba >= 0.5).astype(int)
+            else:
+                te_proba, te_pred = None, None
+
+            y_te = np.asarray(y_test).reshape(-1).astype(int)
+            split_metrics["test"] = {
+                "auc": _safe_auc(y_te, te_proba) if te_proba is not None else None,
+                "auprc": _safe_auprc(y_te, te_proba) if te_proba is not None else None,
+                "accuracy": float(accuracy_score(y_te, te_pred)) if te_pred is not None else None,
+                "f1": float(f1_score(y_te, te_pred)) if te_pred is not None else None,
+            }
+
+            # --- VAL predictions  ---
+            if X_val is not None and y_val is not None and len(y_val) > 0:
+                if model_type == "catboost_classifier":
+                    va_proba = estimator.predict_proba(X_val)[:, 1]
+                    va_pred = estimator.predict(X_val)
+                elif is_dl:
+                    va_logits = _predict_dl(estimator, X_val.values)
+                    va_proba = 1.0 / (1.0 + np.exp(-np.asarray(va_logits).reshape(-1)))
+                    va_pred = (va_proba >= 0.5).astype(int)
+                else:
+                    va_proba, va_pred = None, None
+
+                y_va = np.asarray(y_val).reshape(-1).astype(int)
+                split_metrics["val"] = {
+                    "auc": _safe_auc(y_va, va_proba) if va_proba is not None else None,
+                    "auprc": _safe_auprc(y_va, va_proba) if va_proba is not None else None,
+                    "accuracy": float(accuracy_score(y_va, va_pred)) if va_pred is not None else None,
+                    "f1": float(f1_score(y_va, va_pred)) if va_pred is not None else None,
+                }
+
+        else:
+            # --- regression ---
+            if is_dl:
+                y_train_pred = _predict_dl(estimator, X_train.values)
+                y_test_pred = _predict_dl(estimator, X_test.values)
+                y_val_pred = _predict_dl(estimator, X_val.values) if X_val is not None else None
+            else:
+                y_train_pred = estimator.predict(X_train)
+                y_test_pred = estimator.predict(X_test)
+                y_val_pred = estimator.predict(X_val) if X_val is not None else None
+
+            split_metrics = {
+                "train": {"r2": _safe_r2(y_train, y_train_pred), "mae": _safe_mae(y_train, y_train_pred)},
+                "test": {"r2": _safe_r2(y_test, y_test_pred), "mae": _safe_mae(y_test, y_test_pred)},
+            }
+            if X_val is not None and y_val is not None and len(y_val) > 0 and y_val_pred is not None:
+                split_metrics["val"] = {"r2": _safe_r2(y_val, y_val_pred), "mae": _safe_mae(y_val, y_val_pred)}
+
+        split_metrics_path, split_plot_path = _save_split_metrics_artifacts(output_dir, model_type, split_metrics)
         if split_metrics_path:
             metrics["split_metrics_path"] = split_metrics_path
         if split_plot_path:
@@ -1287,7 +1397,7 @@ def train_model(
     metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")
     joblib.dump(best_params, params_path)   
     pd.Series(metrics).to_json(metrics_path)
-    logging.info("Training complete (regression): metrics=%s", metrics)
+    logging.info("Training complete (%s): metrics=%s", task_type, metrics)
     logging.info("Artifacts: model=%s metrics=%s params=%s", model_path, metrics_path, params_path)
 
     return estimator, TrainResult(model_path, params_path, metrics_path)
@@ -1331,8 +1441,11 @@ def run_explainability(
     model_type: str,
     output_dir: str,
     background_samples: int = 100,
+    task_type: str = "regression",
     ) -> None:
     _ensure_dir(output_dir)
+    if task_type == "classification":
+        y_test = _ensure_binary_labels(y_test)
     is_dl = model_type.startswith("dl_")
     n_jobs = _resolve_n_jobs()
 
@@ -1345,23 +1458,46 @@ def run_explainability(
     if is_dl:
         import torch
         class _SklearnWrapper:
-            def __init__(self, model):
+            def __init__(self, model, task_type: str):
                 self.model = model
+                self.task_type = task_type
+
             def fit(self, X, y):
                 return self
+
             def predict(self, X):
-                return _predict_dl(self.model, X.values if hasattr(X, 'values') else X)
+                y_out = _predict_dl(self.model, X.values if hasattr(X, "values") else X)
+                if self.task_type == "classification":
+                    proba = 1.0 / (1.0 + np.exp(-np.asarray(y_out).reshape(-1)))
+                    return (proba >= 0.5).astype(int)
+                return y_out
+
+            def predict_proba(self, X):
+                y_out = _predict_dl(self.model, X.values if hasattr(X, "values") else X)
+                proba = 1.0 / (1.0 + np.exp(-np.asarray(y_out).reshape(-1)))
+                return np.vstack([1.0 - proba, proba]).T
+
             def score(self, X, y):
-                y_pred = self.predict(X)
-                return r2_score(y, y_pred)
+                y_true = np.asarray(y).reshape(-1)
+                if self.task_type == "classification":
+                    y_true = _ensure_binary_labels(pd.Series(y_true)).to_numpy(dtype=int)
+                    proba = self.predict_proba(X)[:, 1]
+                    auc = _safe_auc(y_true, proba)
+                    if auc is None:
+                        pred = (proba >= 0.5).astype(int)
+                        return float(accuracy_score(y_true, pred))
+                    return float(auc)
+                y_pred = _predict_dl(self.model, X.values if hasattr(X, "values") else X)
+                return float(r2_score(y_true, y_pred))
         
-        wrapped_estimator = _SklearnWrapper(estimator)
+        wrapped_estimator = _SklearnWrapper(estimator, task_type=task_type)
         result = permutation_importance(
             wrapped_estimator, X_test, y_test, n_repeats=10, random_state=42, n_jobs=1
         )
     else:
+        scoring = "roc_auc" if task_type == "classification" else None
         result = permutation_importance(
-            estimator, X_test, y_test, n_repeats=10, random_state=42, n_jobs=n_jobs
+            estimator, X_test, y_test, n_repeats=10, random_state=42, n_jobs=n_jobs, scoring=scoring
         )
 
 
@@ -1381,6 +1517,8 @@ def run_explainability(
         if model_type in ["random_forest", "decision_tree", "xgboost", "catboost_classifier"]:
             explainer = shap.TreeExplainer(estimator)
             shap_values = explainer.shap_values(X_test)
+            if task_type == "classification" and isinstance(shap_values, list) and len(shap_values) == 2:
+                shap_values = shap_values[1]
         
         elif model_type == "ensemble":
             explainer = shap.Explainer(estimator.predict, X_test.iloc[:background_samples])
@@ -1400,26 +1538,23 @@ def run_explainability(
             n_bg = min(background_samples, len(X_train))
             n_ex = min(100, len(X_test))
             
-            # Convert to numpy arrays (not tensors) for SHAP
-            X_bg_np = X_train.iloc[:n_bg].values.astype(np.float32)
+            # Convert to numpy arrays for SHAP
+            # X_bg_np = X_train.iloc[:n_bg].values.astype(np.float32)
+            X_bg_np = X_train.sample(n=n_bg, random_state=42).values.astype(np.float32)
             X_ex_np = X_test.iloc[:n_ex].values.astype(np.float32)
             
-            # Use KernelExplainer instead (more reliable for PyTorch)
+            # Use KernelExplainer
             def model_predict(X):
-                return _predict_dl(estimator, X)
+                out = _predict_dl(estimator, X) 
+                out = np.asarray(out).reshape(-1)
+                if task_type == "classification":
+                    return out  # <-- logits
+                return out      
             
             explainer = shap.KernelExplainer(model_predict, X_bg_np)
             shap_values = explainer.shap_values(X_ex_np, nsamples=100)
             
-            # Keep DataFrame for feature names in plot
             X_test = X_test.iloc[:n_ex]
-        
-        else:
-            background = shap.sample(X_test, min(background_samples, len(X_test)))
-            explainer = shap.KernelExplainer(estimator.predict, background)
-            X_explain = X_test.iloc[:min(100, len(X_test))]
-            shap_values = explainer.shap_values(X_explain)
-            X_test = X_explain
 
         if hasattr(shap_values, 'values'):
             shap_values = shap_values.values
