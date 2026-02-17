@@ -10,6 +10,7 @@ from datetime import datetime
 import yaml
 import pandas as pd
 import joblib
+import numpy as np
 
 from contracts import (
     ANALYZE_EDA_INPUT_2CLASS_CONTRACT,
@@ -116,18 +117,46 @@ def resolve_run_dir(config: dict) -> str:
         return os.path.join("runs", run_id)
     return "results"
 
-def _configure_logging(run_dir: str) -> None:
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _resolve_log_level(global_config: dict) -> int:
+    configured = global_config.get("log_level")
+    if configured is not None:
+        if isinstance(configured, int):
+            return configured
+        if isinstance(configured, str):
+            level = getattr(logging, configured.strip().upper(), None)
+            if isinstance(level, int):
+                return level
+    if _as_bool(global_config.get("debug", False)):
+        return logging.DEBUG
+    return logging.INFO
+
+
+def _configure_logging(run_dir: str, level: int = logging.INFO) -> None:
     """Configure root logger to emit to stdout and to <run_dir>/run.log.
 
     This must be defined before any pipeline runner calls it.
     """
     log_path = os.path.join(run_dir, "run.log")
     logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+    logger.setLevel(level)
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
-    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+    if not any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in logger.handlers
+    ):
         stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(level)
         stream_handler.setFormatter(formatter)
         logger.addHandler(stream_handler)
 
@@ -136,8 +165,12 @@ def _configure_logging(run_dir: str) -> None:
         for h in logger.handlers
     ):
         file_handler = logging.FileHandler(log_path)
+        file_handler.setLevel(level)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
+
+    for handler in logger.handlers:
+        handler.setLevel(level)
 
 
 def run_node_get_data(context: dict) -> None:
@@ -822,6 +855,325 @@ def run_node_select_features(context: dict) -> None:
     )
     context["selected_ready"] = True
 
+
+def _as_str_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, tuple):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, set):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return [str(value).strip()]
+
+
+def _as_int_list(value: object, default: list[int]) -> list[int]:
+    if value is None:
+        raw = default
+    else:
+        raw = value
+    items = _as_str_list(raw)
+    out: list[int] = []
+    for item in items:
+        out.append(int(item))
+    return out
+
+
+def _normalize_tdc_group_name(group_name: str) -> str:
+    token = str(group_name).strip().lower().replace("-", "_")
+    if token in {"admet_group", "admet", "adme_group", "adme"}:
+        return "ADMET_Group"
+    raise ValueError(f"Unsupported TDC benchmark group: {group_name!r}")
+
+
+def _resolve_train_tdc_config(context: dict) -> dict:
+    train_tdc_config = context.get("train_tdc_config", {}) or {}
+    source_cfg = context.get("source", {}) or {}
+
+    raw_group = train_tdc_config.get("group") or source_cfg.get("group") or "ADMET_Group"
+    group = _normalize_tdc_group_name(str(raw_group))
+
+    benchmarks = _as_str_list(
+        train_tdc_config.get("benchmarks")
+        or train_tdc_config.get("benchmark")
+        or source_cfg.get("name")
+    )
+    if not benchmarks:
+        raise ValueError(
+            "train_tdc requires at least one benchmark name (train_tdc.benchmarks or get_data.source.name)."
+        )
+
+    split_type = str(train_tdc_config.get("split_type", "default")).strip() or "default"
+    seeds = _as_int_list(train_tdc_config.get("seeds"), default=[1, 2, 3, 4, 5])
+    if not seeds:
+        raise ValueError("train_tdc.seeds must contain at least one integer seed.")
+
+    return {
+        "group": group,
+        "benchmarks": benchmarks,
+        "split_type": split_type,
+        "seeds": seeds,
+        "path": str(train_tdc_config.get("path", context["base_dir"])),
+    }
+
+
+def _load_tdc_benchmark_group(group_name: str, path: str):
+    try:
+        from tdc.benchmark_group import admet_group
+    except Exception as exc:
+        raise ImportError(
+            "TDC benchmark workflow requires pytdc benchmark APIs. Install pytdc to use 'train.tdc'."
+        ) from exc
+
+    if group_name != "ADMET_Group":
+        raise ValueError(f"Unsupported TDC benchmark group: {group_name}")
+    return admet_group(path=path)
+
+
+def _find_tdc_smiles_column(df: pd.DataFrame) -> str:
+    for candidate in ["Drug", "drug", "SMILES", "Smiles", "smiles", "canonical_smiles"]:
+        if candidate in df.columns:
+            return candidate
+    raise ValueError("TDC benchmark split frame is missing a SMILES column.")
+
+
+def _find_tdc_label_column(df: pd.DataFrame, target_column: str) -> str:
+    if target_column in df.columns:
+        return target_column
+    for candidate in ["Y", "label", "Label", "y"]:
+        if candidate in df.columns:
+            return candidate
+    raise ValueError(
+        f"TDC benchmark split frame is missing label column. Expected '{target_column}' or one of Y/label."
+    )
+
+
+def _morgan_features_from_smiles(
+    smiles_values: pd.Series,
+    radius: int,
+    n_bits: int,
+    split_name: str,
+) -> pd.DataFrame:
+    try:
+        from rdkit import Chem, DataStructs
+        from rdkit.Chem import rdFingerprintGenerator
+    except Exception as exc:
+        raise ImportError(
+            "RDKit is required for CatBoost TDC benchmarking with Morgan fingerprints."
+        ) from exc
+
+    generator = rdFingerprintGenerator.GetMorganGenerator(radius=int(radius), fpSize=int(n_bits))
+    rows: list[np.ndarray] = []
+    invalid_positions: list[int] = []
+    for idx, smi in enumerate(smiles_values.astype(str).tolist()):
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            invalid_positions.append(idx)
+            continue
+        fp = generator.GetFingerprint(mol)
+        arr = np.zeros((int(n_bits),), dtype=int)
+        DataStructs.ConvertToNumpyArray(fp, arr)
+        rows.append(arr)
+
+    if invalid_positions:
+        preview = invalid_positions[:5]
+        raise ValueError(
+            f"TDC {split_name} split has {len(invalid_positions)} invalid SMILES "
+            f"(first row positions: {preview})."
+        )
+
+    return pd.DataFrame(rows, columns=[f"fp_{i}" for i in range(int(n_bits))])
+
+
+def run_node_train_tdc(context: dict) -> None:
+    model_type = context["model_type"]
+    if context.get("task_type") != "classification":
+        raise ValueError("train.tdc currently supports classification benchmarks only.")
+    if model_type != "catboost_classifier":
+        raise ValueError(
+            "train.tdc currently supports model.type=catboost_classifier. "
+            "Use the regular 'train' node for other models."
+        )
+
+    cfg = _resolve_train_tdc_config(context)
+    featurize_config = context.get("featurize_config", {})
+    radius = int(featurize_config.get("radius", 2))
+    n_bits = int(featurize_config.get("n_bits", 2048))
+
+    output_dir = os.path.join(context["run_dir"], "tdc_benchmark")
+    os.makedirs(output_dir, exist_ok=True)
+
+    logging.warning("##### WARNING: TDC BENCHMARK TRAINING WORKFLOW ENABLED #####")
+    logging.warning(
+        "##### group=%s benchmarks=%s seeds=%s split_type=%s #####",
+        cfg["group"],
+        ",".join(cfg["benchmarks"]),
+        ",".join(str(seed) for seed in cfg["seeds"]),
+        cfg["split_type"],
+    )
+    logging.warning("##### Results will be reported via TDC evaluate_many #####")
+
+    group = _load_tdc_benchmark_group(cfg["group"], cfg["path"])
+    predictions_list: list[dict[str, list[float]]] = []
+    seed_metric_rows: list[dict[str, object]] = []
+
+    model_config = dict(context.get("model_config", {}) or {})
+    model_config["_debug_logging"] = context.get("debug_logging", False)
+
+    for seed in cfg["seeds"]:
+        seed_predictions: dict[str, list[float]] = {}
+        seed_dir = os.path.join(output_dir, f"seed_{seed}")
+        os.makedirs(seed_dir, exist_ok=True)
+
+        for benchmark_name in cfg["benchmarks"]:
+            benchmark = group.get(benchmark_name)
+            canonical_name = str(benchmark.get("name", benchmark_name))
+            train_df, valid_df = group.get_train_valid_split(
+                benchmark=canonical_name,
+                split_type=cfg["split_type"],
+                seed=int(seed),
+            )
+            test_df = benchmark["test"]
+            if not isinstance(train_df, pd.DataFrame) or not isinstance(valid_df, pd.DataFrame):
+                raise ValueError(f"TDC benchmark split is not tabular for {canonical_name}.")
+            if not isinstance(test_df, pd.DataFrame):
+                raise ValueError(f"TDC benchmark test split is not tabular for {canonical_name}.")
+
+            smiles_col = _find_tdc_smiles_column(train_df)
+            label_col = _find_tdc_label_column(train_df, context["target_column"])
+            if label_col not in valid_df.columns or label_col not in test_df.columns:
+                raise ValueError(
+                    f"TDC benchmark {canonical_name} split is missing label column '{label_col}'."
+                )
+            if smiles_col not in valid_df.columns or smiles_col not in test_df.columns:
+                raise ValueError(
+                    f"TDC benchmark {canonical_name} split is missing smiles column '{smiles_col}'."
+                )
+
+            X_train = _morgan_features_from_smiles(train_df[smiles_col], radius, n_bits, "train")
+            X_val = _morgan_features_from_smiles(valid_df[smiles_col], radius, n_bits, "valid")
+            X_test = _morgan_features_from_smiles(test_df[smiles_col], radius, n_bits, "test")
+
+            y_train = train_models._ensure_binary_labels(train_df[label_col])
+            y_val = train_models._ensure_binary_labels(valid_df[label_col])
+            y_test = train_models._ensure_binary_labels(test_df[label_col])
+
+            bench_slug = canonical_name.lower().replace(" ", "_")
+            bench_out_dir = os.path.join(seed_dir, bench_slug)
+            os.makedirs(bench_out_dir, exist_ok=True)
+
+            estimator, train_result = train_models.train_model(
+                X_train=X_train,
+                y_train=y_train,
+                X_test=X_test,
+                y_test=y_test,
+                model_type=model_type,
+                output_dir=bench_out_dir,
+                random_state=int(seed),
+                cv_folds=int(model_config.get("cv_folds", 5)),
+                search_iters=int(model_config.get("search_iters", 100)),
+                use_hpo=_as_bool(model_config.get("use_hpo", False)),
+                hpo_trials=int(model_config.get("hpo_trials", 30)),
+                patience=int(model_config.get("patience", 20)),
+                task_type="classification",
+                model_config=model_config,
+                X_val=X_val,
+                y_val=y_val,
+            )
+
+            y_pred_test = estimator.predict_proba(X_test)[:, 1].astype(float)
+            seed_predictions[canonical_name] = [float(v) for v in y_pred_test.tolist()]
+
+            pred_df = pd.DataFrame(
+                {
+                    "smiles": test_df[smiles_col].astype(str).tolist(),
+                    "y_true": y_test.tolist(),
+                    "y_pred_proba": y_pred_test.tolist(),
+                }
+            )
+            pred_df.to_csv(os.path.join(bench_out_dir, "tdc_test_predictions.csv"), index=False)
+
+            metrics_payload = {}
+            if os.path.exists(train_result.metrics_path):
+                with open(train_result.metrics_path, "r", encoding="utf-8") as f:
+                    metrics_payload = json.load(f)
+            seed_metric_rows.append(
+                {
+                    "seed": int(seed),
+                    "benchmark": canonical_name,
+                    "n_train": int(len(X_train)),
+                    "n_val": int(len(X_val)),
+                    "n_test": int(len(X_test)),
+                    "auc": metrics_payload.get("auc"),
+                    "auprc": metrics_payload.get("auprc"),
+                    "accuracy": metrics_payload.get("accuracy"),
+                    "f1": metrics_payload.get("f1"),
+                    "metrics_path": train_result.metrics_path,
+                }
+            )
+            logging.info(
+                "TDC benchmark run complete: benchmark=%s seed=%s n_train=%s n_val=%s n_test=%s",
+                canonical_name,
+                seed,
+                len(X_train),
+                len(X_val),
+                len(X_test),
+            )
+
+        predictions_list.append(seed_predictions)
+        with open(
+            os.path.join(seed_dir, f"tdc_predictions_seed_{seed}.json"),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(seed_predictions, f, indent=2)
+
+    results = group.evaluate_many(predictions_list)
+    results_path = os.path.join(output_dir, "tdc_benchmark_results.json")
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+    summary_rows: list[dict[str, object]] = []
+    for benchmark_name, value in results.items():
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            summary_rows.append(
+                {
+                    "benchmark": benchmark_name,
+                    "mean": float(value[0]),
+                    "std": float(value[1]),
+                }
+            )
+        else:
+            summary_rows.append(
+                {
+                    "benchmark": benchmark_name,
+                    "mean": value,
+                    "std": None,
+                }
+            )
+
+    pd.DataFrame(summary_rows).to_csv(
+        os.path.join(output_dir, "tdc_benchmark_summary.csv"),
+        index=False,
+    )
+    if seed_metric_rows:
+        pd.DataFrame(seed_metric_rows).to_csv(
+            os.path.join(output_dir, "tdc_seed_metrics.csv"),
+            index=False,
+        )
+
+    logging.warning("##### TDC benchmark workflow completed. results=%s #####", results_path)
+
+    context["tdc_benchmark_results_path"] = results_path
+    validate_contract(
+        bind_output_path(TRAIN_OUTPUT_CONTRACT, output_dir),
+        warn_only=True,
+    )
+
+
 def run_node_train(context: dict) -> None:
     pipeline_type = context["pipeline_type"]
     output_dir = context["run_dir"]
@@ -942,6 +1294,9 @@ def run_node_train(context: dict) -> None:
     if not skip_quality_checks:
         data_preprocessing.check_data_leakage(X_train, X_test)
 
+    train_model_config = dict(model_config)
+    train_model_config["_debug_logging"] = context.get("debug_logging", False)
+
     estimator, train_result = train_models.train_model(
         X_train,
         y_train,
@@ -956,7 +1311,7 @@ def run_node_train(context: dict) -> None:
         hpo_trials=model_config.get("hpo_trials", 30),
         patience=model_config.get("patience", 20),
         task_type=task_type,
-        model_config=model_config,
+        model_config=train_model_config,
         X_val=X_val,
         y_val=y_val,
     )
@@ -1053,6 +1408,7 @@ NODE_REGISTRY = {
     "preprocess.features": run_node_preprocess_features,
     "select.features": run_node_select_features,
     "train": run_node_train,
+    "train.tdc": run_node_train_tdc,
     "explain": run_node_explain,
 }
 
@@ -1079,6 +1435,16 @@ def validate_pipeline_nodes(nodes: list[str]) -> None:
     split_positions = [i for i, node in enumerate(nodes) if node == "split"]
     if len(split_positions) > 1:
         raise ValueError("Pipeline must include at most one 'split' node.")
+
+    train_tdc_positions = [i for i, node in enumerate(nodes) if node == "train.tdc"]
+    if len(train_tdc_positions) > 1:
+        raise ValueError("Pipeline must include at most one 'train.tdc' node.")
+    if train_tdc_positions:
+        train_tdc_pos = train_tdc_positions[0]
+        if "train" in nodes:
+            raise ValueError("Use either 'train' or 'train.tdc' in a pipeline, not both.")
+        if train_tdc_pos != len(nodes) - 1:
+            raise ValueError("'train.tdc' must be the terminal node in pipeline.nodes.")
 
     if uses_split_dependents and not split_positions:
         raise ValueError(
@@ -1116,7 +1482,9 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
     os.makedirs(base_dir, exist_ok=True)
     run_dir = resolve_run_dir(config)
     os.makedirs(run_dir, exist_ok=True)
-    _configure_logging(run_dir)
+    log_level = _resolve_log_level(global_config)
+    _configure_logging(run_dir, level=log_level)
+    debug_logging = _as_bool(global_config.get("debug", False)) or log_level <= logging.DEBUG
 
     # If the pipeline uses curated tabular descriptors directly, keep all columns during curate
     # so the downstream model has feature columns to train on.
@@ -1143,10 +1511,12 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
         "featurize_config": config.get("featurize", {}),
         "label_config": config.get("label", {}),
         "model_config": config.get("model", {}),
+        "train_tdc_config": config.get("train_tdc", config.get("train.tdc", {})),
         "categorical_features": config.get("preprocess", {}).get("categorical_features", []),
         "keep_all_columns": keep_all_columns,
         "source": config.get("get_data", {}).get("source", {}),
         "run_dir": run_dir,
+        "debug_logging": debug_logging,
     }
 
     with open(os.path.join(run_dir, "run_config.yaml"), "w", encoding="utf-8") as f:

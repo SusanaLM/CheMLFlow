@@ -40,6 +40,16 @@ def test_validate_pipeline_nodes_requires_split_before_training() -> None:
         validate_pipeline_nodes(["curate", "split", "train", "split", "explain"])
     with pytest.raises(ValueError):
         validate_pipeline_nodes(["split", "split"])
+    with pytest.raises(ValueError):
+        validate_pipeline_nodes(["train", "train.tdc"])
+    with pytest.raises(ValueError):
+        validate_pipeline_nodes(["train.tdc", "explain"])
+    with pytest.raises(ValueError):
+        validate_pipeline_nodes(["split", "train.tdc", "explain"])
+
+
+def test_validate_pipeline_nodes_allows_train_tdc_without_split() -> None:
+    validate_pipeline_nodes(["train.tdc"])
 
 
 def test_pgp_chemprop_example_config_is_valid_yaml() -> None:
