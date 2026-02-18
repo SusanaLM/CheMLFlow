@@ -20,9 +20,11 @@ from sklearn.metrics import (
     mean_absolute_error,
     roc_auc_score,
     average_precision_score,
+    precision_recall_curve,
     accuracy_score,
     f1_score,
     roc_curve,
+    confusion_matrix,
 )
 from sklearn.inspection import permutation_importance
 
@@ -117,6 +119,172 @@ def _save_roc_curve(output_dir: str, model_type: str, y_true, y_score) -> str | 
     plt.savefig(roc_path)
     plt.close()
     return roc_path
+
+
+def _save_pr_curve(
+    output_dir: str,
+    model_type: str,
+    split_name: str,
+    y_true,
+    y_score,
+) -> str | None:
+    y_true_arr = np.asarray(y_true).reshape(-1).astype(int)
+    y_score_arr = np.asarray(y_score).reshape(-1).astype(float)
+    if y_true_arr.size == 0 or y_true_arr.size != y_score_arr.size:
+        return None
+    if len(np.unique(y_true_arr)) < 2:
+        return None
+    precision, recall, _ = precision_recall_curve(y_true_arr, y_score_arr)
+    ap = _safe_auprc(y_true_arr, y_score_arr)
+    prevalence = float(np.mean(y_true_arr))
+    plt.figure(figsize=(6, 5))
+    plt.plot(recall, precision, label="PR")
+    plt.hlines(
+        prevalence,
+        xmin=0.0,
+        xmax=1.0,
+        linestyles="--",
+        colors="gray",
+        label="Baseline",
+    )
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    title = f"{model_type} {split_name} PR curve (N={len(y_true_arr)})"
+    if ap is not None:
+        title += f" AUPRC={ap:.3f}"
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    pr_path = os.path.join(output_dir, f"{model_type}_pr_curve_{split_name}.png")
+    plt.savefig(pr_path)
+    plt.close()
+    return pr_path
+
+
+def _save_confusion_matrix_plot(
+    output_dir: str,
+    model_type: str,
+    split_name: str,
+    y_true,
+    y_pred,
+) -> str | None:
+    y_true_arr = np.asarray(y_true).reshape(-1).astype(int)
+    y_pred_arr = np.asarray(y_pred).reshape(-1).astype(int)
+    if y_true_arr.size == 0 or y_true_arr.size != y_pred_arr.size:
+        return None
+    cm = confusion_matrix(y_true_arr, y_pred_arr, labels=[0, 1])
+    fig, ax = plt.subplots(figsize=(5.5, 5))
+    im = ax.imshow(cm, cmap="Blues")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xticks([0, 1], labels=["Pred 0", "Pred 1"])
+    ax.set_yticks([0, 1], labels=["True 0", "True 1"])
+    ax.set_title(f"{model_type} {split_name} confusion (N={len(y_true_arr)})")
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, str(int(cm[i, j])), ha="center", va="center")
+    fig.tight_layout()
+    cm_path = os.path.join(output_dir, f"{model_type}_confusion_{split_name}.png")
+    fig.savefig(cm_path)
+    plt.close(fig)
+    return cm_path
+
+
+def _save_classification_split_plots(
+    output_dir: str,
+    model_type: str,
+    split_outputs: Dict[str, Dict[str, Any]],
+) -> Dict[str, str]:
+    saved_paths: Dict[str, str] = {}
+    split_order = [name for name in ("train", "val", "test") if name in split_outputs]
+    if not split_order:
+        split_order = list(split_outputs.keys())
+    if not split_order:
+        return saved_paths
+
+    combined_pr_fig, combined_pr_axes = plt.subplots(
+        1, len(split_order), figsize=(6 * len(split_order), 5), squeeze=False
+    )
+    combined_cm_fig, combined_cm_axes = plt.subplots(
+        1, len(split_order), figsize=(5.5 * len(split_order), 5), squeeze=False
+    )
+    any_pr = False
+    any_cm = False
+
+    for idx, split_name in enumerate(split_order):
+        payload = split_outputs.get(split_name, {})
+        y_true = payload.get("y_true")
+        y_proba = payload.get("y_proba")
+        y_pred = payload.get("y_pred")
+        if y_true is None or y_proba is None:
+            continue
+        y_true_arr = np.asarray(y_true).reshape(-1).astype(int)
+        y_proba_arr = np.asarray(y_proba).reshape(-1).astype(float)
+        if y_pred is None:
+            y_pred_arr = (y_proba_arr >= 0.5).astype(int)
+        else:
+            y_pred_arr = np.asarray(y_pred).reshape(-1).astype(int)
+        if (
+            y_true_arr.size == 0
+            or y_true_arr.size != y_proba_arr.size
+            or y_true_arr.size != y_pred_arr.size
+        ):
+            continue
+
+        pr_path = _save_pr_curve(output_dir, model_type, split_name, y_true_arr, y_proba_arr)
+        if pr_path:
+            saved_paths[f"pr_curve_{split_name}_path"] = pr_path
+
+        cm_path = _save_confusion_matrix_plot(output_dir, model_type, split_name, y_true_arr, y_pred_arr)
+        if cm_path:
+            saved_paths[f"confusion_matrix_{split_name}_path"] = cm_path
+
+        pr_ax = combined_pr_axes[0, idx]
+        if len(np.unique(y_true_arr)) >= 2:
+            precision, recall, _ = precision_recall_curve(y_true_arr, y_proba_arr)
+            pr_ax.plot(recall, precision, label="PR")
+            pr_ax.hlines(
+                float(np.mean(y_true_arr)),
+                xmin=0.0,
+                xmax=1.0,
+                linestyles="--",
+                colors="gray",
+                label="Baseline",
+            )
+            any_pr = True
+        else:
+            pr_ax.text(0.5, 0.5, "Single-class split", ha="center", va="center", transform=pr_ax.transAxes)
+        pr_ax.set_xlabel("Recall")
+        pr_ax.set_ylabel("Precision")
+        pr_ax.set_title(f"{split_name} PR (N={len(y_true_arr)})")
+        pr_ax.grid(alpha=0.25)
+        if pr_ax.get_legend_handles_labels()[0]:
+            pr_ax.legend()
+
+        cm_ax = combined_cm_axes[0, idx]
+        cm = confusion_matrix(y_true_arr, y_pred_arr, labels=[0, 1])
+        cm_im = cm_ax.imshow(cm, cmap="Blues")
+        for i in range(2):
+            for j in range(2):
+                cm_ax.text(j, i, str(int(cm[i, j])), ha="center", va="center")
+        cm_ax.set_xticks([0, 1], labels=["Pred 0", "Pred 1"])
+        cm_ax.set_yticks([0, 1], labels=["True 0", "True 1"])
+        cm_ax.set_title(f"{split_name} confusion (N={len(y_true_arr)})")
+        any_cm = True
+        combined_cm_fig.colorbar(cm_im, ax=cm_ax, fraction=0.046, pad=0.04)
+
+    combined_pr_fig.tight_layout()
+    combined_cm_fig.tight_layout()
+    if any_pr:
+        pr_all_path = os.path.join(output_dir, f"{model_type}_pr_curve_all_splits.png")
+        combined_pr_fig.savefig(pr_all_path)
+        saved_paths["pr_curve_all_splits_path"] = pr_all_path
+    if any_cm:
+        cm_all_path = os.path.join(output_dir, f"{model_type}_confusion_all_splits.png")
+        combined_cm_fig.savefig(cm_all_path)
+        saved_paths["confusion_matrix_all_splits_path"] = cm_all_path
+    plt.close(combined_pr_fig)
+    plt.close(combined_cm_fig)
+    return saved_paths
 
 
 def _as_bool(value: Any) -> bool:
@@ -714,6 +882,29 @@ def train_chemprop_model(
             metrics["split_metrics_path"] = split_metrics_path
         if split_plot_path:
             metrics["split_metrics_plot_path"] = split_plot_path
+        metrics.update(
+            _save_classification_split_plots(
+                output_dir,
+                "chemprop",
+                {
+                    "train": {
+                        "y_true": train_y,
+                        "y_proba": train_preds,
+                        "y_pred": (train_preds >= 0.5).astype(int),
+                    },
+                    "val": {
+                        "y_true": val_y,
+                        "y_proba": val_preds,
+                        "y_pred": (val_preds >= 0.5).astype(int),
+                    },
+                    "test": {
+                        "y_true": y_true,
+                        "y_proba": preds,
+                        "y_pred": y_pred,
+                    },
+                },
+            )
+        )
 
     # Save artifacts.
     model_path = os.path.join(output_dir, "chemprop_best_model.ckpt")
@@ -1294,14 +1485,28 @@ def train_model(
             "f1": float(f1_score(y_test, y_pred)),
         }
         if plot_split_performance:
+            train_proba = estimator.predict_proba(X_train)[:, 1]
+            train_pred = estimator.predict(X_train)
             split_metrics: Dict[str, Dict[str, float | None]] = {
                 "train": {
-                    "auc": _safe_auc(y_train, estimator.predict_proba(X_train)[:, 1]),
-                    "auprc": _safe_auprc(y_train, estimator.predict_proba(X_train)[:, 1]),
-                    "accuracy": float(accuracy_score(y_train, estimator.predict(X_train))),
-                    "f1": float(f1_score(y_train, estimator.predict(X_train))),
+                    "auc": _safe_auc(y_train, train_proba),
+                    "auprc": _safe_auprc(y_train, train_proba),
+                    "accuracy": float(accuracy_score(y_train, train_pred)),
+                    "f1": float(f1_score(y_train, train_pred)),
                 },
                 "test": metrics.copy(),
+            }
+            split_outputs: Dict[str, Dict[str, Any]] = {
+                "train": {
+                    "y_true": np.asarray(y_train).reshape(-1).astype(int),
+                    "y_proba": np.asarray(train_proba).reshape(-1).astype(float),
+                    "y_pred": np.asarray(train_pred).reshape(-1).astype(int),
+                },
+                "test": {
+                    "y_true": np.asarray(y_test).reshape(-1).astype(int),
+                    "y_proba": np.asarray(y_pred_proba).reshape(-1).astype(float),
+                    "y_pred": np.asarray(y_pred).reshape(-1).astype(int),
+                },
             }
             if X_val is not None and y_val is not None and len(y_val) > 0:
                 y_val_proba = estimator.predict_proba(X_val)[:, 1]
@@ -1312,6 +1517,11 @@ def train_model(
                     "accuracy": float(accuracy_score(y_val, y_val_pred)),
                     "f1": float(f1_score(y_val, y_val_pred)),
                 }
+                split_outputs["val"] = {
+                    "y_true": np.asarray(y_val).reshape(-1).astype(int),
+                    "y_proba": np.asarray(y_val_proba).reshape(-1).astype(float),
+                    "y_pred": np.asarray(y_val_pred).reshape(-1).astype(int),
+                }
             split_metrics_path, split_plot_path = _save_split_metrics_artifacts(
                 output_dir,
                 model_type,
@@ -1321,6 +1531,7 @@ def train_model(
                 metrics["split_metrics_path"] = split_metrics_path
             if split_plot_path:
                 metrics["split_metrics_plot_path"] = split_plot_path
+            metrics.update(_save_classification_split_plots(output_dir, model_type, split_outputs))
 
         roc_path = _save_roc_curve(output_dir, model_type, y_test, y_pred_proba)
         if roc_path:
