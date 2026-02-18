@@ -1384,7 +1384,8 @@ def run_node_explain(context: dict) -> None:
         model_type, 
         input_dim=X_train.shape[1]
     )
-    train_models.run_explainability(estimator, X_train, X_test, y_test, model_type, output_dir)
+
+    train_models.run_explainability(estimator, X_train, X_test, y_test, model_type, output_dir, task_type=context.get("task_type", "regression"))
 
     validate_contract(
         bind_output_path(EXPLAIN_OUTPUT_CONTRACT, output_dir),

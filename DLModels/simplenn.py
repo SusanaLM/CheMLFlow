@@ -1,7 +1,7 @@
 import torch.nn as nn
 from DLModels.tropicallayer import TropicalLayer
 
-class SimpleRegressionNN(nn.Module):
+class SimpleNN(nn.Module):
     def __init__(self, input_dim, hidden_dim=64, use_tropical=False):
         super().__init__()
 
