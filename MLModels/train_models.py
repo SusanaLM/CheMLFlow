@@ -187,6 +187,99 @@ def _save_split_metrics_artifacts(
     return metrics_json_path, plot_path
 
 
+def _save_regression_parity_plots(
+    output_dir: str,
+    model_type: str,
+    split_predictions: Dict[str, tuple[Any, Any]],
+) -> Dict[str, str]:
+    def _sanitize_pair(y_true: Any, y_pred: Any) -> tuple[np.ndarray, np.ndarray] | None:
+        if y_true is None or y_pred is None:
+            return None
+        y_true_arr = np.asarray(y_true).reshape(-1)
+        y_pred_arr = np.asarray(y_pred).reshape(-1)
+        if y_true_arr.size == 0 or y_true_arr.size != y_pred_arr.size:
+            return None
+        finite_mask = np.isfinite(y_true_arr) & np.isfinite(y_pred_arr)
+        y_true_arr = y_true_arr[finite_mask]
+        y_pred_arr = y_pred_arr[finite_mask]
+        if y_true_arr.size == 0:
+            return None
+        return y_true_arr, y_pred_arr
+
+    def _limits(y_true_arr: np.ndarray, y_pred_arr: np.ndarray) -> tuple[float, float]:
+        lo = float(min(np.min(y_true_arr), np.min(y_pred_arr)))
+        hi = float(max(np.max(y_true_arr), np.max(y_pred_arr)))
+        pad = (hi - lo) * 0.05 if hi > lo else 1.0
+        return lo - pad, hi + pad
+
+    saved_paths: Dict[str, str] = {}
+    clean_pairs: Dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for split_name, payload in split_predictions.items():
+        if payload is None or len(payload) != 2:
+            continue
+        y_true, y_pred = payload
+        sanitized = _sanitize_pair(y_true, y_pred)
+        if sanitized is None:
+            continue
+        y_true_arr, y_pred_arr = sanitized
+        clean_pairs[split_name] = (y_true_arr, y_pred_arr)
+        line_lo, line_hi = _limits(y_true_arr, y_pred_arr)
+
+        fig, ax = plt.subplots(figsize=(5.5, 5.5))
+        ax.scatter(y_true_arr, y_pred_arr, s=18, alpha=0.65, edgecolors="none")
+        ax.plot([line_lo, line_hi], [line_lo, line_hi], linestyle="--", color="gray", linewidth=1)
+        ax.set_xlabel("True")
+        ax.set_ylabel("Predicted")
+        ax.set_title(f"{model_type} {split_name} parity (N={len(y_true_arr)})")
+        ax.grid(alpha=0.25)
+        fig.tight_layout()
+
+        parity_path = os.path.join(output_dir, f"{model_type}_parity_{split_name}.png")
+        fig.savefig(parity_path)
+        plt.close(fig)
+        saved_paths[split_name] = parity_path
+
+    if clean_pairs:
+        order = ["train", "val", "test"]
+        all_true_parts = [clean_pairs[name][0] for name in order if name in clean_pairs]
+        all_pred_parts = [clean_pairs[name][1] for name in order if name in clean_pairs]
+        if all_true_parts and all_pred_parts:
+            all_true = np.concatenate(all_true_parts)
+            all_pred = np.concatenate(all_pred_parts)
+            clean_pairs["all"] = (all_true, all_pred)
+
+            line_lo, line_hi = _limits(all_true, all_pred)
+            fig, axes = plt.subplots(2, 2, figsize=(11, 10), squeeze=False)
+            panel_order = ["all", "train", "val", "test"]
+            for idx, split_name in enumerate(panel_order):
+                ax = axes[idx // 2, idx % 2]
+                pair = clean_pairs.get(split_name)
+                if pair is None:
+                    ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+                    ax.set_title(f"{model_type} {split_name} parity (N=0)")
+                    ax.set_xlabel("True")
+                    ax.set_ylabel("Predicted")
+                    ax.grid(alpha=0.25)
+                    continue
+                y_true_arr, y_pred_arr = pair
+                ax.scatter(y_true_arr, y_pred_arr, s=16, alpha=0.6, edgecolors="none")
+                ax.plot([line_lo, line_hi], [line_lo, line_hi], linestyle="--", color="gray", linewidth=1)
+                ax.set_xlim(line_lo, line_hi)
+                ax.set_ylim(line_lo, line_hi)
+                ax.set_xlabel("True")
+                ax.set_ylabel("Predicted")
+                ax.set_title(f"{model_type} {split_name} parity (N={len(y_true_arr)})")
+                ax.grid(alpha=0.25)
+
+            fig.tight_layout()
+            combined_path = os.path.join(output_dir, f"{model_type}_parity_all_splits.png")
+            fig.savefig(combined_path)
+            plt.close(fig)
+            saved_paths["all_splits"] = combined_path
+
+    return saved_paths
+
+
 def _ensure_binary_labels(series: pd.Series) -> pd.Series:
     if isinstance(series, pd.DataFrame):
         if series.shape[1] != 1:
@@ -1340,6 +1433,18 @@ def train_model(
             metrics["split_metrics_path"] = split_metrics_path
         if split_plot_path:
             metrics["split_metrics_plot_path"] = split_plot_path
+
+        parity_paths = _save_regression_parity_plots(
+            output_dir,
+            model_type,
+            {
+                "train": (y_train, y_train_pred),
+                "test": (y_test, y_test_pred),
+                "val": (y_val, y_val_pred),
+            },
+        )
+        for split_name, path in parity_paths.items():
+            metrics[f"parity_plot_{split_name}_path"] = path
 
     params_path = os.path.join(output_dir, f"{model_type}_best_params.pkl")
     metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")

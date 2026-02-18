@@ -42,6 +42,18 @@ def test_train_model_writes_split_metrics_artifacts(tmp_path):
     assert split_plot_path is not None
     assert Path(split_metrics_path).exists()
     assert Path(split_plot_path).exists()
+    parity_train_path = metrics.get("parity_plot_train_path")
+    parity_val_path = metrics.get("parity_plot_val_path")
+    parity_test_path = metrics.get("parity_plot_test_path")
+    parity_all_splits_path = metrics.get("parity_plot_all_splits_path")
+    assert parity_train_path is not None
+    assert parity_val_path is not None
+    assert parity_test_path is not None
+    assert parity_all_splits_path is not None
+    assert Path(parity_train_path).exists()
+    assert Path(parity_val_path).exists()
+    assert Path(parity_test_path).exists()
+    assert Path(parity_all_splits_path).exists()
 
     split_metrics = json.loads(Path(split_metrics_path).read_text(encoding="utf-8"))
     assert set(split_metrics.keys()) == {"train", "val", "test"}
