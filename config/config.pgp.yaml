@@ -60,6 +60,7 @@ featurize:
 
 model:
   type: catboost_classifier
+  plot_split_performance: true
   params:
     depth: 6
     learning_rate: 0.1

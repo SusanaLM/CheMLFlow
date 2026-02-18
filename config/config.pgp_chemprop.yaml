@@ -53,10 +53,12 @@ split:
 
 model:
   type: chemprop
-  # foundation: none
-  foundation: chemeleon
-  foundation_checkpoint: models/chemeleon_mp.pt
-  freeze_encoder: false
+  foundation: none
+  plot_split_performance: true
+  # To enable CheMeleon foundation initialization:
+  # foundation: chemeleon
+  # foundation_checkpoint: models/chemeleon_mp.pt
+  # freeze_encoder: false
   smiles_column: canonical_smiles
   params:
     max_epochs: 30

@@ -251,6 +251,7 @@ def test_e2e_pgp_chemprop_fast(tmp_path: Path) -> None:
         },
         "model": {
             "type": "chemprop",
+            "plot_split_performance": True,
             "params": {
                 "max_epochs": 2,
                 "batch_size": 16,
@@ -264,6 +265,16 @@ def test_e2e_pgp_chemprop_fast(tmp_path: Path) -> None:
 
     out_dir = _run_pipeline(tmp_path, config)
     _assert_metrics(out_dir, "chemprop", ["auc", "auprc", "accuracy", "f1"])
+    metrics = json.loads((out_dir / "chemprop_metrics.json").read_text(encoding="utf-8"))
+    split_metrics_path = metrics.get("split_metrics_path")
+    split_plot_path = metrics.get("split_metrics_plot_path")
+    assert split_metrics_path is not None
+    assert split_plot_path is not None
+    assert Path(split_metrics_path).exists()
+    assert Path(split_plot_path).exists()
+    split_metrics = json.loads(Path(split_metrics_path).read_text(encoding="utf-8"))
+    assert set(split_metrics.keys()) == {"train", "val", "test"}
+    assert {"auc", "auprc", "accuracy", "f1"}.issubset(split_metrics["train"].keys())
     assert (out_dir / "run_config.yaml").exists()
 
 
