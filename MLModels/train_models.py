@@ -343,6 +343,7 @@ def train_chemprop_model(
     ff_hidden = int(params.get("ffn_hidden_dim", 300))
     mp_hidden = int(params.get("mp_hidden_dim", 300))
     depth = int(params.get("mp_depth", 3))
+    plot_split_performance = _as_bool(model_config.get("plot_split_performance", False))
 
     # Under pytest we aggressively shrink runtime unless explicitly overridden.
     if os.environ.get("PYTEST_CURRENT_TEST") and "max_epochs" not in params:
@@ -391,6 +392,12 @@ def train_chemprop_model(
             shuffle=True,
             num_workers=0,
         )
+        train_eval_loader = data.build_dataloader(
+            train_data,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
         val_loader = data.build_dataloader(
             val_data,
             batch_size=batch_size,
@@ -406,6 +413,9 @@ def train_chemprop_model(
     else:
         train_loader = data.MolGraphDataLoader(
             train_data, mol_featurizer, batch_size=batch_size, shuffle=True, num_workers=0
+        )
+        train_eval_loader = data.MolGraphDataLoader(
+            train_data, mol_featurizer, batch_size=batch_size, shuffle=False, num_workers=0
         )
         val_loader = data.MolGraphDataLoader(
             val_data, mol_featurizer, batch_size=batch_size, shuffle=False, num_workers=0
@@ -519,8 +529,7 @@ def train_chemprop_model(
     )
     trainer.fit(mpnn, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-    # Predict probabilities on test split.
-    pred_batches = trainer.predict(dataloaders=test_loader, ckpt_path="best")
+    # Predict probabilities from the best checkpoint.
     def _extract_tensor(obj):
         if isinstance(obj, torch.Tensor):
             return obj
@@ -533,15 +542,30 @@ def train_chemprop_model(
             return _extract_tensor(next(iter(obj.values())))
         raise TypeError(f"Unsupported prediction batch type: {type(obj)!r}")
 
-    if isinstance(pred_batches, list):
-        preds_t = torch.cat([_extract_tensor(p).detach().cpu().reshape(-1, 1) for p in pred_batches], dim=0)
-        preds = preds_t.numpy().reshape(-1)
-    else:
-        preds = _extract_tensor(pred_batches).detach().cpu().numpy().reshape(-1)
-    preds = preds.astype(float)
-    if np.nanmin(preds) < 0.0 or np.nanmax(preds) > 1.0:
-        # Some configs may emit logits; convert to probabilities for metrics.
-        preds = 1.0 / (1.0 + np.exp(-preds))
+    def _predict_batches(loader):
+        try:
+            return trainer.predict(dataloaders=loader, ckpt_path="best", weights_only=False)
+        except TypeError:
+            # Backward compatibility with older Lightning signatures.
+            return trainer.predict(dataloaders=loader, ckpt_path="best")
+
+    def _predict_probs(loader) -> np.ndarray:
+        pred_batches = _predict_batches(loader)
+        if isinstance(pred_batches, list):
+            preds_t = torch.cat(
+                [_extract_tensor(p).detach().cpu().reshape(-1, 1) for p in pred_batches],
+                dim=0,
+            )
+            preds = preds_t.numpy().reshape(-1)
+        else:
+            preds = _extract_tensor(pred_batches).detach().cpu().numpy().reshape(-1)
+        preds = preds.astype(float)
+        if np.nanmin(preds) < 0.0 or np.nanmax(preds) > 1.0:
+            # Some configs may emit logits; convert to probabilities for metrics.
+            preds = 1.0 / (1.0 + np.exp(-preds))
+        return preds
+
+    preds = _predict_probs(test_loader)
 
     y_true = df.loc[te_idx, "_label"].to_numpy(dtype=int)
     y_pred = (preds >= 0.5).astype(int)
@@ -563,6 +587,40 @@ def train_chemprop_model(
         "foundation_checkpoint": foundation_checkpoint,
         "freeze_encoder": bool(freeze_encoder),
     }
+    if plot_split_performance:
+        train_preds = _predict_probs(train_eval_loader)
+        val_preds = _predict_probs(val_loader)
+        train_y = df.loc[tr_idx, "_label"].to_numpy(dtype=int)
+        val_y = df.loc[va_idx, "_label"].to_numpy(dtype=int)
+        split_metrics: Dict[str, Dict[str, float | None]] = {
+            "train": {
+                "auc": _safe_auc(train_y, train_preds),
+                "auprc": _safe_auprc(train_y, train_preds),
+                "accuracy": float(accuracy_score(train_y, (train_preds >= 0.5).astype(int))),
+                "f1": float(f1_score(train_y, (train_preds >= 0.5).astype(int))),
+            },
+            "val": {
+                "auc": _safe_auc(val_y, val_preds),
+                "auprc": _safe_auprc(val_y, val_preds),
+                "accuracy": float(accuracy_score(val_y, (val_preds >= 0.5).astype(int))),
+                "f1": float(f1_score(val_y, (val_preds >= 0.5).astype(int))),
+            },
+            "test": {
+                "auc": metrics["auc"],
+                "auprc": metrics["auprc"],
+                "accuracy": metrics["accuracy"],
+                "f1": metrics["f1"],
+            },
+        }
+        split_metrics_path, split_plot_path = _save_split_metrics_artifacts(
+            output_dir,
+            "chemprop",
+            split_metrics,
+        )
+        if split_metrics_path:
+            metrics["split_metrics_path"] = split_metrics_path
+        if split_plot_path:
+            metrics["split_metrics_plot_path"] = split_plot_path
 
     # Save artifacts.
     model_path = os.path.join(output_dir, "chemprop_best_model.ckpt")

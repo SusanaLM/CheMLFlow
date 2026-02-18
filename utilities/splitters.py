@@ -184,24 +184,30 @@ def tdc_split_indices(
         raise ValueError(f"Unsupported TDC group: {group}")
     from tdc.single_pred import ADME
 
-    data = ADME(name=name)
-    split = data.get_split()
-    strategy_key = None
     desired = "scaffold" if strategy.endswith("scaffold") else "random"
-    for key in split.keys():
-        key_lower = key.lower()
-        if desired in key_lower:
-            strategy_key = key
-            break
-    if strategy_key is None:
-        if {"train", "test"}.issubset({k.lower() for k in split.keys()}):
-            selected = split
-        else:
+    data = ADME(name=name)
+    split = data.get_split(method=desired)
+    if not isinstance(split, dict):
+        raise ValueError(f"TDC get_split(method={desired!r}) returned an invalid payload.")
+
+    split_keys_lower = {str(k).lower() for k in split.keys()}
+    if {"train", "test"}.issubset(split_keys_lower):
+        selected = split
+    else:
+        strategy_key = None
+        for key in split.keys():
+            if desired in str(key).lower():
+                strategy_key = key
+                break
+        if strategy_key is None:
             raise ValueError(
                 f"TDC split does not expose a '{desired}' key. Available: {list(split.keys())}"
             )
-    else:
         selected = split[strategy_key]
+        if not isinstance(selected, dict):
+            raise ValueError(
+                f"TDC split key {strategy_key!r} does not contain split tables."
+            )
 
     canonical_map = _build_canonical_index(curated_smiles)
     split_dict: Dict[str, List[int]] = {}

@@ -311,7 +311,7 @@ if __name__ == "__main__":
                         help="If set, keep the largest fragment by heavy-atom count when multiple fragments are present.")
     parser.add_argument('--no_prefer_largest_fragment', dest='prefer_largest_fragment', action='store_false',
                         help="Disable largest-fragment preference and keep the first valid fragment.")
-    parser.set_defaults(prefer_largest_fragment=False)
+    parser.set_defaults(prefer_largest_fragment=True)
     parser.add_argument('--keep_all_columns', action='store_true',
                         help="If set, keep all columns (do not drop to only selected properties).")
     parser.add_argument('--dedupe_strategy', type=str, default=None,
