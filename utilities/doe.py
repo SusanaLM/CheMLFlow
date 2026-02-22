@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import math
 import os
 import subprocess
 from dataclasses import dataclass
@@ -24,6 +25,16 @@ _DEDUPE_STRATEGY_ALIASES = {
     "keep_last": "last",
 }
 _VALID_DEDUPE_STRATEGIES = {"first", "last", "drop_conflicts", "majority"}
+_SMILES_COLUMN_CANDIDATES = (
+    "canonical_smiles",
+    "smiles",
+    "SMILES",
+    "Smiles",
+    "Drug",
+    "drug",
+)
+_DEFAULT_MAX_EXPANDED_CASES = 10000
+_DOE_SPEC_NAMESPACE_LEN = 8
 
 
 @dataclass(frozen=True)
@@ -267,16 +278,29 @@ def _hashable_config_payload(config: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _case_scoped_path(path_template: str, case_id: str) -> str:
+def _case_scoped_path(path_template: str, case_id: str, namespace: str | None = None) -> str:
     template = str(path_template).strip()
     if not template:
-        return case_id
-    if "{case_id}" in template:
-        return template.replace("{case_id}", case_id)
-    return os.path.join(template, case_id)
+        return os.path.join(namespace, case_id) if namespace else case_id
+
+    rendered = template
+    if namespace and "{doe_spec_hash}" in rendered:
+        rendered = rendered.replace("{doe_spec_hash}", namespace)
+    if "{case_id}" in rendered:
+        scoped_case = os.path.join(namespace, case_id) if namespace and "{doe_spec_hash}" not in template else case_id
+        return rendered.replace("{case_id}", scoped_case)
+
+    if namespace:
+        return os.path.join(rendered, namespace, case_id)
+    return os.path.join(rendered, case_id)
 
 
-def _apply_case_isolation(config: dict[str, Any], case_id: str, output_dir: str) -> None:
+def _apply_case_isolation(
+    config: dict[str, Any],
+    case_id: str,
+    output_dir: str,
+    spec_namespace: str | None = None,
+) -> None:
     global_cfg = config.setdefault("global", {})
     if not isinstance(global_cfg, dict):
         return
@@ -284,12 +308,12 @@ def _apply_case_isolation(config: dict[str, Any], case_id: str, output_dir: str)
     base_root = str(global_cfg.get("base_dir", os.path.join("data", "doe"))).strip() or os.path.join(
         "data", "doe"
     )
-    global_cfg["base_dir"] = _case_scoped_path(base_root, case_id)
+    global_cfg["base_dir"] = _case_scoped_path(base_root, case_id, namespace=spec_namespace)
 
     run_root = str(global_cfg.get("run_dir", os.path.join(output_dir, "runs"))).strip() or os.path.join(
         output_dir, "runs"
     )
-    global_cfg["run_dir"] = _case_scoped_path(run_root, case_id)
+    global_cfg["run_dir"] = _case_scoped_path(run_root, case_id, namespace=spec_namespace)
 
     runs_cfg = global_cfg.get("runs")
     if not isinstance(runs_cfg, dict):
@@ -343,6 +367,7 @@ def probe_dataset(dataset_cfg: dict[str, Any]) -> dict[str, Any]:
         "binary_target": None,
         "columns": [],
         "n_rows": None,
+        "resolved_smiles_column": None,
     }
     if source_type != "local_csv":
         return probe
@@ -355,6 +380,11 @@ def probe_dataset(dataset_cfg: dict[str, Any]) -> dict[str, Any]:
         raise DOEGenerationError(f"dataset.source.path does not exist: {source_path}")
     columns = [str(c) for c in pd.read_csv(path, nrows=0).columns]
     probe["columns"] = columns
+    configured_smiles = str(dataset_cfg.get("smiles_column", "")).strip()
+    if configured_smiles:
+        probe["resolved_smiles_column"] = configured_smiles if configured_smiles in columns else None
+    else:
+        probe["resolved_smiles_column"] = next((c for c in _SMILES_COLUMN_CANDIDATES if c in columns), None)
 
     target_name = str(target_column) if target_column is not None else ""
     target_present = bool(target_name and target_name in columns)
@@ -505,11 +535,22 @@ def resolve_profile(dataset_cfg: dict[str, Any], probe: dict[str, Any]) -> Profi
 def _expand_search_space(search_space: dict[str, Any], max_cases: int | None) -> list[dict[str, Any]]:
     keys = sorted(search_space.keys())
     value_lists = []
+    axis_sizes: list[int] = []
     for key in keys:
         values = _as_list(search_space.get(key))
         if not values:
             raise DOEGenerationError(f"search_space.{key} must contain at least one value.")
         value_lists.append(values)
+        axis_sizes.append(len(values))
+
+    estimated = int(math.prod(axis_sizes)) if axis_sizes else 0
+    if max_cases is None and estimated > _DEFAULT_MAX_EXPANDED_CASES:
+        raise DOEGenerationError(
+            "Expanded DOE is too large without constraints.max_cases. "
+            f"Estimated combinations={estimated:,} exceeds default safety limit={_DEFAULT_MAX_EXPANDED_CASES:,}. "
+            "Set constraints.max_cases explicitly."
+        )
+
     combos: list[dict[str, Any]] = []
     for values in itertools.product(*value_lists):
         combos.append({key: value for key, value in zip(keys, values)})
@@ -597,6 +638,7 @@ def _build_case_config(
     dataset_cfg: dict[str, Any],
     merged: dict[str, Any],
     resolved_task: str,
+    probe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if resolved_task != profile.task_type:
         raise DOEGenerationError(
@@ -699,6 +741,11 @@ def _build_case_config(
     if "curate" in nodes:
         curate_cfg: dict[str, Any] = {}
         dataset_curate = dataset_cfg.get("curate", {}) if isinstance(dataset_cfg.get("curate"), dict) else {}
+        resolved_smiles_column = ""
+        if isinstance(probe, dict):
+            resolved_smiles = probe.get("resolved_smiles_column")
+            if resolved_smiles is not None:
+                resolved_smiles_column = str(resolved_smiles).strip()
         default_properties: Any = dataset_curate.get("properties")
         if default_properties is None:
             if profile.name == "reg_chembl_ic50":
@@ -712,7 +759,7 @@ def _build_case_config(
         curate_cfg["properties"] = merged.get("curate.properties", default_properties)
         smiles_column = merged.get(
             "curate.smiles_column",
-            dataset_curate.get("smiles_column", dataset_cfg.get("smiles_column")),
+            dataset_curate.get("smiles_column", dataset_cfg.get("smiles_column", resolved_smiles_column)),
         )
         if smiles_column:
             curate_cfg["smiles_column"] = str(smiles_column)
@@ -911,6 +958,7 @@ def _validate_case(
     has_train_tdc = "train.tdc" in nodes
     has_preprocess = "preprocess.features" in nodes
     has_select = "select.features" in nodes
+    source_type = str(_get_dotted(config, "get_data.data_source", profile.default_source)).strip().lower()
     if has_train and has_train_tdc:
         _add_issue(
             issues,
@@ -927,7 +975,6 @@ def _validate_case(
         )
 
     if "get_data" in nodes:
-        source_type = str(_get_dotted(config, "get_data.data_source", "")).strip().lower()
         if source_type and source_type != profile.default_source:
             _add_issue(
                 issues,
@@ -1015,10 +1062,12 @@ def _validate_case(
         "featurize.morgan",
     }
     selected_feature_input = "none"
-    for candidate in ("use.curated_features", "featurize.rdkit", "featurize.morgan"):
-        if candidate in nodes:
-            selected_feature_input = candidate
-            break
+    if "use.curated_features" in nodes:
+        selected_feature_input = "use.curated_features"
+    elif "featurize.rdkit" in nodes or "featurize.rdkit_labeled" in nodes:
+        selected_feature_input = "featurize.rdkit"
+    elif "featurize.morgan" in nodes:
+        selected_feature_input = "featurize.morgan"
     if has_train and not profile.allows_feature_input(selected_feature_input):
         _add_issue(
             issues,
@@ -1214,6 +1263,26 @@ def _validate_case(
                         f"got {target_column!r}."
                     ),
                 )
+            else:
+                keep_all_columns = _as_bool(_get_dotted(config, "curate.keep_all_columns", False))
+                label_column = str(_get_dotted(config, "curate.label_column", "")).strip()
+                curate_properties = set(_as_str_list(_get_dotted(config, "curate.properties", [])))
+                preserves_target = (
+                    keep_all_columns
+                    or (label_column and target_column == label_column)
+                    or target_column in curate_properties
+                )
+                if not preserves_target:
+                    _add_issue(
+                        issues,
+                        code="DOE_CURATE_TARGET_DROPPED",
+                        path="curate.properties",
+                        message=(
+                            "Regression DOE requires the target column to survive curate. "
+                            f"Configure curate.keep_all_columns=true, curate.label_column={target_column!r}, "
+                            f"or include {target_column!r} in curate.properties."
+                        ),
+                    )
         smiles_column = str(_get_dotted(config, "curate.smiles_column", "")).strip()
         if smiles_column and smiles_column not in columns:
             _add_issue(
@@ -1222,6 +1291,21 @@ def _validate_case(
                 path="curate.smiles_column",
                 message=f"Configured smiles column {smiles_column!r} was not found in the dataset.",
             )
+        elif source_type == "local_csv" and not smiles_column:
+            resolved_smiles = probe.get("resolved_smiles_column")
+            resolved_smiles_column = ""
+            if resolved_smiles is not None:
+                resolved_smiles_column = str(resolved_smiles).strip()
+            if not resolved_smiles_column:
+                _add_issue(
+                    issues,
+                    code="DOE_SMILES_COLUMN_MISSING",
+                    path="curate.smiles_column",
+                    message=(
+                        "No SMILES column could be resolved for local_csv data. "
+                        "Set dataset.smiles_column/curate.smiles_column explicitly."
+                    ),
+                )
         if task_type == "classification" and "label.normalize" in nodes:
             source_column = str(_get_dotted(config, "label.source_column", "")).strip()
             if source_column and source_column not in columns:
@@ -1299,6 +1383,7 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
         spec=spec,
         doe_path=doe_path,
     )
+    spec_namespace = doe_spec_hash[:_DOE_SPEC_NAMESPACE_LEN]
 
     probe = probe_dataset(dataset_cfg)
     resolved_task = _resolve_task_type(dataset_cfg, probe)
@@ -1339,6 +1424,7 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
             dataset_cfg=dataset_cfg,
             merged=merged,
             resolved_task=resolved_task,
+            probe=probe,
         )
         issues = _validate_case(profile=profile, config=base_config, probe=probe)
 
@@ -1373,7 +1459,12 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
 
         config = json.loads(json.dumps(base_config))
         if isolate_case_artifacts:
-            _apply_case_isolation(config, case_id=case_id, output_dir=output_dir)
+            _apply_case_isolation(
+                config,
+                case_id=case_id,
+                output_dir=output_dir,
+                spec_namespace=spec_namespace,
+            )
         config_hash = _stable_hash(config)
 
         model_type = _get_dotted(config, "train.model.type", _get_dotted(config, "train_tdc.model.type", "model"))

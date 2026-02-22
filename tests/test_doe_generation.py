@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
-from utilities.doe import generate_doe
+from utilities.doe import DOEGenerationError, generate_doe
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -204,12 +205,44 @@ def test_generate_doe_isolates_case_artifacts_by_default(tmp_path: Path) -> None
     base_dirs = [cfg["global"]["base_dir"] for cfg in configs]
     run_dirs = [cfg["global"]["run_dir"] for cfg in configs]
     run_ids = [cfg["global"]["runs"]["id"] for cfg in configs]
+    namespace = result["summary"]["doe_spec_hash"][:8]
 
     assert len(set(base_dirs)) == 2
     assert len(set(run_dirs)) == 2
     assert len(set(run_ids)) == 2
     assert any(path.endswith("case_0001") for path in base_dirs)
     assert any(path.endswith("case_0002") for path in base_dirs)
+    assert all(Path(path).parts[-2] == namespace for path in base_dirs)
+    assert all(Path(path).parts[-2] == namespace for path in run_dirs)
+
+
+def test_generate_doe_isolation_namespaces_paths_by_spec_hash(tmp_path: Path) -> None:
+    spec_a = _base_clf_doe(tmp_path)
+    spec_a["search_space"]["train.model.type"] = ["catboost_classifier"]
+    spec_a["defaults"]["global.base_dir"] = str(tmp_path / "shared_data")
+    spec_a["defaults"]["global.run_dir"] = str(tmp_path / "shared_runs")
+    spec_a["output"]["dir"] = str(tmp_path / "generated_a")
+
+    spec_b = _base_clf_doe(tmp_path)
+    spec_b["search_space"]["train.model.type"] = ["dl_simple"]
+    spec_b["defaults"]["global.base_dir"] = str(tmp_path / "shared_data")
+    spec_b["defaults"]["global.run_dir"] = str(tmp_path / "shared_runs")
+    spec_b["output"]["dir"] = str(tmp_path / "generated_b")
+
+    result_a = generate_doe(spec_a)
+    result_b = generate_doe(spec_b)
+
+    cfg_a = yaml.safe_load(Path(result_a["valid_cases"][0]["config_path"]).read_text(encoding="utf-8"))
+    cfg_b = yaml.safe_load(Path(result_b["valid_cases"][0]["config_path"]).read_text(encoding="utf-8"))
+
+    ns_a = result_a["summary"]["doe_spec_hash"][:8]
+    ns_b = result_b["summary"]["doe_spec_hash"][:8]
+
+    assert ns_a != ns_b
+    assert Path(cfg_a["global"]["base_dir"]).parts[-2] == ns_a
+    assert Path(cfg_b["global"]["base_dir"]).parts[-2] == ns_b
+    assert cfg_a["global"]["base_dir"] != cfg_b["global"]["base_dir"]
+    assert cfg_a["global"]["run_dir"] != cfg_b["global"]["run_dir"]
 
 
 def test_generate_doe_validates_dataset_columns(tmp_path: Path) -> None:
@@ -359,3 +392,160 @@ def test_generate_doe_auto_task_detects_float_binary_labels(tmp_path: Path) -> N
 
     assert summary["task_type"] == "classification"
     assert summary["valid_cases"] == 1
+
+
+def test_generate_doe_auto_resolves_smiles_column_for_local_csv(tmp_path: Path) -> None:
+    spec = {
+        "version": 1,
+        "dataset": {
+            "profile": "reg_local_csv",
+            "task_type": "regression",
+            "target_column": "FP Exp.",
+            "source": {"type": "local_csv", "path": _flash_dataset_path()},
+        },
+        "search_space": {
+            "split.mode": ["holdout"],
+            "split.strategy": ["random"],
+            "pipeline.feature_input": ["use.curated_features"],
+            "train.model.type": ["random_forest"],
+        },
+        "defaults": {
+            "global.base_dir": str(tmp_path / "auto_smiles_data"),
+            "global.runs.enabled": False,
+            "split.test_size": 0.2,
+            "split.val_size": 0.1,
+        },
+        "output": {"dir": str(tmp_path / "generated_auto_smiles")},
+    }
+
+    result = generate_doe(spec)
+    assert result["summary"]["valid_cases"] == 1
+
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["curate"]["smiles_column"] == "SMILES"
+
+
+def test_generate_doe_rejects_unresolvable_smiles_column(tmp_path: Path) -> None:
+    csv_path = tmp_path / "no_smiles.csv"
+    csv_path.write_text("structure,target\nCC,0.1\nCCC,0.2\n", encoding="utf-8")
+    spec = {
+        "version": 1,
+        "dataset": {
+            "profile": "reg_local_csv",
+            "task_type": "regression",
+            "target_column": "target",
+            "source": {"type": "local_csv", "path": str(csv_path)},
+        },
+        "search_space": {
+            "split.mode": ["holdout"],
+            "split.strategy": ["random"],
+            "pipeline.feature_input": ["use.curated_features"],
+            "train.model.type": ["random_forest"],
+        },
+        "defaults": {
+            "global.base_dir": str(tmp_path / "no_smiles_data"),
+            "global.runs.enabled": False,
+            "split.test_size": 0.2,
+            "split.val_size": 0.1,
+        },
+        "output": {"dir": str(tmp_path / "generated_no_smiles")},
+    }
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 0
+    assert summary["issue_counts"].get("DOE_SMILES_COLUMN_MISSING", 0) == 1
+
+
+def test_generate_doe_rejects_regression_when_curate_drops_target(tmp_path: Path) -> None:
+    spec = {
+        "version": 1,
+        "dataset": {
+            "profile": "reg_local_csv",
+            "task_type": "regression",
+            "target_column": "FP Exp.",
+            "source": {"type": "local_csv", "path": _flash_dataset_path()},
+            "smiles_column": "SMILES",
+        },
+        "search_space": {
+            "split.mode": ["holdout"],
+            "split.strategy": ["random"],
+            "pipeline.feature_input": ["use.curated_features"],
+            "train.model.type": ["random_forest"],
+        },
+        "defaults": {
+            "global.base_dir": str(tmp_path / "missing_target_data"),
+            "global.runs.enabled": False,
+            "split.test_size": 0.2,
+            "split.val_size": 0.1,
+            "curate.properties": ["FP Calc."],
+        },
+        "output": {"dir": str(tmp_path / "generated_missing_target")},
+    }
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 0
+    assert summary["issue_counts"].get("DOE_CURATE_TARGET_DROPPED", 0) == 1
+
+
+def test_generate_doe_allows_regression_target_when_keep_all_columns(tmp_path: Path) -> None:
+    spec = {
+        "version": 1,
+        "dataset": {
+            "profile": "reg_local_csv",
+            "task_type": "regression",
+            "target_column": "FP Exp.",
+            "source": {"type": "local_csv", "path": _flash_dataset_path()},
+            "smiles_column": "SMILES",
+        },
+        "search_space": {
+            "split.mode": ["holdout"],
+            "split.strategy": ["random"],
+            "pipeline.feature_input": ["use.curated_features"],
+            "train.model.type": ["random_forest"],
+        },
+        "defaults": {
+            "global.base_dir": str(tmp_path / "keep_all_data"),
+            "global.runs.enabled": False,
+            "split.test_size": 0.2,
+            "split.val_size": 0.1,
+            "curate.properties": ["FP Calc."],
+            "curate.keep_all_columns": True,
+        },
+        "output": {"dir": str(tmp_path / "generated_keep_all")},
+    }
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 1
+    assert summary["issue_counts"].get("DOE_CURATE_TARGET_DROPPED", 0) == 0
+
+
+def test_generate_doe_accepts_rdkit_labeled_feature_alias(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["featurize.rdkit_labeled"]
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 1
+    assert summary["issue_counts"].get("DOE_FEATURE_INPUT_NOT_SUPPORTED", 0) == 0
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert "featurize.rdkit_labeled" in config["pipeline"]["nodes"]
+
+
+def test_generate_doe_requires_max_cases_for_large_grid(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"] = {
+        "axis.a": list(range(101)),
+        "axis.b": list(range(101)),
+    }
+
+    with pytest.raises(DOEGenerationError, match="constraints.max_cases"):
+        generate_doe(spec)

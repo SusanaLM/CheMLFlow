@@ -6,7 +6,8 @@ import logging
 import os
 import subprocess
 import sys
-from datetime import datetime
+import traceback
+from datetime import datetime, timezone
 
 import yaml
 import pandas as pd
@@ -179,6 +180,49 @@ def _configure_logging(run_dir: str, level: int = logging.INFO) -> None:
 
     for handler in logger.handlers:
         handler.setLevel(level)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _stable_hash(payload: object) -> str:
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _hashable_config_payload(config: dict) -> dict:
+    payload = json.loads(json.dumps(config))
+    global_cfg = payload.get("global")
+    if isinstance(global_cfg, dict):
+        global_cfg.pop("base_dir", None)
+        global_cfg.pop("run_dir", None)
+        runs_cfg = global_cfg.get("runs")
+        if isinstance(runs_cfg, dict):
+            runs_cfg.pop("id", None)
+    return payload
+
+
+def _git_sha() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def _write_json_atomic(path: str, payload: dict) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    temp_path = f"{path}.tmp.{os.getpid()}"
+    with open(temp_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    os.replace(temp_path, path)
 
 
 def _run_subprocess(cmd: list[str], *, cwd: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -2095,10 +2139,15 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
     os.makedirs(base_dir, exist_ok=True)
     run_dir = resolve_run_dir(config)
     os.makedirs(run_dir, exist_ok=True)
+    run_config_path = os.path.join(run_dir, "run_config.yaml")
+    run_status_path = os.path.join(run_dir, "run_status.json")
     log_level = _resolve_log_level(global_config)
     _configure_logging(run_dir, level=log_level)
     debug_logging = _as_bool(global_config.get("debug", False)) or log_level <= logging.DEBUG
     global_random_state = int(global_config.get("random_state", 42))
+    start_time = _utc_now_iso()
+    config_hash = _stable_hash(config)
+    config_fingerprint = _stable_hash(_hashable_config_payload(config))
 
     train_config = config.get("train", {}) or {}
     train_features_config = train_config.get("features", {}) if isinstance(train_config, dict) else {}
@@ -2144,17 +2193,73 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
         "source": config.get("get_data", {}).get("source", {}),
         "run_dir": run_dir,
         "debug_logging": debug_logging,
+        "config_hash": config_hash,
+        "config_fingerprint": config_fingerprint,
     }
 
-    with open(os.path.join(run_dir, "run_config.yaml"), "w", encoding="utf-8") as f:
+    with open(run_config_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, sort_keys=False)
 
-    for node_name in nodes:
-        node_fn = NODE_REGISTRY.get(node_name)
-        if not node_fn:
-            raise ValueError(f"Unknown pipeline node: {node_name}")
-        node_fn(context)
+    _write_json_atomic(
+        run_status_path,
+        {
+            "status": "running",
+            "start_time": start_time,
+            "config_path": config_path,
+            "run_dir": run_dir,
+            "base_dir": base_dir,
+            "pipeline_nodes": list(nodes),
+            "config_hash": config_hash,
+            "config_fingerprint": config_fingerprint,
+            "git_sha": _git_sha(),
+        },
+    )
 
+    failed_node = None
+    try:
+        for node_name in nodes:
+            failed_node = node_name
+            node_fn = NODE_REGISTRY.get(node_name)
+            if not node_fn:
+                raise ValueError(f"Unknown pipeline node: {node_name}")
+            node_fn(context)
+    except BaseException as exc:
+        _write_json_atomic(
+            run_status_path,
+            {
+                "status": "failed",
+                "start_time": start_time,
+                "end_time": _utc_now_iso(),
+                "config_path": config_path,
+                "run_dir": run_dir,
+                "base_dir": base_dir,
+                "pipeline_nodes": list(nodes),
+                "failed_node": failed_node,
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+                "config_hash": config_hash,
+                "config_fingerprint": config_fingerprint,
+                "git_sha": _git_sha(),
+            },
+        )
+        raise
+
+    _write_json_atomic(
+        run_status_path,
+        {
+            "status": "success",
+            "start_time": start_time,
+            "end_time": _utc_now_iso(),
+            "config_path": config_path,
+            "run_dir": run_dir,
+            "base_dir": base_dir,
+            "pipeline_nodes": list(nodes),
+            "config_hash": config_hash,
+            "config_fingerprint": config_fingerprint,
+            "git_sha": _git_sha(),
+        },
+    )
     return True
 
 

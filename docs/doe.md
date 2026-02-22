@@ -52,11 +52,12 @@ Important conventions:
 - `defaults` uses the same dotted-path style and is applied before `search_space` factors.
 - For `split.mode: cv` or `nested_holdout_cv`, include fold axes in `search_space`
   (`split.cv.fold_index` / `split.cv.repeat_index` or nested equivalents) when you want multi-fold evaluation.
-- By default, generated cases are isolated per case id:
-  - `global.base_dir` becomes `<base_dir>/<case_id>`
-  - `global.run_dir` becomes `<run_dir>/<case_id>` (or `<output.dir>/runs/<case_id>`)
+- By default, generated cases are isolated per DOE spec hash + case id:
+  - `global.base_dir` becomes `<base_dir>/<doe_spec_hash[:8]>/<case_id>`
+  - `global.run_dir` becomes `<run_dir>/<doe_spec_hash[:8]>/<case_id>` (or `<output.dir>/runs/<doe_spec_hash[:8]>/<case_id>`)
   - `global.runs.id` is set to `case_id`
   Set `constraints.isolate_case_artifacts: false` only if you intentionally want shared artifacts.
+- Safety cap: if `constraints.max_cases` is omitted and expanded combinations exceed 10,000, DOE generation fails fast.
 
 ## Required dataset fields (typical local CSV)
 
@@ -95,7 +96,9 @@ Examples:
 - `DOE_SPLIT_PARAM_INVALID`
 - `DOE_DATASET_COLUMN_MISSING`
 - `DOE_TARGET_COLUMN_MISSING`
+- `DOE_SMILES_COLUMN_MISSING`
 - `DOE_CURATE_DEDUPE_INVALID`
+- `DOE_CURATE_TARGET_DROPPED`
 - `DOE_RUNTIME_SCHEMA_INVALID`
 
 `manifest.jsonl` contains these codes per skipped case.
