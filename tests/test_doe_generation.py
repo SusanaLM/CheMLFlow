@@ -156,7 +156,7 @@ def test_generate_doe_supports_auto_task_with_confirmation(tmp_path: Path) -> No
         "search_space": {
             "split.mode": ["holdout"],
             "split.strategy": ["random"],
-            "pipeline.feature_input": ["use.curated_features"],
+            "pipeline.feature_input": ["featurize.none"],
             "pipeline.preprocess": [False],
             "pipeline.select": [False],
             "pipeline.explain": [False],
@@ -284,7 +284,7 @@ def test_generate_doe_requires_regression_target_column_for_local_csv(tmp_path: 
         "search_space": {
             "split.mode": ["holdout"],
             "split.strategy": ["random"],
-            "pipeline.feature_input": ["use.curated_features"],
+            "pipeline.feature_input": ["featurize.rdkit"],
             "train.model.type": ["random_forest"],
         },
         "defaults": {
@@ -374,7 +374,7 @@ def test_generate_doe_auto_task_detects_float_binary_labels(tmp_path: Path) -> N
         "search_space": {
             "split.mode": ["holdout"],
             "split.strategy": ["random"],
-            "pipeline.feature_input": ["use.curated_features"],
+            "pipeline.feature_input": ["featurize.none"],
             "train.model.type": ["catboost_classifier"],
         },
         "defaults": {
@@ -406,7 +406,7 @@ def test_generate_doe_auto_resolves_smiles_column_for_local_csv(tmp_path: Path) 
         "search_space": {
             "split.mode": ["holdout"],
             "split.strategy": ["random"],
-            "pipeline.feature_input": ["use.curated_features"],
+            "pipeline.feature_input": ["featurize.rdkit"],
             "train.model.type": ["random_forest"],
         },
         "defaults": {
@@ -440,7 +440,7 @@ def test_generate_doe_rejects_unresolvable_smiles_column(tmp_path: Path) -> None
         "search_space": {
             "split.mode": ["holdout"],
             "split.strategy": ["random"],
-            "pipeline.feature_input": ["use.curated_features"],
+            "pipeline.feature_input": ["featurize.rdkit"],
             "train.model.type": ["random_forest"],
         },
         "defaults": {
@@ -472,7 +472,7 @@ def test_generate_doe_rejects_regression_when_curate_drops_target(tmp_path: Path
         "search_space": {
             "split.mode": ["holdout"],
             "split.strategy": ["random"],
-            "pipeline.feature_input": ["use.curated_features"],
+            "pipeline.feature_input": ["featurize.rdkit"],
             "train.model.type": ["random_forest"],
         },
         "defaults": {
@@ -505,7 +505,7 @@ def test_generate_doe_allows_regression_target_when_keep_all_columns(tmp_path: P
         "search_space": {
             "split.mode": ["holdout"],
             "split.strategy": ["random"],
-            "pipeline.feature_input": ["use.curated_features"],
+            "pipeline.feature_input": ["featurize.rdkit"],
             "train.model.type": ["random_forest"],
         },
         "defaults": {
@@ -526,6 +526,43 @@ def test_generate_doe_allows_regression_target_when_keep_all_columns(tmp_path: P
     assert summary["issue_counts"].get("DOE_CURATE_TARGET_DROPPED", 0) == 0
 
 
+def test_generate_doe_featurize_none_defaults_keep_all_columns(tmp_path: Path) -> None:
+    spec = {
+        "version": 1,
+        "dataset": {
+            "profile": "reg_local_csv",
+            "task_type": "regression",
+            "target_column": "FP Exp.",
+            "source": {"type": "local_csv", "path": _flash_dataset_path()},
+            "smiles_column": "SMILES",
+        },
+        "search_space": {
+            "split.mode": ["holdout"],
+            "split.strategy": ["random"],
+            "pipeline.feature_input": ["featurize.none"],
+            "train.model.type": ["random_forest"],
+        },
+        "defaults": {
+            "global.base_dir": str(tmp_path / "default_keep_all_data"),
+            "global.runs.enabled": False,
+            "split.test_size": 0.2,
+            "split.val_size": 0.1,
+            "curate.properties": ["FP Calc."],
+        },
+        "output": {"dir": str(tmp_path / "generated_default_keep_all")},
+    }
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 1
+    assert summary["issue_counts"].get("DOE_CURATE_TARGET_DROPPED", 0) == 0
+
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert (config.get("curate") or {}).get("keep_all_columns") is True
+
+
 def test_generate_doe_accepts_rdkit_labeled_feature_alias(tmp_path: Path) -> None:
     spec = _base_clf_doe(tmp_path)
     spec["search_space"]["pipeline.feature_input"] = ["featurize.rdkit_labeled"]
@@ -538,6 +575,20 @@ def test_generate_doe_accepts_rdkit_labeled_feature_alias(tmp_path: Path) -> Non
     config_path = Path(result["valid_cases"][0]["config_path"])
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert "featurize.rdkit_labeled" in config["pipeline"]["nodes"]
+
+
+def test_generate_doe_normalizes_legacy_curated_feature_alias(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["use.curated_features"]
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 1
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert "featurize.none" in config["pipeline"]["nodes"]
+    assert "use.curated_features" not in config["pipeline"]["nodes"]
 
 
 def test_generate_doe_requires_max_cases_for_large_grid(tmp_path: Path) -> None:

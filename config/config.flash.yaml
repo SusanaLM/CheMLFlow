@@ -15,7 +15,7 @@ pipeline:
     - get_data
     - curate
     - split
-    - use.curated_features
+    - featurize.none
     - preprocess.features
     - train
     - explain

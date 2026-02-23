@@ -203,6 +203,25 @@ def _hashable_config_payload(config: dict) -> dict:
     return payload
 
 
+_PIPELINE_NODE_ALIASES = {
+    "use.curated_features": "featurize.none",
+}
+
+
+def _canonicalize_pipeline_nodes(nodes: list[str]) -> list[str]:
+    return [_PIPELINE_NODE_ALIASES.get(str(node), str(node)) for node in nodes]
+
+
+def _normalize_runtime_config(config: dict, nodes: list[str]) -> dict:
+    payload = json.loads(json.dumps(config))
+    pipeline_cfg = payload.get("pipeline")
+    if isinstance(pipeline_cfg, dict):
+        pipeline_cfg["nodes"] = list(nodes)
+    else:
+        payload["pipeline"] = {"nodes": list(nodes)}
+    return payload
+
+
 def _git_sha() -> str | None:
     try:
         result = subprocess.run(
@@ -330,12 +349,12 @@ def run_node_curate(context: dict) -> None:
     context["curated_path"] = curated_file
 
 
-def run_node_use_curated_features(context: dict) -> None:
+def run_node_featurize_none(context: dict) -> None:
     curated_path = context.get("curated_path", context["paths"]["curated"])
     validate_contract(
         bind_output_path(
             make_target_column_contract(
-                name="use_curated_features_input",
+                name="featurize_none_input",
                 target_column=context["target_column"],
                 output_path=curated_path,
             ),
@@ -2051,7 +2070,7 @@ def run_node_explain(context: dict) -> None:
 NODE_REGISTRY = {
     "get_data": run_node_get_data,
     "curate": run_node_curate,
-    "use.curated_features": run_node_use_curated_features,
+    "featurize.none": run_node_featurize_none,
     "label.normalize": run_node_label_normalize,
     "split": run_node_split,
     "featurize.lipinski": run_node_featurize_lipinski,
@@ -2128,16 +2147,18 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
     nodes = pipeline.get("nodes")
     if not nodes:
         return False
+    nodes = _canonicalize_pipeline_nodes(list(nodes))
+    runtime_config = _normalize_runtime_config(config, nodes)
     validate_pipeline_nodes(nodes)
-    validate_config_strict(config, nodes)
+    validate_config_strict(runtime_config, nodes)
 
-    global_config = config.get("global")
+    global_config = runtime_config.get("global")
     if not global_config:
         raise ValueError("global section is required in config")
     pipeline_type = global_config.get("pipeline_type", "chembl")
     base_dir = global_config["base_dir"]
     os.makedirs(base_dir, exist_ok=True)
-    run_dir = resolve_run_dir(config)
+    run_dir = resolve_run_dir(runtime_config)
     os.makedirs(run_dir, exist_ok=True)
     run_config_path = os.path.join(run_dir, "run_config.yaml")
     run_status_path = os.path.join(run_dir, "run_status.json")
@@ -2146,20 +2167,20 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
     debug_logging = _as_bool(global_config.get("debug", False)) or log_level <= logging.DEBUG
     global_random_state = int(global_config.get("random_state", 42))
     start_time = _utc_now_iso()
-    config_hash = _stable_hash(config)
-    config_fingerprint = _stable_hash(_hashable_config_payload(config))
+    config_hash = _stable_hash(runtime_config)
+    config_fingerprint = _stable_hash(_hashable_config_payload(runtime_config))
 
-    train_config = config.get("train", {}) or {}
+    train_config = runtime_config.get("train", {}) or {}
     train_features_config = train_config.get("features", {}) if isinstance(train_config, dict) else {}
     model_config = train_config.get("model", {}) if isinstance(train_config, dict) else {}
-    train_tdc_config = config.get("train_tdc", {}) or {}
+    train_tdc_config = runtime_config.get("train_tdc", {}) or {}
     train_tdc_model_config = (
         train_tdc_config.get("model", {}) if isinstance(train_tdc_config, dict) else {}
     )
 
     # If the pipeline uses curated tabular descriptors directly, default to keep all columns.
-    keep_all_columns = _as_bool(config.get("curate", {}).get("keep_all_columns", False))
-    if "use.curated_features" in nodes:
+    keep_all_columns = _as_bool(runtime_config.get("curate", {}).get("keep_all_columns", False))
+    if "featurize.none" in nodes:
         keep_all_columns = True
 
     model_type = None
@@ -2179,18 +2200,18 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
         "target_column": global_config.get("target_column", "pIC50"),
         "model_type": model_type,
         "global_random_state": global_random_state,
-        "get_data_config": config.get("get_data", {}),
-        "curate_config": config.get("curate", {}),
-        "preprocess_config": config.get("preprocess", {}),
-        "split_config": config.get("split", {}),
-        "featurize_config": config.get("featurize", {}),
-        "label_config": config.get("label", {}),
+        "get_data_config": runtime_config.get("get_data", {}),
+        "curate_config": runtime_config.get("curate", {}),
+        "preprocess_config": runtime_config.get("preprocess", {}),
+        "split_config": runtime_config.get("split", {}),
+        "featurize_config": runtime_config.get("featurize", {}),
+        "label_config": runtime_config.get("label", {}),
         "train_config": train_config,
         "model_config": model_config,
         "train_tdc_config": train_tdc_config,
         "categorical_features": _as_str_list(train_features_config.get("categorical_features", [])),
         "keep_all_columns": keep_all_columns,
-        "source": config.get("get_data", {}).get("source", {}),
+        "source": runtime_config.get("get_data", {}).get("source", {}),
         "run_dir": run_dir,
         "debug_logging": debug_logging,
         "config_hash": config_hash,
@@ -2198,7 +2219,7 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
     }
 
     with open(run_config_path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(config, f, sort_keys=False)
+        yaml.safe_dump(runtime_config, f, sort_keys=False)
 
     _write_json_atomic(
         run_status_path,

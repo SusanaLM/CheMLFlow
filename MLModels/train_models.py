@@ -4,6 +4,7 @@ import logging
 import shutil
 import inspect
 import random
+import re
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any, Callable
 
@@ -45,6 +46,128 @@ class DLSearchConfig:
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+_XGBOOST_INVALID_FEATURE_CHARS = re.compile(r"[\[\]<>]")
+
+
+def _sanitize_xgboost_feature_columns(columns: pd.Index) -> tuple[list[str], list[dict[str, Any]], int]:
+    sanitized: list[str] = []
+    records: list[dict[str, Any]] = []
+    used: dict[str, int] = {}
+    changed_count = 0
+
+    for idx, col in enumerate(columns):
+        original = str(col)
+        base = _XGBOOST_INVALID_FEATURE_CHARS.sub("_", original) or "feature"
+        candidate = base
+        suffix = 2
+        while candidate in used:
+            candidate = f"{base}__{suffix}"
+            suffix += 1
+        used[candidate] = 1
+        if candidate != original:
+            changed_count += 1
+        sanitized.append(candidate)
+        records.append(
+            {
+                "index": idx,
+                "original": original,
+                "sanitized": candidate,
+                "changed": candidate != original,
+            }
+        )
+    return sanitized, records, changed_count
+
+
+def _assign_feature_columns(df: pd.DataFrame | None, columns: list[str]) -> pd.DataFrame | None:
+    if df is None:
+        return None
+    if df.shape[1] != len(columns):
+        raise ValueError(
+            "Feature column mismatch while applying sanitized feature names: "
+            f"expected {len(columns)} columns, got {df.shape[1]}."
+        )
+    out = df.copy()
+    out.columns = columns
+    return out
+
+
+def _sanitize_xgboost_feature_frames(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    X_val: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, Any]]:
+    sanitized_columns, records, changed_count = _sanitize_xgboost_feature_columns(X_train.columns)
+    payload = {
+        "sanitized_columns": sanitized_columns,
+        "columns": records,
+        "changed_count": changed_count,
+        "invalid_char_pattern": r"[\[\]<>]",
+    }
+    return (
+        _assign_feature_columns(X_train, sanitized_columns),
+        _assign_feature_columns(X_test, sanitized_columns),
+        _assign_feature_columns(X_val, sanitized_columns),
+        payload,
+    )
+
+
+def _maybe_sanitize_xgboost_feature_frames(
+    model_type: str,
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    X_val: pd.DataFrame | None,
+    output_dir: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, str | None]:
+    if model_type not in {"xgboost", "ensemble"}:
+        return X_train, X_test, X_val, None
+
+    if not isinstance(X_train, pd.DataFrame) or not isinstance(X_test, pd.DataFrame):
+        return X_train, X_test, X_val, None
+
+    X_train_s, X_test_s, X_val_s, payload = _sanitize_xgboost_feature_frames(X_train, X_test, X_val)
+    map_path = os.path.join(output_dir, f"{model_type}_feature_name_map.json")
+    with open(map_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=True)
+    if payload["changed_count"] > 0:
+        logging.info(
+            "Sanitized %d feature names for %s to satisfy XGBoost constraints. map=%s",
+            payload["changed_count"],
+            model_type,
+            map_path,
+        )
+    return X_train_s, X_test_s, X_val_s, map_path
+
+
+def _maybe_apply_xgboost_feature_map_for_explain(
+    model_type: str,
+    output_dir: str,
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if model_type not in {"xgboost", "ensemble"}:
+        return X_train, X_test
+
+    map_path = os.path.join(output_dir, f"{model_type}_feature_name_map.json")
+    columns: list[str] | None = None
+    if os.path.exists(map_path):
+        try:
+            with open(map_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            mapped = payload.get("sanitized_columns")
+            if isinstance(mapped, list) and mapped:
+                columns = [str(col) for col in mapped]
+        except Exception as exc:
+            logging.warning("Failed to load feature-name map at %s: %s", map_path, exc)
+
+    if columns is None:
+        columns, _, _ = _sanitize_xgboost_feature_columns(X_train.columns)
+
+    X_train_s = _assign_feature_columns(X_train, columns)
+    X_test_s = _assign_feature_columns(X_test, columns)
+    assert X_train_s is not None and X_test_s is not None
+    return X_train_s, X_test_s
 
 def _resolve_n_jobs(model_config: Dict[str, Any] | None = None) -> int:
     """Resolve parallelism level for scikit-learn/joblib.
@@ -1556,6 +1679,13 @@ def train_model(
         X_train.shape,
         X_test.shape,
     )
+    X_train, X_test, X_val, feature_name_map_path = _maybe_sanitize_xgboost_feature_frames(
+        model_type=model_type,
+        X_train=X_train,
+        X_test=X_test,
+        X_val=X_val,
+        output_dir=output_dir,
+    )
 
     if task_type == "classification" and model_type == "catboost_classifier":
         from catboost import CatBoostClassifier
@@ -1760,6 +1890,8 @@ def train_model(
             "r2": float(r2_score(y_test, y_pred)),
             "mae": float(mean_absolute_error(y_test, y_pred)),
         }
+    if feature_name_map_path:
+        metrics["feature_name_map_path"] = feature_name_map_path
 
     if plot_split_performance:
         split_metrics: Dict[str, Dict[str, float | None]] = {}
@@ -1908,12 +2040,18 @@ def run_explainability(
     output_dir: str,
     background_samples: int = 100,
     task_type: str = "regression",
-    ) -> None:
+) -> None:
     _ensure_dir(output_dir)
     if task_type == "classification":
         y_test = _ensure_binary_labels(y_test)
     is_dl = model_type.startswith("dl_")
     n_jobs = _resolve_n_jobs()
+    X_train, X_test = _maybe_apply_xgboost_feature_map_for_explain(
+        model_type=model_type,
+        output_dir=output_dir,
+        X_train=X_train,
+        X_test=X_test,
+    )
 
     try:
         import shap

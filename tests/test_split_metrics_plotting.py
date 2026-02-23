@@ -98,3 +98,50 @@ def test_classification_split_plot_artifacts(tmp_path):
     assert expected_keys.issubset(paths.keys())
     for key in expected_keys:
         assert Path(paths[key]).exists()
+
+
+def test_train_model_sanitizes_xgboost_feature_names(tmp_path):
+    rng = np.random.default_rng(7)
+    X = pd.DataFrame(
+        rng.normal(size=(60, 4)),
+        columns=["A[1]", "B<2>", "C]3[", "regular"],
+    )
+    y = pd.Series(1.8 * X["A[1]"] - 0.6 * X["B<2>"] + rng.normal(scale=0.1, size=len(X)))
+
+    X_train = X.iloc[:40]
+    y_train = y.iloc[:40]
+    X_test = X.iloc[40:]
+    y_test = y.iloc[40:]
+
+    _, train_result = train_models.train_model(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        model_type="xgboost",
+        output_dir=str(tmp_path),
+        cv_folds=2,
+        search_iters=1,
+        task_type="regression",
+        model_config={
+            "n_jobs": 1,
+            "params": {
+                "n_estimators": 20,
+                "max_depth": 3,
+                "learning_rate": 0.1,
+                "subsample": 1.0,
+                "colsample_bytree": 1.0,
+            },
+        },
+    )
+
+    metrics = json.loads(Path(train_result.metrics_path).read_text(encoding="utf-8"))
+    map_path = metrics.get("feature_name_map_path")
+    assert map_path is not None
+    assert Path(map_path).exists()
+
+    payload = json.loads(Path(map_path).read_text(encoding="utf-8"))
+    sanitized_cols = payload.get("sanitized_columns")
+    assert isinstance(sanitized_cols, list)
+    assert len(sanitized_cols) == X_train.shape[1]
+    assert all("[" not in c and "]" not in c and "<" not in c and ">" not in c for c in sanitized_cols)

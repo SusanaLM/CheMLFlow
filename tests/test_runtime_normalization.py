@@ -57,3 +57,40 @@ def test_run_node_curate_accepts_properties_list(monkeypatch, tmp_path) -> None:
     cmd = captured["cmd"]
     prop_idx = cmd.index("--properties")
     assert cmd[prop_idx + 1] == "target,aux"
+
+
+def test_canonicalize_pipeline_nodes_maps_legacy_alias() -> None:
+    nodes = ["get_data", "use.curated_features", "train"]
+    assert main._canonicalize_pipeline_nodes(nodes) == ["get_data", "featurize.none", "train"]
+
+
+def test_runtime_config_normalization_stabilizes_alias_hashes() -> None:
+    alias_cfg = {
+        "global": {
+            "pipeline_type": "flash",
+            "base_dir": "data/flash",
+            "thresholds": {"active": 1000, "inactive": 10000},
+            "run_dir": "runs/example",
+        },
+        "pipeline": {"nodes": ["get_data", "curate", "split", "use.curated_features", "train"]},
+    }
+    canonical_cfg = {
+        "global": {
+            "pipeline_type": "flash",
+            "base_dir": "data/flash",
+            "thresholds": {"active": 1000, "inactive": 10000},
+            "run_dir": "runs/example",
+        },
+        "pipeline": {"nodes": ["get_data", "curate", "split", "featurize.none", "train"]},
+    }
+
+    alias_nodes = main._canonicalize_pipeline_nodes(alias_cfg["pipeline"]["nodes"])
+    canonical_nodes = main._canonicalize_pipeline_nodes(canonical_cfg["pipeline"]["nodes"])
+    alias_runtime_cfg = main._normalize_runtime_config(alias_cfg, alias_nodes)
+    canonical_runtime_cfg = main._normalize_runtime_config(canonical_cfg, canonical_nodes)
+
+    assert alias_runtime_cfg["pipeline"]["nodes"] == canonical_runtime_cfg["pipeline"]["nodes"]
+    assert main._stable_hash(alias_runtime_cfg) == main._stable_hash(canonical_runtime_cfg)
+    assert main._stable_hash(main._hashable_config_payload(alias_runtime_cfg)) == main._stable_hash(
+        main._hashable_config_payload(canonical_runtime_cfg)
+    )

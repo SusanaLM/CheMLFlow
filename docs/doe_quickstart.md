@@ -46,13 +46,13 @@ What these mean:
 ## 5) Run one generated config
 
 ```bash
-python main.py --config config/generated/flash_doe/<case_file>.yaml
+CHEMLFLOW_CONFIG=config/generated/flash_doe/<case_file>.yaml python main.py
 ```
 
 Example:
 
 ```bash
-python main.py --config config/generated/flash_doe/case_0001__reg_local_csv__random_forest__holdout__random.yaml
+CHEMLFLOW_CONFIG=config/generated/flash_doe/case_0001__reg_local_csv__random_forest__holdout__random.yaml python main.py
 ```
 
 ## 6) Where outputs go
@@ -65,10 +65,10 @@ python main.py --config config/generated/flash_doe/case_0001__reg_local_csv__ran
 
 ```bash
 # show skip reasons
-cat config/generated/flash_doe/manifest.jsonl | rg '"status": "skipped"|DOE_'
+cat config/generated/flash_doe/manifest.jsonl | grep -E '"status": "skipped"|DOE_'
 
-# show run status (after running a case)
-cat runs/<run_id>/run_status.json
+# show run status (after running a case; use global.run_dir from that case config)
+cat config/generated/flash_doe/runs/<doe_spec_hash>/<case_id>/run_status.json
 ```
 
 ## 8) Clean generated DOE outputs (optional)

@@ -32,11 +32,22 @@ def test_strict_rejects_block_not_in_pipeline() -> None:
         validate_config_strict(cfg, ["train"])
 
 
-def test_strict_rejects_configless_use_block() -> None:
-    cfg = _base_config(["use.curated_features"])
-    cfg["use"] = {}
+def test_strict_rejects_configless_featurize_none_block() -> None:
+    cfg = _base_config(["featurize.none"])
+    cfg["featurize"] = {"radius": 2}
     with pytest.raises(ConfigValidationError, match="CFG_CONFIGLESS_NODE_HAS_BLOCK"):
-        validate_config_strict(cfg, ["use.curated_features"])
+        validate_config_strict(cfg, ["featurize.none"])
+
+
+def test_configless_featurize_none_allows_shared_featurize_block_with_morgan() -> None:
+    cfg = _base_config(["featurize.none", "featurize.morgan"])
+    cfg["featurize"] = {"radius": 2, "n_bits": 1024}
+    validate_config_strict(cfg, ["featurize.none", "featurize.morgan"])
+
+
+def test_strict_allows_legacy_use_curated_features_alias_node() -> None:
+    cfg = _base_config(["use.curated_features"])
+    validate_config_strict(cfg, ["use.curated_features"])
 
 
 def test_strict_requires_train_model_type() -> None:

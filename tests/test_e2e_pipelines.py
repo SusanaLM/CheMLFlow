@@ -297,7 +297,7 @@ def test_e2e_flash_fast(tmp_path: Path) -> None:
             "run_dir": str(run_dir),
         },
         "pipeline": {
-            "nodes": ["get_data", "curate", "split", "use.curated_features", "train"]
+            "nodes": ["get_data", "curate", "split", "featurize.none", "train"]
         },
         "get_data": {
             "data_source": "local_csv",

@@ -35,6 +35,9 @@ _SMILES_COLUMN_CANDIDATES = (
 )
 _DEFAULT_MAX_EXPANDED_CASES = 10000
 _DOE_SPEC_NAMESPACE_LEN = 8
+_FEATURE_INPUT_ALIASES = {
+    "use.curated_features": "featurize.none",
+}
 
 
 @dataclass(frozen=True)
@@ -73,7 +76,7 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         task_type="regression",
         train_node="train",
         default_source="local_csv",
-        allowed_feature_inputs=("use.curated_features", "featurize.rdkit", "featurize.morgan"),
+        allowed_feature_inputs=("featurize.none", "featurize.rdkit", "featurize.morgan"),
         allowed_models=("random_forest", "svm", "decision_tree", "xgboost", "ensemble", "dl_*"),
         supports_label_normalize=False,
         supports_label_ic50=False,
@@ -101,7 +104,7 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         default_source="local_csv",
         allowed_feature_inputs=(
             "none",
-            "use.curated_features",
+            "featurize.none",
             "featurize.rdkit",
             "featurize.morgan",
         ),
@@ -226,6 +229,11 @@ def _sanitize_token(value: Any) -> str:
         else:
             out.append("_")
     return "".join(out).strip("_") or "x"
+
+
+def _normalize_feature_input(value: str) -> str:
+    normalized = str(value or "").strip()
+    return _FEATURE_INPUT_ALIASES.get(normalized, normalized)
 
 
 def _is_binary_target(series: pd.Series) -> bool:
@@ -584,7 +592,7 @@ def _profile_default_feature_input(profile: ProfileSpec, model_type: str) -> str
     if model_type == "chemprop":
         return "none"
     allowed_inputs = set(profile.allowed_feature_inputs)
-    preferred = ("featurize.morgan", "featurize.rdkit", "use.curated_features")
+    preferred = ("featurize.morgan", "featurize.rdkit", "featurize.none")
     for candidate in preferred:
         if candidate in allowed_inputs:
             return candidate
@@ -654,9 +662,9 @@ def _build_case_config(
     if not model_type:
         raise DOEGenerationError("Each DOE case must resolve train.model.type (or train_tdc.model.type).")
 
-    feature_input = str(
-        merged.get("pipeline.feature_input", _profile_default_feature_input(profile, model_type))
-    ).strip()
+    feature_input = _normalize_feature_input(
+        str(merged.get("pipeline.feature_input", _profile_default_feature_input(profile, model_type))).strip()
+    )
     if not feature_input:
         feature_input = "none"
 
@@ -778,6 +786,8 @@ def _build_case_config(
             curate_cfg["prefer_largest_fragment"] = _as_bool(merged["curate.prefer_largest_fragment"])
         if "curate.keep_all_columns" in merged:
             curate_cfg["keep_all_columns"] = _as_bool(merged["curate.keep_all_columns"])
+        elif feature_input == "featurize.none":
+            curate_cfg["keep_all_columns"] = True
         elif profile.name == "reg_chembl_ic50":
             curate_cfg["keep_all_columns"] = True
         config["curate"] = curate_cfg
@@ -856,7 +866,11 @@ def _build_case_config(
                 split_cfg["val_from_train"]["random_state"] = int(merged["split.val_from_train.random_state"])
         config["split"] = split_cfg
 
-    if any(node.startswith("featurize.") for node in nodes):
+    has_configurable_featurizer = any(
+        node in {"featurize.morgan", "featurize.rdkit", "featurize.rdkit_labeled", "featurize.lipinski"}
+        for node in nodes
+    )
+    if has_configurable_featurizer:
         featurize_cfg = _extract_prefixed(merged, "featurize.")
         if "radius" not in featurize_cfg and "featurize.morgan" in nodes:
             featurize_cfg["radius"] = 2
@@ -901,7 +915,7 @@ def _build_case_config(
         features_cfg = _extract_prefixed(merged, "train.features.")
         if (
             "label.normalize" in nodes
-            and feature_input == "use.curated_features"
+            and feature_input == "featurize.none"
             and isinstance(config.get("label"), dict)
         ):
             source_column = str(config["label"].get("source_column", "")).strip()
@@ -1057,13 +1071,14 @@ def _validate_case(
 
     feature_nodes = {
         "use.curated_features",
+        "featurize.none",
         "featurize.rdkit",
         "featurize.rdkit_labeled",
         "featurize.morgan",
     }
     selected_feature_input = "none"
-    if "use.curated_features" in nodes:
-        selected_feature_input = "use.curated_features"
+    if "featurize.none" in nodes or "use.curated_features" in nodes:
+        selected_feature_input = "featurize.none"
     elif "featurize.rdkit" in nodes or "featurize.rdkit_labeled" in nodes:
         selected_feature_input = "featurize.rdkit"
     elif "featurize.morgan" in nodes:
@@ -1081,7 +1096,7 @@ def _validate_case(
                 issues,
                 code="DOE_FEATURE_INPUT_REQUIRED",
                 path="pipeline.nodes",
-                message="Non-chemprop training requires one feature input node (use.curated_features or featurize.*).",
+                message="Non-chemprop training requires one feature input node (featurize.none or featurize.*).",
             )
     if (has_preprocess or has_select) and not any(node in feature_nodes for node in nodes):
         _add_issue(
@@ -1265,10 +1280,12 @@ def _validate_case(
                 )
             else:
                 keep_all_columns = _as_bool(_get_dotted(config, "curate.keep_all_columns", False))
+                uses_curated_features = "featurize.none" in nodes or "use.curated_features" in nodes
                 label_column = str(_get_dotted(config, "curate.label_column", "")).strip()
                 curate_properties = set(_as_str_list(_get_dotted(config, "curate.properties", [])))
                 preserves_target = (
                     keep_all_columns
+                    or uses_curated_features
                     or (label_column and target_column == label_column)
                     or target_column in curate_properties
                 )

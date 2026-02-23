@@ -12,7 +12,7 @@ CheMLFlow validates your config before running. These rules prevent common mista
 |------|---------------|
 | Blocks require nodes | Each config block (except `global` and `pipeline`) needs a matching node in `pipeline.nodes`. For example, a `split:` block requires `split` in the nodes list. |
 | No top-level `model:` | Model settings go under `train.model.*` or `train_tdc.model.*`, not at root level. |
-| `use.curated_features` is configless | This node takes no configuration. Do not add a `use:` block. |
+| `featurize.none` is configless | This node takes no configuration. Do not add a top-level `featurize:` block unless another `featurize.*` node needs parameters. |
 | `preprocess.keep_all_columns` moved | Use `curate.keep_all_columns` instead. |
 | `preprocess.exclude_columns` moved | Use `train.features.exclude_columns` instead. |
 | `train` requires model type | When `train` is in your pipeline, you must specify `train.model.type`. |
@@ -100,9 +100,9 @@ pipeline:
 | Category | Nodes |
 |----------|-------|
 | Data loading | `get_data` |
-| Data preparation | `curate`, `use.curated_features`, `label.normalize`, `label.ic50` |
+| Data preparation | `curate`, `label.normalize`, `label.ic50` |
 | Splitting | `split` |
-| Featurization | `featurize.lipinski`, `featurize.rdkit`, `featurize.rdkit_labeled`, `featurize.morgan` |
+| Featurization | `featurize.none`, `featurize.lipinski`, `featurize.rdkit`, `featurize.rdkit_labeled`, `featurize.morgan` |
 | Preprocessing | `preprocess.features`, `select.features` |
 | Training | `train`, `train.tdc` |
 | Analysis | `analyze.stats`, `analyze.eda`, `explain` |
@@ -502,7 +502,7 @@ These nodes run with fixed behavior and do not accept config blocks:
 
 | Node | What it does |
 |------|--------------|
-| `use.curated_features` | Uses the curated CSV directly as features (no featurization). |
+| `featurize.none` | Uses the curated CSV directly as features (no descriptor generation). |
 | `label.ic50` | Converts IC50 values to pIC50 with activity classes. |
 | `analyze.stats` | Runs statistical tests on the dataset. |
 | `analyze.eda` | Generates exploratory data analysis plots. |
@@ -574,6 +574,6 @@ Full metadata including mode, strategy, seeds, fold/repeat indices, sizes, and c
 | `CFG_BLOCK_NOT_ALLOWED_FOR_PIPELINE` | Config block exists without a matching node in `pipeline.nodes`. | Add the node to the pipeline, or remove the config block. |
 | `CFG_MISSING_TRAIN_MODEL` | `train` node is in the pipeline but `train.model` is missing. | Add a `train.model` section. |
 | `CFG_MISSING_TRAIN_MODEL_TYPE` | `train.model` exists but `type` is not specified. | Set `train.model.type` to a valid model name. |
-| `CFG_CONFIGLESS_NODE_HAS_BLOCK` | `use.curated_features` is in the pipeline and a `use:` block exists. | Remove the `use:` block (this node doesn't accept config). |
+| `CFG_CONFIGLESS_NODE_HAS_BLOCK` | A configless node has a top-level config block (for example, `featurize.none` with only `featurize.none` in pipeline). | Remove the config block for that node, or include a configurable sibling node that uses the same block. |
 | `CFG_LEGACY_MODEL_BLOCK_FORBIDDEN` | A top-level `model:` block was found. | Move settings to `train.model.*` or `train_tdc.model.*`. |
 | `CFG_LEGACY_PREPROCESS_KEY_FORBIDDEN` | `preprocess.keep_all_columns` or `preprocess.exclude_columns` was found. | Use `curate.keep_all_columns` or `train.features.exclude_columns` instead. |

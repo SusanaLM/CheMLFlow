@@ -25,7 +25,7 @@ defaults:  # applied to every generated case before search_space factors
 search_space:  # grid axes (only fields you want to vary)
   split.strategy: [random, scaffold]  # random/scaffold supported for holdout/cv/nested modes
   train.model.type: [random_forest, xgboost]  # models to compare
-  pipeline.feature_input: [use.curated_features, featurize.rdkit]  # feature input node variants
+  pipeline.feature_input: [featurize.none, featurize.rdkit]  # feature input node variants
 
 # output: where generated config files + manifest/summary are written
 output:  # where generated DOE artifacts are written
