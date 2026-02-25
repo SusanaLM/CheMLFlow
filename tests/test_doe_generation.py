@@ -67,8 +67,44 @@ def _base_clf_doe(tmp_path: Path) -> dict:
 
 
 def test_generate_doe_skips_invalid_model_task_combos(tmp_path: Path) -> None:
-    spec = _base_clf_doe(tmp_path)
-    spec["search_space"]["train.model.type"] = ["catboost_classifier", "random_forest"]
+    spec = {
+        "version": 1,
+        "dataset": {
+            "profile": "reg_local_csv",
+            "name": "flash_reg_doe",
+            "task_type": "regression",
+            "target_column": "FP Exp.",
+            "source": {"type": "local_csv", "path": _flash_dataset_path()},
+            "smiles_column": "SMILES",
+            "curate": {
+                "properties": "FP Calc.",
+                "smiles_column": "SMILES",
+                "dedupe_strategy": "first",
+                "keep_all_columns": True,
+            },
+        },
+        "search_space": {
+            "split.mode": ["holdout"],
+            "split.strategy": ["random"],
+            "pipeline.feature_input": ["featurize.none"],
+            "pipeline.preprocess": [False],
+            "pipeline.select": [False],
+            "pipeline.explain": [False],
+            "train.model.type": ["random_forest", "catboost_classifier"],
+        },
+        "defaults": {
+            "global.base_dir": str(tmp_path / "data"),
+            "global.runs.enabled": False,
+            "global.random_state": 42,
+            "split.test_size": 0.2,
+            "split.val_size": 0.1,
+            "split.stratify": False,
+            "split.require_disjoint": True,
+            "split.require_full_test_coverage": True,
+            "train.tuning.method": "fixed",
+        },
+        "output": {"dir": str(tmp_path / "generated")},
+    }
 
     result = generate_doe(spec)
     summary = result["summary"]
@@ -79,6 +115,25 @@ def test_generate_doe_skips_invalid_model_task_combos(tmp_path: Path) -> None:
     assert summary["issue_counts"].get("DOE_MODEL_TASK_MISMATCH", 0) == 1
     assert len(result["valid_cases"]) == 1
     assert Path(result["valid_cases"][0]["config_path"]).exists()
+
+
+def test_generate_doe_allows_tree_models_for_classification(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["train.model.type"] = [
+        "catboost_classifier",
+        "random_forest",
+        "decision_tree",
+        "xgboost",
+        "svm",
+        "ensemble",
+    ]
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["total_cases"] == 6
+    assert summary["valid_cases"] == 6
+    assert summary["skipped_cases"] == 0
 
 
 def test_generate_doe_requires_validation_split_for_chemprop(tmp_path: Path) -> None:
@@ -125,6 +180,58 @@ def test_generate_doe_skips_chemprop_with_preprocess_and_no_features(tmp_path: P
     assert summary["valid_cases"] == 0
     assert summary["issue_counts"].get("DOE_FEATURE_INPUT_REQUIRED_FOR_PREPROCESS", 0) == 1
     assert summary["issue_counts"].get("DOE_CHEMPROP_PREPROCESS_UNSUPPORTED", 0) == 1
+
+
+def test_generate_doe_allows_chemprop_for_regression_local_csv(tmp_path: Path) -> None:
+    spec = {
+        "version": 1,
+        "dataset": {
+            "profile": "reg_local_csv",
+            "name": "flash_reg_chemprop",
+            "task_type": "regression",
+            "target_column": "FP Exp.",
+            "source": {"type": "local_csv", "path": _flash_dataset_path()},
+            "smiles_column": "SMILES",
+            "curate": {
+                "properties": "FP Exp.",
+                "smiles_column": "SMILES",
+                "dedupe_strategy": "first",
+                "keep_all_columns": True,
+            },
+        },
+        "search_space": {
+            "split.mode": ["holdout"],
+            "split.strategy": ["random"],
+            "pipeline.feature_input": ["none"],
+            "pipeline.preprocess": [False],
+            "pipeline.select": [False],
+            "pipeline.explain": [False],
+            "train.model.type": ["chemprop"],
+        },
+        "defaults": {
+            "global.base_dir": str(tmp_path / "data_reg_chemprop"),
+            "global.runs.enabled": False,
+            "global.random_state": 42,
+            "split.test_size": 0.2,
+            "split.val_size": 0.1,
+            "split.stratify": False,
+            "split.require_disjoint": True,
+            "split.require_full_test_coverage": True,
+            "train.tuning.method": "fixed",
+        },
+        "output": {"dir": str(tmp_path / "generated_reg_chemprop")},
+    }
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 1
+    assert summary["skipped_cases"] == 0
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["global"]["task_type"] == "regression"
+    assert config["train"]["model"]["type"] == "chemprop"
+    assert "featurize.none" not in config["pipeline"]["nodes"]
 
 
 def test_generate_doe_enforces_split_mode_strategy_compatibility(tmp_path: Path) -> None:

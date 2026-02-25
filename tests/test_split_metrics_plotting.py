@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from MLModels import train_models
 
@@ -145,3 +146,141 @@ def test_train_model_sanitizes_xgboost_feature_names(tmp_path):
     assert isinstance(sanitized_cols, list)
     assert len(sanitized_cols) == X_train.shape[1]
     assert all("[" not in c and "]" not in c and "<" not in c and ">" not in c for c in sanitized_cols)
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    ["random_forest", "decision_tree", "xgboost", "svm", "ensemble"],
+)
+def test_train_model_supports_classification_for_tabular_models(tmp_path, model_type):
+    rng = np.random.default_rng(11)
+    n_rows = 80
+    labels = np.array([i % 2 for i in range(n_rows)], dtype=int)
+    X = pd.DataFrame(
+        {
+            "f0": labels + rng.normal(scale=0.1, size=n_rows),
+            "f1": (1 - labels) + rng.normal(scale=0.1, size=n_rows),
+            "f2": rng.normal(size=n_rows),
+            "f3": rng.normal(size=n_rows),
+        }
+    )
+    y = pd.Series(labels)
+
+    X_train = X.iloc[:50]
+    y_train = y.iloc[:50]
+    X_val = X.iloc[50:65]
+    y_val = y.iloc[50:65]
+    X_test = X.iloc[65:]
+    y_test = y.iloc[65:]
+
+    params_by_model = {
+        "random_forest": {"n_estimators": 30, "max_depth": 4},
+        "decision_tree": {"max_depth": 4},
+        "xgboost": {
+            "n_estimators": 20,
+            "max_depth": 3,
+            "learning_rate": 0.1,
+            "subsample": 1.0,
+            "colsample_bytree": 1.0,
+        },
+        "svm": {"kernel": "linear", "C": 1.0, "probability": True},
+        "ensemble": {
+            "voting": "soft",
+            "rf_params": {"n_estimators": 30, "max_depth": 4},
+            "xgb_params": {
+                "n_estimators": 20,
+                "max_depth": 3,
+                "learning_rate": 0.1,
+                "subsample": 1.0,
+                "colsample_bytree": 1.0,
+            },
+        },
+    }
+
+    _, train_result = train_models.train_model(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        model_type=model_type,
+        output_dir=str(tmp_path / model_type),
+        cv_folds=2,
+        search_iters=1,
+        task_type="classification",
+        model_config={"n_jobs": 1, "params": params_by_model[model_type]},
+        X_val=X_val,
+        y_val=y_val,
+    )
+
+    metrics = json.loads(Path(train_result.metrics_path).read_text(encoding="utf-8"))
+    assert {"auc", "auprc", "accuracy", "f1"}.issubset(metrics.keys())
+
+    preds_path = Path(tmp_path / model_type / f"{model_type}_predictions.csv")
+    assert preds_path.exists()
+    preds = pd.read_csv(preds_path)
+    assert {"y_true", "y_score", "y_proba", "y_pred"}.issubset(preds.columns)
+    assert preds["y_proba"].between(0, 1).all()
+
+
+@pytest.mark.parametrize(
+    ("model_type", "search_type", "estimator_type"),
+    [
+        ("random_forest", "RandomizedSearchCV", "RandomForestClassifier"),
+        ("decision_tree", "RandomizedSearchCV", "DecisionTreeClassifier"),
+        ("xgboost", "RandomizedSearchCV", "XGBClassifier"),
+        ("svm", "GridSearchCV", "SVC"),
+    ],
+)
+def test_initialize_model_builds_classification_train_cv_searchers(
+    model_type, search_type, estimator_type
+):
+    model = train_models._initialize_model(
+        model_type=model_type,
+        random_state=42,
+        cv_folds=2,
+        search_iters=1,
+        n_jobs=1,
+        tuning_method="train_cv",
+        model_params={},
+        task_type="classification",
+    )
+
+    assert model.__class__.__name__ == search_type
+    assert getattr(model, "estimator").__class__.__name__ == estimator_type
+
+
+def test_predict_classification_outputs_uses_decision_function_when_no_proba():
+    class _DecisionEstimator:
+        def decision_function(self, X):
+            return np.array([-2.0, 0.0, 2.0], dtype=float)
+
+        def predict(self, X):
+            return np.array([0, 0, 1], dtype=int)
+
+    X = pd.DataFrame({"f0": [0.1, 0.2, 0.3]})
+    y_proba, y_pred, y_score = train_models._predict_classification_outputs(
+        estimator=_DecisionEstimator(),
+        model_type="svm",
+        X=X,
+    )
+
+    assert np.allclose(y_score, np.array([-2.0, 0.0, 2.0]))
+    assert np.all((y_proba >= 0.0) & (y_proba <= 1.0))
+    assert np.array_equal(y_pred, np.array([0, 0, 1], dtype=int))
+
+
+def test_predict_classification_outputs_falls_back_to_hard_predictions():
+    class _PredictOnlyEstimator:
+        def predict(self, X):
+            return np.array([0, 1, 1, 0], dtype=int)
+
+    X = pd.DataFrame({"f0": [1, 2, 3, 4]})
+    y_proba, y_pred, y_score = train_models._predict_classification_outputs(
+        estimator=_PredictOnlyEstimator(),
+        model_type="unknown_model",
+        X=X,
+    )
+
+    assert np.array_equal(y_pred, np.array([0, 1, 1, 0], dtype=int))
+    assert np.array_equal(y_proba, y_pred.astype(float))
+    assert np.array_equal(y_score, y_pred.astype(float))

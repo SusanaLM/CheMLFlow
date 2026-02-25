@@ -136,7 +136,11 @@ pip install pytest
 
 Run a pipeline by setting `CHEMLFLOW_CONFIG` and executing `main.py` from repo root:
 
-CHEMLFLOW_CONFIG=config/config.qm9.yaml python main.py
+CHEMLFLOW_CONFIG=<path-to-runtime-config.yaml> python main.py
+
+Note:
+- Runtime config files are user-provided in this repo. Build one from `docs/config-options.md`
+  (or generate a batch from DOE via `scripts/generate_doe.py`).
 
 Outputs:
 - If `global.runs.enabled: true`, results go to `runs/<timestamp>/`
@@ -276,23 +280,6 @@ Coverage/comparability controls:
 - `split.min_test_coverage`, `split.min_train_coverage`, `split.min_val_coverage` set explicit thresholds
 - This protects model comparisons from "winning by dropping hard rows"
 
-### DOE config generation
-
-You can generate many runnable configs from one DOE YAML:
-
-```bash
-python scripts/generate_doe.py --doe config/doe.example.yaml
-```
-
-The generator expands your search space and writes:
-
-- one config YAML per valid case
-- `manifest.jsonl` (valid/skipped + reason codes)
-- `summary.json` (counts + selection metadata)
-- isolated case paths by default (`base_dir`/`run_dir` scoped per `case_id`)
-
-Details and schema are in `docs/doe.md`.
-
 ## Quick start (pipelines)
 
 All pipelines are config-driven. You select the pipeline by setting `CHEMLFLOW_CONFIG`
@@ -306,7 +293,7 @@ conda activate chemlflow_env
 
 2. Run the pipeline:
 
-CHEMLFLOW_CONFIG=config/config.chembl.yaml python main.py
+CHEMLFLOW_CONFIG=<path-to-chembl-config.yaml> python main.py
 
 3. Outputs:
 - Data artifacts: `data/urease/`
@@ -325,7 +312,7 @@ conda activate chemlflow_env
 
 2. Run the pipeline:
 
-CHEMLFLOW_CONFIG=config/config.qm9.yaml python main.py
+CHEMLFLOW_CONFIG=<path-to-qm9-config.yaml> python main.py
 
 3. Outputs:
 - Data artifacts: `data/qm9/`
@@ -333,7 +320,7 @@ CHEMLFLOW_CONFIG=config/config.qm9.yaml python main.py
 - Explainability PNGs (permutation importance + SHAP): `results/`
 
 Notes:
-- Control dataset size via `get_data.max_rows` in `config/config.qm9.yaml`.
+- Control dataset size via `get_data.max_rows` in your selected runtime config.
 - Model choice is controlled by `train.model.type` (e.g., `random_forest`, `svm`, `decision_tree`, `xgboost`, `ensemble`).
 
 ### YSI (Sooting Index, local CSV → RDKit → Train → Explain)
@@ -346,7 +333,7 @@ Expected columns include `SMILES` and `YSI`.
 
 2. Run the pipeline:
 
-CHEMLFLOW_CONFIG=config/config.ysi.yaml python main.py
+CHEMLFLOW_CONFIG=<path-to-ysi-config.yaml> python main.py
 
 ### PAH (logP, local CSV → RDKit → Train → Explain)
 
@@ -358,7 +345,7 @@ Expected columns include `smiles` and `log_p`.
 
 2. Run the pipeline:
 
-CHEMLFLOW_CONFIG=config/config.pah.yaml python main.py
+CHEMLFLOW_CONFIG=<path-to-pah-config.yaml> python main.py
 
 ### Pgp_Broccatelli (Local CSV → Morgan → CatBoost → AUROC)
 
@@ -368,7 +355,7 @@ conda activate chemlflow_env
 
 2. Run the pipeline:
 
-CHEMLFLOW_CONFIG=config/config.pgp.yaml python main.py
+CHEMLFLOW_CONFIG=<path-to-pgp-config.yaml> python main.py
 
 3. Outputs:
 - Data artifacts: `data/pgp_broccatelli/`
@@ -397,7 +384,7 @@ Verify:
 
 2. Run the benchmark config:
 
-`CHEMLFLOW_CONFIG=config/config.pgp_tdc_benchmark.yaml python main.py`
+`CHEMLFLOW_CONFIG=<path-to-pgp-tdc-benchmark-config.yaml> python main.py`
 
 3. Outputs:
 - Run directory: `runs/<timestamp>/`
@@ -418,7 +405,7 @@ Notes:
 
 2. Run the pipeline:
 
-CHEMLFLOW_CONFIG=config/config.ara.yaml python main.py
+CHEMLFLOW_CONFIG=<path-to-ara-config.yaml> python main.py
 
 Notes:
 - Expected columns: `Smiles` and `Activity` (`active`/`inactive`).
@@ -450,9 +437,10 @@ For CatBoost classification (`train.model.type: catboost_classifier`):
 - With `global.debug: false`, CheMLFlow forces quiet CatBoost output even if `train.model.params.verbose: true`.
 - To see per-iteration CatBoost logs, set `global.debug: true` (or `global.log_level: DEBUG`).
 
-## Chemprop backend (optional, classification only)
+## Chemprop backend (optional; classification and regression)
 
-CheMLFlow supports an in-process Chemprop D-MPNN backend behind `train.model.type: chemprop`.
+CheMLFlow supports an in-process Chemprop D-MPNN backend behind `train.model.type: chemprop`
+for both classification and regression tasks.
 This path is SMILES-native (no descriptor generation) and uses CheMLFlow's `split_indices`
 from the `split` node for apples-to-apples split comparability.
 
@@ -472,14 +460,14 @@ differences at runtime for compatibility.
 
 ### Example config
 
-Use the included example: `config/config.pgp_chemprop.yaml`:
+Use a runtime config with `train.model.type: chemprop`:
 
 ```
-CHEMLFLOW_CONFIG=config/config.pgp_chemprop.yaml python main.py
+CHEMLFLOW_CONFIG=<path-to-chemprop-config.yaml> python main.py
 ```
 
-This bundled example defaults to `train.model.foundation: none` so it runs without
-an external foundation checkpoint file.
+If omitted, `train.model.foundation` defaults to `none`, so no external
+foundation checkpoint file is required.
 
 ### CheMeleon foundation checkpoint
 
@@ -500,7 +488,7 @@ ls -lh models/chemeleon_mp.pt
 
 ### Foundation fine-tuning knobs
 
-For `train.model.type: chemprop` (classification path), you can enable CheMeleon initialization:
+For `train.model.type: chemprop` (classification or regression), you can enable CheMeleon initialization:
 - `train.model.foundation`: `none` (default) or `chemeleon`
 - `train.model.foundation_checkpoint`: local path to `chemeleon_mp.pt` (required when `foundation=chemeleon`)
 - `train.model.freeze_encoder`: whether to freeze message-passing weights after loading foundation weights (default `false`)
@@ -542,5 +530,5 @@ Put these under `train.model.params` (all optional; defaults exist):
 Under the run directory (e.g., `runs/<timestamp>/`):
 - `chemprop_best_model.ckpt`
 - `chemprop_best_params.pkl` (do not load untrusted pickle/joblib files)
-- `chemprop_metrics.json` (includes metrics and Chemprop/foundation run settings)
-- `chemprop_predictions.csv`
+- `chemprop_metrics.json` (classification: `auc`/`auprc`/`accuracy`/`f1`; regression: `r2`/`mae`; plus Chemprop/foundation run settings)
+- `chemprop_predictions.csv` (`y_true` + `y_pred`; classification also includes `y_proba`)

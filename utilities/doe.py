@@ -17,8 +17,7 @@ import yaml
 from utilities.config_validation import validate_config_strict
 
 
-REGRESSION_MODELS = {"random_forest", "svm", "decision_tree", "xgboost", "ensemble"}
-CLASSIFICATION_MODELS = {"catboost_classifier", "chemprop"}
+CLASSIFICATION_ONLY_MODELS = {"catboost_classifier"}
 DL_PREFIX = "dl_"
 _DEDUPE_STRATEGY_ALIASES = {
     "keep_first": "first",
@@ -76,8 +75,8 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         task_type="regression",
         train_node="train",
         default_source="local_csv",
-        allowed_feature_inputs=("featurize.none", "featurize.rdkit", "featurize.morgan"),
-        allowed_models=("random_forest", "svm", "decision_tree", "xgboost", "ensemble", "dl_*"),
+        allowed_feature_inputs=("none", "featurize.none", "featurize.rdkit", "featurize.morgan"),
+        allowed_models=("random_forest", "svm", "decision_tree", "xgboost", "ensemble", "chemprop", "dl_*"),
         supports_label_normalize=False,
         supports_label_ic50=False,
         supports_split=True,
@@ -108,7 +107,16 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
             "featurize.rdkit",
             "featurize.morgan",
         ),
-        allowed_models=("catboost_classifier", "chemprop", "dl_*"),
+        allowed_models=(
+            "random_forest",
+            "decision_tree",
+            "xgboost",
+            "svm",
+            "ensemble",
+            "catboost_classifier",
+            "chemprop",
+            "dl_*",
+        ),
         supports_label_normalize=True,
         supports_label_ic50=False,
         supports_split=True,
@@ -1068,14 +1076,7 @@ def _validate_case(
             message=f"Model {model_type!r} is not supported for profile {profile.name!r}.",
         )
 
-    if task_type == "classification" and model_type in REGRESSION_MODELS:
-        _add_issue(
-            issues,
-            code="DOE_MODEL_TASK_MISMATCH",
-            path="train.model.type",
-            message=f"Model {model_type!r} is regression-only but task_type is classification.",
-        )
-    if task_type == "regression" and model_type in CLASSIFICATION_MODELS:
+    if task_type == "regression" and model_type in CLASSIFICATION_ONLY_MODELS:
         _add_issue(
             issues,
             code="DOE_MODEL_TASK_MISMATCH",
