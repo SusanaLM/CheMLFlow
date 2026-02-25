@@ -6,7 +6,8 @@ import logging
 import os
 import subprocess
 import sys
-from datetime import datetime
+import traceback
+from datetime import datetime, timezone
 
 import yaml
 import pandas as pd
@@ -61,6 +62,15 @@ from MLModels import data_preprocessing
 from MLModels import train_models
 from utilities import splitters
 from utilities.config_validation import validate_config_strict
+
+_EXPLICIT_FEATURE_INPUT_NODES = {
+    "featurize.none",
+    "use.curated_features",
+    "featurize.rdkit",
+    "featurize.rdkit_labeled",
+    "featurize.morgan",
+}
+
 
 def build_paths(base_dir: str) -> dict[str, str]:
     return {
@@ -181,6 +191,68 @@ def _configure_logging(run_dir: str, level: int = logging.INFO) -> None:
         handler.setLevel(level)
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _stable_hash(payload: object) -> str:
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _hashable_config_payload(config: dict) -> dict:
+    payload = json.loads(json.dumps(config))
+    global_cfg = payload.get("global")
+    if isinstance(global_cfg, dict):
+        global_cfg.pop("base_dir", None)
+        global_cfg.pop("run_dir", None)
+        runs_cfg = global_cfg.get("runs")
+        if isinstance(runs_cfg, dict):
+            runs_cfg.pop("id", None)
+    return payload
+
+
+_PIPELINE_NODE_ALIASES = {
+    "use.curated_features": "featurize.none",
+}
+
+
+def _canonicalize_pipeline_nodes(nodes: list[str]) -> list[str]:
+    return [_PIPELINE_NODE_ALIASES.get(str(node), str(node)) for node in nodes]
+
+
+def _normalize_runtime_config(config: dict, nodes: list[str]) -> dict:
+    payload = json.loads(json.dumps(config))
+    pipeline_cfg = payload.get("pipeline")
+    if isinstance(pipeline_cfg, dict):
+        pipeline_cfg["nodes"] = list(nodes)
+    else:
+        payload["pipeline"] = {"nodes": list(nodes)}
+    return payload
+
+
+def _git_sha() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def _write_json_atomic(path: str, payload: dict) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    temp_path = f"{path}.tmp.{os.getpid()}"
+    with open(temp_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    os.replace(temp_path, path)
+
+
 def _run_subprocess(cmd: list[str], *, cwd: str | None = None) -> subprocess.CompletedProcess[str]:
     """Run a child process and raise with captured output on failure."""
     result = subprocess.run(
@@ -262,6 +334,7 @@ def run_node_curate(context: dict) -> None:
     smiles_column = curate_config.get("smiles_column")
     if smiles_column:
         cmd.extend(["--smiles_column", smiles_column])
+    cmd.extend(["--target_column", str(target_column)])
     dedupe_strategy = curate_config.get("dedupe_strategy")
     if dedupe_strategy:
         cmd.extend(["--dedupe_strategy", dedupe_strategy])
@@ -279,6 +352,24 @@ def run_node_curate(context: dict) -> None:
             cmd.append("--no_prefer_largest_fragment")
     if context["keep_all_columns"]:
         cmd.append("--keep_all_columns")
+    if "drop_missing_smiles" in curate_config:
+        if _as_bool(curate_config.get("drop_missing_smiles", True)):
+            cmd.append("--drop_missing_smiles")
+        else:
+            cmd.append("--no_drop_missing_smiles")
+    if "drop_invalid_smiles" in curate_config:
+        if _as_bool(curate_config.get("drop_invalid_smiles", True)):
+            cmd.append("--drop_invalid_smiles")
+        else:
+            cmd.append("--no_drop_invalid_smiles")
+    if "drop_missing_target" in curate_config:
+        if _as_bool(curate_config.get("drop_missing_target", True)):
+            cmd.append("--drop_missing_target")
+        else:
+            cmd.append("--no_drop_missing_target")
+    required_non_null_columns = _as_str_list(curate_config.get("required_non_null_columns", []))
+    if required_non_null_columns:
+        cmd.extend(["--required_non_null_columns", ",".join(required_non_null_columns)])
     _run_subprocess(cmd)
     validate_contract(bind_output_path(PREPROCESSED_CONTRACT, preprocessed_file), warn_only=True)
     validate_contract(bind_output_path(CURATE_OUTPUT_CONTRACT, curated_file), warn_only=True)
@@ -286,12 +377,12 @@ def run_node_curate(context: dict) -> None:
     context["curated_path"] = curated_file
 
 
-def run_node_use_curated_features(context: dict) -> None:
+def run_node_featurize_none(context: dict) -> None:
     curated_path = context.get("curated_path", context["paths"]["curated"])
     validate_contract(
         bind_output_path(
             make_target_column_contract(
-                name="use_curated_features_input",
+                name="featurize_none_input",
                 target_column=context["target_column"],
                 output_path=curated_path,
             ),
@@ -538,6 +629,41 @@ def run_node_label_normalize(context: dict) -> None:
     context["target_column"] = target_column
 
 
+def _has_explicit_feature_input_node(context: dict) -> bool:
+    pipeline_nodes = list(context.get("pipeline_nodes") or [])
+    if not pipeline_nodes:
+        return False
+    return any(node in _EXPLICIT_FEATURE_INPUT_NODES for node in pipeline_nodes)
+
+
+def _normalize_and_validate_row_index(
+    df: pd.DataFrame,
+    row_index_col: str,
+    *,
+    stage: str,
+) -> pd.DataFrame:
+    if row_index_col not in df.columns:
+        raise ValueError(f"{stage}: missing required row index column {row_index_col!r}.")
+    raw = df[row_index_col]
+    if raw.isna().any():
+        raise ValueError(f"{stage}: {row_index_col} contains null values.")
+    numeric = pd.to_numeric(raw, errors="coerce")
+    if numeric.isna().any():
+        raise ValueError(f"{stage}: {row_index_col} must contain integer-like values.")
+    if (numeric % 1 != 0).any():
+        raise ValueError(f"{stage}: {row_index_col} must contain integer-like values.")
+    normalized = numeric.astype(int)
+    duplicates = normalized[normalized.duplicated()].unique().tolist()
+    if duplicates:
+        preview = duplicates[:10]
+        raise ValueError(
+            f"{stage}: {row_index_col} must be unique; duplicate_count={len(duplicates)} preview={preview}."
+        )
+    out = df.copy()
+    out[row_index_col] = normalized
+    return out
+
+
 def run_node_split(context: dict) -> None:
     split_config = context.get("split_config", {})
     mode = str(split_config.get("mode", "holdout")).strip().lower() or "holdout"
@@ -640,7 +766,7 @@ def run_node_split(context: dict) -> None:
         if local_stratify:
             if not stratify_column:
                 raise ValueError("Stratified val_from_train requires split.stratify_column.")
-            stratify_values = curated_df.iloc[train_pool][stratify_column].to_numpy()
+            stratify_values = split_df.iloc[train_pool][stratify_column].to_numpy()
 
         try:
             local_split = splitters.random_split_indices(
@@ -674,14 +800,99 @@ def run_node_split(context: dict) -> None:
 
     curated_path = context.get("curated_path", context["paths"]["curated"])
     curated_df = pd.read_csv(curated_path)
+    row_index_col = data_preprocessing.ROW_INDEX_COL
+    if row_index_col not in curated_df.columns:
+        curated_df[row_index_col] = curated_df.index.astype(int)
+    curated_df = _normalize_and_validate_row_index(
+        curated_df,
+        row_index_col,
+        stage="split curated input",
+    )
+
+    split_df = curated_df.copy()
+    split_source = "curated"
+    split_features_file = ""
+    split_labels_file = ""
+    feature_nodes = {
+        "featurize.none",
+        "featurize.rdkit",
+        "featurize.rdkit_labeled",
+        "featurize.morgan",
+    }
+    pipeline_nodes = list(context.get("pipeline_nodes") or [])
+    explicit_feature_input_before_split = False
+    if pipeline_nodes and "split" in pipeline_nodes:
+        split_pos = pipeline_nodes.index("split")
+        explicit_feature_input_before_split = any(
+            node in feature_nodes for node in pipeline_nodes[:split_pos]
+        )
+    elif context.get("feature_matrix") or context.get("labels_matrix"):
+        # Backward-compatible fallback for lightweight test contexts without pipeline_nodes.
+        explicit_feature_input_before_split = True
+
+    if explicit_feature_input_before_split:
+        features_file, labels_file = _resolve_feature_inputs(context)
+        if not (os.path.exists(features_file) and os.path.exists(labels_file)):
+            raise ValueError(
+                "split pre-split cleaning expected feature/label artifacts from explicit feature input, "
+                f"but files were missing (features={features_file} labels={labels_file})."
+            )
+        X_split, _ = data_preprocessing.load_features_labels(
+            features_file,
+            labels_file,
+            context["target_column"],
+            context.get("categorical_features"),
+            exclude_columns=_exclude_feature_columns(context),
+            drop_invalid_rows=True,
+            drop_duplicate_rows=True,
+        )
+        eligible_row_ids = [int(i) for i in X_split.index.tolist()]
+        if not eligible_row_ids:
+            raise ValueError("Pre-split cleaning produced zero rows; cannot build split indices.")
+        curated_row_id_universe = set(int(v) for v in curated_df[row_index_col].tolist())
+        missing_from_curated = sorted(
+            int(v) for v in set(eligible_row_ids) if int(v) not in curated_row_id_universe
+        )
+        if missing_from_curated:
+            preview = missing_from_curated[:10]
+            raise ValueError(
+                "Pre-split feature cleaning produced row IDs not present in curated row-id universe. "
+                f"row_index_column={row_index_col} missing_count={len(missing_from_curated)} preview={preview}. "
+                "Feature artifacts likely came from a different dataset/version."
+            )
+        split_df = (
+            split_df.set_index(row_index_col, drop=False)
+            .reindex(eligible_row_ids)
+            .dropna(subset=[row_index_col])
+            .reset_index(drop=True)
+        )
+        if split_df.empty:
+            raise ValueError(
+                "Pre-split feature cleaning produced eligible row IDs that do not map to curated rows via "
+                f"{row_index_col}. Feature artifacts likely lost {row_index_col} or came from a different dataset."
+            )
+        split_df = _normalize_and_validate_row_index(
+            split_df,
+            row_index_col,
+            stage="split feature-cleaned alignment",
+        )
+        split_source = "feature_cleaned"
+        split_features_file = features_file
+        split_labels_file = labels_file
+    else:
+        split_source = "curated_no_explicit_feature_input"
+        logging.info(
+            "Pre-split feature cleaning skipped because no explicit feature input node runs before split."
+        )
+
     if stratify:
         if not stratify_column:
             raise ValueError("split.stratify=true requires split.stratify_column to be set.")
-        if stratify_column not in curated_df.columns:
+        if stratify_column not in split_df.columns:
             raise ValueError(
-                f"split.stratify_column={stratify_column!r} not found in curated data."
+                f"split.stratify_column={stratify_column!r} not found in split dataset."
             )
-        unique = curated_df[stratify_column].dropna().nunique()
+        unique = split_df[stratify_column].dropna().nunique()
         if unique > 20:
             raise ValueError(
                 f"split.stratify_column={stratify_column!r} has {unique} unique values; "
@@ -689,10 +900,11 @@ def run_node_split(context: dict) -> None:
             )
 
     os.makedirs(context["paths"]["split_dir"], exist_ok=True)
-    curated_count = len(curated_df)
+    source_curated_count = len(curated_df)
+    curated_count = len(split_df)
     all_indices_ordered = list(range(curated_count))
     dataset_fingerprint = splitters.compute_dataset_fingerprint(
-        curated_df,
+        split_df,
         target_column=context.get("target_column"),
     )
     tdc_group = context.get("source", {}).get("group")
@@ -702,8 +914,13 @@ def run_node_split(context: dict) -> None:
     split_meta: dict[str, object] = {
         "mode": mode,
         "strategy": strategy,
+        "source_curated_rows": int(source_curated_count),
         "dataset_rows": int(curated_count),
         "dataset_fingerprint": dataset_fingerprint,
+        "row_index_column": row_index_col,
+        "split_source": split_source,
+        "split_features_file": split_features_file,
+        "split_labels_file": split_labels_file,
         "stratify": bool(stratify),
         "stratify_column": stratify_column,
         "random_state": int(random_state),
@@ -715,7 +932,7 @@ def run_node_split(context: dict) -> None:
     if mode == "holdout":
         split_indices_raw = splitters.build_split_indices(
             strategy=strategy,
-            curated_df=curated_df,
+            curated_df=split_df,
             test_size=test_size,
             val_size=val_size,
             random_state=random_state,
@@ -781,12 +998,12 @@ def run_node_split(context: dict) -> None:
         def _build_cv_plan():
             stratify_values = None
             if stratify and stratify_column:
-                stratify_values = curated_df[stratify_column].to_numpy()
+                stratify_values = split_df[stratify_column].to_numpy()
             if strategy == "scaffold":
-                if "canonical_smiles" not in curated_df.columns:
+                if "canonical_smiles" not in split_df.columns:
                     raise ValueError("Curated data must include canonical_smiles for scaffold CV splitting.")
                 return splitters.scaffold_kfold_plan(
-                    smiles_list=curated_df["canonical_smiles"].astype(str).tolist(),
+                    smiles_list=split_df["canonical_smiles"].astype(str).tolist(),
                     n_splits=n_splits,
                     repeats=repeats,
                     random_state=cv_seed,
@@ -884,10 +1101,10 @@ def run_node_split(context: dict) -> None:
 
         def _build_outer_plan():
             if strategy == "scaffold":
-                if "canonical_smiles" not in curated_df.columns:
+                if "canonical_smiles" not in split_df.columns:
                     raise ValueError("Curated data must include canonical_smiles for scaffold splitting.")
                 split = splitters.scaffold_split_indices(
-                    curated_df["canonical_smiles"].astype(str).tolist(),
+                    split_df["canonical_smiles"].astype(str).tolist(),
                     test_size=outer_test_size,
                     val_size=0.0,
                     random_state=outer_seed,
@@ -895,7 +1112,7 @@ def run_node_split(context: dict) -> None:
             else:
                 stratify_values = None
                 if stratify and stratify_column:
-                    stratify_values = curated_df[stratify_column].to_numpy()
+                    stratify_values = split_df[stratify_column].to_numpy()
                 split = splitters.random_split_indices(
                     n_samples=curated_count,
                     test_size=outer_test_size,
@@ -976,7 +1193,7 @@ def run_node_split(context: dict) -> None:
             repeat_index = int(inner_cfg.get("repeat_index", 0))
             inner_seed = int(inner_cfg.get("random_state", random_state))
 
-            dev_df = curated_df.iloc[dev_idx].reset_index(drop=True)
+            dev_df = split_df.iloc[dev_idx].reset_index(drop=True)
             inner_spec = {
                 "mode": mode,
                 "stage": "inner",
@@ -1078,7 +1295,20 @@ def run_node_split(context: dict) -> None:
             f"Unsupported split.mode={mode!r}. Expected one of: holdout, cv, nested_holdout_cv."
         )
 
-    normalized = _normalize_split_keys(split_indices_raw)
+    normalized_local = _normalize_split_keys(split_indices_raw)
+    row_id_lookup = [int(v) for v in split_df[row_index_col].tolist()]
+    normalized: dict[str, list[int]] = {}
+    for split_name, local_ids in normalized_local.items():
+        remapped: list[int] = []
+        for local_idx in local_ids:
+            if local_idx < 0 or local_idx >= len(row_id_lookup):
+                raise ValueError(
+                    f"Split index out of bounds for split={split_name}: idx={local_idx} "
+                    f"with split_rows={len(row_id_lookup)}."
+                )
+            remapped.append(int(row_id_lookup[local_idx]))
+        normalized[split_name] = remapped
+
     dataset_split_path = os.path.join(
         context["paths"]["split_dir"],
         "_".join(split_filename_parts) + ".json",
@@ -1095,8 +1325,14 @@ def run_node_split(context: dict) -> None:
     all_indices = set(train_set | val_set | test_set)
     if not all_indices:
         raise ValueError("Split mapping produced zero indices.")
-    if max(all_indices) >= curated_count:
-        raise ValueError("Split indices exceed curated dataset size.")
+    valid_row_ids = set(row_id_lookup)
+    invalid_ids = sorted(int(i) for i in all_indices if i not in valid_row_ids)
+    if invalid_ids:
+        preview = invalid_ids[:10]
+        raise ValueError(
+            "Split indices contain ids outside the split dataset universe. "
+            f"count={len(invalid_ids)} preview={preview}."
+        )
     if min_coverage is not None:
         coverage = len(all_indices) / max(1, curated_count)
         if coverage < min_coverage:
@@ -1133,7 +1369,9 @@ def run_node_split(context: dict) -> None:
                 "assigned_total": len(all_indices),
             },
             "coverage": {
+                "source_curated_rows": source_curated_count,
                 "curated_rows": curated_count,
+                "dropped_before_split": max(0, source_curated_count - curated_count),
                 "assigned_rows": len(all_indices),
                 "assigned_fraction": len(all_indices) / max(1, curated_count),
             },
@@ -1150,14 +1388,24 @@ def run_node_split(context: dict) -> None:
     context["split_meta"] = split_meta
 
 
-def _resolve_feature_inputs(context: dict) -> tuple[str, str]:
+def _resolve_feature_inputs(
+    context: dict,
+    *,
+    require_explicit: bool = False,
+    consumer: str = "node",
+) -> tuple[str, str]:
     feature_matrix = context.get("feature_matrix")
     labels_matrix = context.get("labels_matrix")
     if feature_matrix and labels_matrix:
         return feature_matrix, labels_matrix
     if feature_matrix and not labels_matrix:
-        return feature_matrix, context["paths"]["curated"]
-    pipeline_type = context["pipeline_type"]
+        return feature_matrix, context.get("curated_path", context["paths"]["curated"])
+    if require_explicit and not _has_explicit_feature_input_node(context):
+        raise ValueError(
+            f"{consumer} requires an explicit feature input node in pipeline.nodes "
+            "(featurize.none/featurize.rdkit/featurize.rdkit_labeled/featurize.morgan)."
+        )
+    pipeline_type = context.get("pipeline_type", "chembl")
     if pipeline_type == "qm9":
         return context["paths"]["rdkit_labeled"], context["paths"]["rdkit_labeled"]
     return context["paths"]["rdkit_descriptors"], context["paths"]["pic50_3class"]
@@ -1189,6 +1437,16 @@ def _exclude_feature_columns(context: dict) -> list[str]:
             "train.features.exclude_columns must be a list or comma-separated string of column names."
         )
     return _as_str_list(raw)
+
+
+def _split_index_universe(context: dict) -> list[int] | None:
+    split_indices = context.get("split_indices")
+    if not split_indices:
+        return None
+    universe: set[int] = set()
+    for split_name in ("train", "val", "test"):
+        universe.update(int(i) for i in (split_indices.get(split_name, []) or []))
+    return sorted(universe)
 
 
 def _resolve_split_partitions(
@@ -1289,7 +1547,11 @@ def run_node_preprocess_features(context: dict) -> None:
             "Add 'split' before 'preprocess.features' in pipeline.nodes."
         )
 
-    features_file, labels_file = _resolve_feature_inputs(context)
+    features_file, labels_file = _resolve_feature_inputs(
+        context,
+        require_explicit=True,
+        consumer="preprocess.features",
+    )
     validate_contract(
         bind_output_path(PREPROCESS_FEATURES_INPUT_CONTRACT, features_file),
         warn_only=False,
@@ -1311,6 +1573,11 @@ def run_node_preprocess_features(context: dict) -> None:
         context["target_column"],
         context.get("categorical_features"),
         exclude_columns=_exclude_feature_columns(context),
+        restrict_to_indices=_split_index_universe(context),
+        drop_invalid_rows=False,
+        drop_duplicate_rows=False,
+        fail_on_invalid_rows=True,
+        fail_on_duplicate_rows=True,
     )
     data_preprocessing.verify_data_quality(X_clean, y_clean)
 
@@ -1404,6 +1671,11 @@ def run_node_select_features(context: dict) -> None:
         target_column,
         context.get("categorical_features"),
         exclude_columns=_exclude_feature_columns(context),
+        restrict_to_indices=_split_index_universe(context),
+        drop_invalid_rows=False,
+        drop_duplicate_rows=False,
+        fail_on_invalid_rows=True,
+        fail_on_duplicate_rows=True,
     )
 
     partitions = _resolve_split_partitions(context, X.index)
@@ -1836,19 +2108,20 @@ def run_node_train(context: dict) -> None:
 
     features_file = paths["rdkit_descriptors"]
     labels_file = paths["pic50_3class"]
-    if pipeline_type == "qm9":
-        features_file = paths["rdkit_labeled"]
-        labels_file = paths["rdkit_labeled"]
-    if context.get("feature_matrix"):
-        features_file = context["feature_matrix"]
-    if context.get("labels_matrix"):
-        labels_file = context["labels_matrix"]
     if use_selected:
         features_file = paths["selected_features"]
+        if use_preprocessed and os.path.exists(paths["preprocessed_labels"]):
+            labels_file = paths["preprocessed_labels"]
     elif use_preprocessed:
         features_file = paths["preprocessed_features"]
-    if use_preprocessed and os.path.exists(paths["preprocessed_labels"]):
-        labels_file = paths["preprocessed_labels"]
+        if os.path.exists(paths["preprocessed_labels"]):
+            labels_file = paths["preprocessed_labels"]
+    else:
+        features_file, labels_file = _resolve_feature_inputs(
+            context,
+            require_explicit=True,
+            consumer="train",
+        )
 
     validate_contract(
         bind_output_path(TRAIN_INPUT_FEATURES_CONTRACT, features_file),
@@ -1873,6 +2146,11 @@ def run_node_train(context: dict) -> None:
         target_column,
         context.get("categorical_features"),
         exclude_columns=_exclude_feature_columns(context),
+        restrict_to_indices=_split_index_universe(context),
+        drop_invalid_rows=False,
+        drop_duplicate_rows=False,
+        fail_on_invalid_rows=True,
+        fail_on_duplicate_rows=True,
     )
     if isinstance(y, pd.DataFrame):
         y = data_preprocessing.select_target_series(y, target_column)
@@ -1964,17 +2242,22 @@ def run_node_explain(context: dict) -> None:
         warn_only=False,
     )
 
-    features_file = context.get("feature_matrix", paths["rdkit_descriptors"])
-    labels_file = context.get("labels_matrix", paths["pic50_3class"])
-    if context["pipeline_type"] == "qm9":
-        features_file = paths["rdkit_labeled"]
-        labels_file = paths["rdkit_labeled"]
+    features_file = paths["rdkit_descriptors"]
+    labels_file = paths["pic50_3class"]
     if context.get("selected_ready", False):
         features_file = paths["selected_features"]
+        if context.get("preprocessed_ready", False) and os.path.exists(paths["preprocessed_labels"]):
+            labels_file = paths["preprocessed_labels"]
     elif context.get("preprocessed_ready", False):
         features_file = paths["preprocessed_features"]
-    if context.get("preprocessed_ready", False) and os.path.exists(paths["preprocessed_labels"]):
-        labels_file = paths["preprocessed_labels"]
+        if os.path.exists(paths["preprocessed_labels"]):
+            labels_file = paths["preprocessed_labels"]
+    else:
+        features_file, labels_file = _resolve_feature_inputs(
+            context,
+            require_explicit=True,
+            consumer="explain",
+        )
 
     X, y = data_preprocessing.load_features_labels(
         features_file,
@@ -1982,6 +2265,11 @@ def run_node_explain(context: dict) -> None:
         target_column,
         context.get("categorical_features"),
         exclude_columns=_exclude_feature_columns(context),
+        restrict_to_indices=_split_index_universe(context),
+        drop_invalid_rows=False,
+        drop_duplicate_rows=False,
+        fail_on_invalid_rows=True,
+        fail_on_duplicate_rows=True,
     )
     partitions = _resolve_split_partitions(context, X.index)
     assert partitions is not None  # split_indices was validated above
@@ -2007,7 +2295,7 @@ def run_node_explain(context: dict) -> None:
 NODE_REGISTRY = {
     "get_data": run_node_get_data,
     "curate": run_node_curate,
-    "use.curated_features": run_node_use_curated_features,
+    "featurize.none": run_node_featurize_none,
     "label.normalize": run_node_label_normalize,
     "split": run_node_split,
     "featurize.lipinski": run_node_featurize_lipinski,
@@ -2035,6 +2323,11 @@ _SPLIT_MUST_FOLLOW = {
     "curate",
     "label.normalize",
     "label.ic50",
+    "featurize.none",
+    "featurize.lipinski",
+    "featurize.rdkit",
+    "featurize.rdkit_labeled",
+    "featurize.morgan",
 }
 
 
@@ -2084,33 +2377,40 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
     nodes = pipeline.get("nodes")
     if not nodes:
         return False
+    nodes = _canonicalize_pipeline_nodes(list(nodes))
+    runtime_config = _normalize_runtime_config(config, nodes)
     validate_pipeline_nodes(nodes)
-    validate_config_strict(config, nodes)
+    validate_config_strict(runtime_config, nodes)
 
-    global_config = config.get("global")
+    global_config = runtime_config.get("global")
     if not global_config:
         raise ValueError("global section is required in config")
     pipeline_type = global_config.get("pipeline_type", "chembl")
     base_dir = global_config["base_dir"]
     os.makedirs(base_dir, exist_ok=True)
-    run_dir = resolve_run_dir(config)
+    run_dir = resolve_run_dir(runtime_config)
     os.makedirs(run_dir, exist_ok=True)
+    run_config_path = os.path.join(run_dir, "run_config.yaml")
+    run_status_path = os.path.join(run_dir, "run_status.json")
     log_level = _resolve_log_level(global_config)
     _configure_logging(run_dir, level=log_level)
     debug_logging = _as_bool(global_config.get("debug", False)) or log_level <= logging.DEBUG
     global_random_state = int(global_config.get("random_state", 42))
+    start_time = _utc_now_iso()
+    config_hash = _stable_hash(runtime_config)
+    config_fingerprint = _stable_hash(_hashable_config_payload(runtime_config))
 
-    train_config = config.get("train", {}) or {}
+    train_config = runtime_config.get("train", {}) or {}
     train_features_config = train_config.get("features", {}) if isinstance(train_config, dict) else {}
     model_config = train_config.get("model", {}) if isinstance(train_config, dict) else {}
-    train_tdc_config = config.get("train_tdc", {}) or {}
+    train_tdc_config = runtime_config.get("train_tdc", {}) or {}
     train_tdc_model_config = (
         train_tdc_config.get("model", {}) if isinstance(train_tdc_config, dict) else {}
     )
 
     # If the pipeline uses curated tabular descriptors directly, default to keep all columns.
-    keep_all_columns = _as_bool(config.get("curate", {}).get("keep_all_columns", False))
-    if "use.curated_features" in nodes:
+    keep_all_columns = _as_bool(runtime_config.get("curate", {}).get("keep_all_columns", False))
+    if "featurize.none" in nodes:
         keep_all_columns = True
 
     model_type = None
@@ -2130,31 +2430,88 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
         "target_column": global_config.get("target_column", "pIC50"),
         "model_type": model_type,
         "global_random_state": global_random_state,
-        "get_data_config": config.get("get_data", {}),
-        "curate_config": config.get("curate", {}),
-        "preprocess_config": config.get("preprocess", {}),
-        "split_config": config.get("split", {}),
-        "featurize_config": config.get("featurize", {}),
-        "label_config": config.get("label", {}),
+        "get_data_config": runtime_config.get("get_data", {}),
+        "curate_config": runtime_config.get("curate", {}),
+        "preprocess_config": runtime_config.get("preprocess", {}),
+        "split_config": runtime_config.get("split", {}),
+        "featurize_config": runtime_config.get("featurize", {}),
+        "label_config": runtime_config.get("label", {}),
         "train_config": train_config,
         "model_config": model_config,
         "train_tdc_config": train_tdc_config,
         "categorical_features": _as_str_list(train_features_config.get("categorical_features", [])),
         "keep_all_columns": keep_all_columns,
-        "source": config.get("get_data", {}).get("source", {}),
+        "source": runtime_config.get("get_data", {}).get("source", {}),
         "run_dir": run_dir,
         "debug_logging": debug_logging,
+        "config_hash": config_hash,
+        "config_fingerprint": config_fingerprint,
+        "pipeline_nodes": list(nodes),
     }
 
-    with open(os.path.join(run_dir, "run_config.yaml"), "w", encoding="utf-8") as f:
-        yaml.safe_dump(config, f, sort_keys=False)
+    with open(run_config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(runtime_config, f, sort_keys=False)
 
-    for node_name in nodes:
-        node_fn = NODE_REGISTRY.get(node_name)
-        if not node_fn:
-            raise ValueError(f"Unknown pipeline node: {node_name}")
-        node_fn(context)
+    _write_json_atomic(
+        run_status_path,
+        {
+            "status": "running",
+            "start_time": start_time,
+            "config_path": config_path,
+            "run_dir": run_dir,
+            "base_dir": base_dir,
+            "pipeline_nodes": list(nodes),
+            "config_hash": config_hash,
+            "config_fingerprint": config_fingerprint,
+            "git_sha": _git_sha(),
+        },
+    )
 
+    failed_node = None
+    try:
+        for node_name in nodes:
+            failed_node = node_name
+            node_fn = NODE_REGISTRY.get(node_name)
+            if not node_fn:
+                raise ValueError(f"Unknown pipeline node: {node_name}")
+            node_fn(context)
+    except BaseException as exc:
+        _write_json_atomic(
+            run_status_path,
+            {
+                "status": "failed",
+                "start_time": start_time,
+                "end_time": _utc_now_iso(),
+                "config_path": config_path,
+                "run_dir": run_dir,
+                "base_dir": base_dir,
+                "pipeline_nodes": list(nodes),
+                "failed_node": failed_node,
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+                "config_hash": config_hash,
+                "config_fingerprint": config_fingerprint,
+                "git_sha": _git_sha(),
+            },
+        )
+        raise
+
+    _write_json_atomic(
+        run_status_path,
+        {
+            "status": "success",
+            "start_time": start_time,
+            "end_time": _utc_now_iso(),
+            "config_path": config_path,
+            "run_dir": run_dir,
+            "base_dir": base_dir,
+            "pipeline_nodes": list(nodes),
+            "config_hash": config_hash,
+            "config_fingerprint": config_fingerprint,
+            "git_sha": _git_sha(),
+        },
+    )
     return True
 
 

@@ -37,6 +37,8 @@ def _make_context(tmp_path: Path, *, global_seed: int, train_seed: int | None) -
         "split_config": {},
         "categorical_features": [],
         "debug_logging": False,
+        "feature_matrix": str(base_dir / "features.csv"),
+        "labels_matrix": str(base_dir / "labels.csv"),
     }
 
 

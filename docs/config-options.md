@@ -12,7 +12,7 @@ CheMLFlow validates your config before running. These rules prevent common mista
 |------|---------------|
 | Blocks require nodes | Each config block (except `global` and `pipeline`) needs a matching node in `pipeline.nodes`. For example, a `split:` block requires `split` in the nodes list. |
 | No top-level `model:` | Model settings go under `train.model.*` or `train_tdc.model.*`, not at root level. |
-| `use.curated_features` is configless | This node takes no configuration. Do not add a `use:` block. |
+| `featurize.none` is configless | This node takes no configuration. Do not add a top-level `featurize:` block unless another `featurize.*` node needs parameters. |
 | `preprocess.keep_all_columns` moved | Use `curate.keep_all_columns` instead. |
 | `preprocess.exclude_columns` moved | Use `train.features.exclude_columns` instead. |
 | `train` requires model type | When `train` is in your pipeline, you must specify `train.model.type`. |
@@ -90,8 +90,8 @@ pipeline:
   nodes:
     - get_data
     - curate
-    - split
     - featurize.morgan
+    - split
     - train
 ```
 
@@ -100,9 +100,9 @@ pipeline:
 | Category | Nodes |
 |----------|-------|
 | Data loading | `get_data` |
-| Data preparation | `curate`, `use.curated_features`, `label.normalize`, `label.ic50` |
+| Data preparation | `curate`, `label.normalize`, `label.ic50` |
 | Splitting | `split` |
-| Featurization | `featurize.lipinski`, `featurize.rdkit`, `featurize.rdkit_labeled`, `featurize.morgan` |
+| Featurization | `featurize.none`, `featurize.lipinski`, `featurize.rdkit`, `featurize.rdkit_labeled`, `featurize.morgan` |
 | Preprocessing | `preprocess.features`, `select.features` |
 | Training | `train`, `train.tdc` |
 | Analysis | `analyze.stats`, `analyze.eda`, `explain` |
@@ -113,7 +113,7 @@ pipeline:
 - Only one `train.tdc` node allowed per pipeline.
 - `train` and `train.tdc` cannot both be in the same pipeline.
 - If using `train.tdc`, it must be the last node.
-- `split` must come **after** any of: `curate`, `label.normalize`, `label.ic50`.
+- `split` must come **after** any of: `curate`, `label.normalize`, `label.ic50`, `featurize.none`, `featurize.lipinski`, `featurize.rdkit`, `featurize.rdkit_labeled`, `featurize.morgan`.
 - `split` must come **before** any of: `preprocess.features`, `select.features`, `train`, `explain`.
 
 ## `get_data` Block
@@ -164,6 +164,10 @@ Controls how raw data is cleaned and standardized.
 curate:
   smiles_column: SMILES
   dedupe_strategy: keep_first
+  drop_missing_smiles: true
+  drop_invalid_smiles: true
+  drop_missing_target: true
+  required_non_null_columns: Name, FP Exp.
   keep_all_columns: true
 ```
 
@@ -175,6 +179,10 @@ curate:
 | `smiles_column` | (auto-detect) | Name of the SMILES column in raw data. |
 | `dedupe_strategy` | (none) | How to handle duplicate SMILES: `keep_first`/`first`, `keep_last`/`last`, `drop_conflicts`, or `majority`. |
 | `label_column` | `target_column` | Label column for classification tasks. |
+| `drop_missing_smiles` | `true` | When `true`, drops raw rows where the detected SMILES column is null. |
+| `drop_invalid_smiles` | `true` | When `true`, drops rows that fail SMILES sanitization/canonicalization. |
+| `drop_missing_target` | `true` | When `true`, drops rows with null values in `global.target_column` if that column exists during curate. |
+| `required_non_null_columns` | (none) | Optional list or comma-separated string of columns that must be non-null; rows missing values in any listed column are dropped. |
 | `require_neutral_charge` | `false` | When `true`, removes molecules with net charge. |
 | `prefer_largest_fragment` | `true` | When `true`, keeps only the largest fragment of multi-fragment molecules. |
 | `keep_all_columns` | `false` | When `true`, preserves all source columns through curation. When `false`, only essential columns (SMILES, target) are kept. |
@@ -502,7 +510,7 @@ These nodes run with fixed behavior and do not accept config blocks:
 
 | Node | What it does |
 |------|--------------|
-| `use.curated_features` | Uses the curated CSV directly as features (no featurization). |
+| `featurize.none` | Uses the curated CSV directly as features (no descriptor generation). |
 | `label.ic50` | Converts IC50 values to pIC50 with activity classes. |
 | `analyze.stats` | Runs statistical tests on the dataset. |
 | `analyze.eda` | Generates exploratory data analysis plots. |
@@ -543,7 +551,7 @@ Each run with a `split` node writes two files:
   "test": [4, 6, 9, ...]
 }
 ```
-Row indices into the curated dataset for each split.
+Row IDs into the split dataset universe (after pre-split cleaning). If curated/features include `__row_index`, IDs map by that value; otherwise they map by curated row order.
 
 **`<run_dir>/split_meta.json`**
 ```json
@@ -574,6 +582,6 @@ Full metadata including mode, strategy, seeds, fold/repeat indices, sizes, and c
 | `CFG_BLOCK_NOT_ALLOWED_FOR_PIPELINE` | Config block exists without a matching node in `pipeline.nodes`. | Add the node to the pipeline, or remove the config block. |
 | `CFG_MISSING_TRAIN_MODEL` | `train` node is in the pipeline but `train.model` is missing. | Add a `train.model` section. |
 | `CFG_MISSING_TRAIN_MODEL_TYPE` | `train.model` exists but `type` is not specified. | Set `train.model.type` to a valid model name. |
-| `CFG_CONFIGLESS_NODE_HAS_BLOCK` | `use.curated_features` is in the pipeline and a `use:` block exists. | Remove the `use:` block (this node doesn't accept config). |
+| `CFG_CONFIGLESS_NODE_HAS_BLOCK` | A configless node has a top-level config block (for example, `featurize.none` with only `featurize.none` in pipeline). | Remove the config block for that node, or include a configurable sibling node that uses the same block. |
 | `CFG_LEGACY_MODEL_BLOCK_FORBIDDEN` | A top-level `model:` block was found. | Move settings to `train.model.*` or `train_tdc.model.*`. |
 | `CFG_LEGACY_PREPROCESS_KEY_FORBIDDEN` | `preprocess.keep_all_columns` or `preprocess.exclude_columns` was found. | Use `curate.keep_all_columns` or `train.features.exclude_columns` instead. |

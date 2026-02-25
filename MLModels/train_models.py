@@ -4,6 +4,7 @@ import logging
 import shutil
 import inspect
 import random
+import re
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any, Callable
 
@@ -30,6 +31,8 @@ from sklearn.metrics import (
 )
 from sklearn.inspection import permutation_importance
 
+_ROW_INDEX_COL = "__row_index"
+
 
 @dataclass
 class TrainResult:
@@ -45,6 +48,128 @@ class DLSearchConfig:
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+_XGBOOST_INVALID_FEATURE_CHARS = re.compile(r"[\[\]<>]")
+
+
+def _sanitize_xgboost_feature_columns(columns: pd.Index) -> tuple[list[str], list[dict[str, Any]], int]:
+    sanitized: list[str] = []
+    records: list[dict[str, Any]] = []
+    used: dict[str, int] = {}
+    changed_count = 0
+
+    for idx, col in enumerate(columns):
+        original = str(col)
+        base = _XGBOOST_INVALID_FEATURE_CHARS.sub("_", original) or "feature"
+        candidate = base
+        suffix = 2
+        while candidate in used:
+            candidate = f"{base}__{suffix}"
+            suffix += 1
+        used[candidate] = 1
+        if candidate != original:
+            changed_count += 1
+        sanitized.append(candidate)
+        records.append(
+            {
+                "index": idx,
+                "original": original,
+                "sanitized": candidate,
+                "changed": candidate != original,
+            }
+        )
+    return sanitized, records, changed_count
+
+
+def _assign_feature_columns(df: pd.DataFrame | None, columns: list[str]) -> pd.DataFrame | None:
+    if df is None:
+        return None
+    if df.shape[1] != len(columns):
+        raise ValueError(
+            "Feature column mismatch while applying sanitized feature names: "
+            f"expected {len(columns)} columns, got {df.shape[1]}."
+        )
+    out = df.copy()
+    out.columns = columns
+    return out
+
+
+def _sanitize_xgboost_feature_frames(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    X_val: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, Any]]:
+    sanitized_columns, records, changed_count = _sanitize_xgboost_feature_columns(X_train.columns)
+    payload = {
+        "sanitized_columns": sanitized_columns,
+        "columns": records,
+        "changed_count": changed_count,
+        "invalid_char_pattern": r"[\[\]<>]",
+    }
+    return (
+        _assign_feature_columns(X_train, sanitized_columns),
+        _assign_feature_columns(X_test, sanitized_columns),
+        _assign_feature_columns(X_val, sanitized_columns),
+        payload,
+    )
+
+
+def _maybe_sanitize_xgboost_feature_frames(
+    model_type: str,
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    X_val: pd.DataFrame | None,
+    output_dir: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, str | None]:
+    if model_type not in {"xgboost", "ensemble"}:
+        return X_train, X_test, X_val, None
+
+    if not isinstance(X_train, pd.DataFrame) or not isinstance(X_test, pd.DataFrame):
+        return X_train, X_test, X_val, None
+
+    X_train_s, X_test_s, X_val_s, payload = _sanitize_xgboost_feature_frames(X_train, X_test, X_val)
+    map_path = os.path.join(output_dir, f"{model_type}_feature_name_map.json")
+    with open(map_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=True)
+    if payload["changed_count"] > 0:
+        logging.info(
+            "Sanitized %d feature names for %s to satisfy XGBoost constraints. map=%s",
+            payload["changed_count"],
+            model_type,
+            map_path,
+        )
+    return X_train_s, X_test_s, X_val_s, map_path
+
+
+def _maybe_apply_xgboost_feature_map_for_explain(
+    model_type: str,
+    output_dir: str,
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if model_type not in {"xgboost", "ensemble"}:
+        return X_train, X_test
+
+    map_path = os.path.join(output_dir, f"{model_type}_feature_name_map.json")
+    columns: list[str] | None = None
+    if os.path.exists(map_path):
+        try:
+            with open(map_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            mapped = payload.get("sanitized_columns")
+            if isinstance(mapped, list) and mapped:
+                columns = [str(col) for col in mapped]
+        except Exception as exc:
+            logging.warning("Failed to load feature-name map at %s: %s", map_path, exc)
+
+    if columns is None:
+        columns, _, _ = _sanitize_xgboost_feature_columns(X_train.columns)
+
+    X_train_s = _assign_feature_columns(X_train, columns)
+    X_test_s = _assign_feature_columns(X_test, columns)
+    assert X_train_s is not None and X_test_s is not None
+    return X_train_s, X_test_s
 
 def _resolve_n_jobs(model_config: Dict[str, Any] | None = None) -> int:
     """Resolve parallelism level for scikit-learn/joblib.
@@ -539,6 +664,99 @@ def _resolve_chemprop_foundation_config(model_config: Dict[str, Any]) -> tuple[s
     return foundation, checkpoint_path, freeze_encoder
 
 
+def _resolve_chemprop_split_positions(
+    curated_df: pd.DataFrame,
+    split_indices: Dict[str, Any],
+    row_index_col: str = _ROW_INDEX_COL,
+    allow_legacy_positions: bool = False,
+) -> tuple[list[int], list[int], list[int], list[int]]:
+    """Resolve split membership to positional indices for Chemprop.
+
+    Preferred mode:
+    - split indices are row IDs that match ``row_index_col`` values.
+
+    Optional backward-compatible fallback:
+    - if ``allow_legacy_positions`` is true and row-ID mapping fails but all
+      indices are valid row positions, treat them as legacy positional indices.
+    """
+
+    def _to_int_list(split_name: str, values: Any) -> list[int]:
+        out: list[int] = []
+        for value in values or []:
+            try:
+                out.append(int(value))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"split.{split_name} contains a non-integer index value: {value!r}."
+                ) from exc
+        return out
+
+    train_raw = _to_int_list("train", split_indices.get("train", []))
+    val_raw = _to_int_list("val", split_indices.get("val", []))
+    test_raw = _to_int_list("test", split_indices.get("test", []))
+    if not test_raw and val_raw:
+        test_raw, val_raw = val_raw, []
+
+    n_rows = int(len(curated_df))
+    if row_index_col in curated_df.columns:
+        row_id_series = pd.to_numeric(curated_df[row_index_col], errors="coerce")
+        if row_id_series.isna().any():
+            raise ValueError(
+                f"Curated data contains non-numeric {row_index_col!r} values; cannot map split row IDs."
+            )
+        row_ids = [int(v) for v in row_id_series.tolist()]
+    else:
+        row_ids = list(range(n_rows))
+
+    if len(set(row_ids)) != len(row_ids):
+        raise ValueError(
+            f"Curated data contains duplicate {row_index_col!r} values; split row-ID mapping is ambiguous."
+        )
+
+    id_to_pos = {rid: pos for pos, rid in enumerate(row_ids)}
+
+    def _map_row_ids(raw_ids: list[int]) -> tuple[list[int], list[int]]:
+        mapped: list[int] = []
+        missing: list[int] = []
+        for rid in raw_ids:
+            pos = id_to_pos.get(rid)
+            if pos is None:
+                missing.append(rid)
+            else:
+                mapped.append(int(pos))
+        return mapped, missing
+
+    train_pos, missing_train = _map_row_ids(train_raw)
+    val_pos, missing_val = _map_row_ids(val_raw)
+    test_pos, missing_test = _map_row_ids(test_raw)
+
+    missing_total = len(missing_train) + len(missing_val) + len(missing_test)
+    if missing_total > 0:
+        all_raw = train_raw + val_raw + test_raw
+        looks_like_legacy_positions = all(0 <= idx < n_rows for idx in all_raw)
+        if looks_like_legacy_positions and allow_legacy_positions:
+            logging.warning(
+                "Chemprop split indices did not match %s values; treating them as legacy positional indices.",
+                row_index_col,
+            )
+            train_pos, val_pos, test_pos = train_raw, val_raw, test_raw
+        else:
+            legacy_hint = ""
+            if looks_like_legacy_positions:
+                legacy_hint = (
+                    " Indices look like legacy positional indices; regenerate splits with row IDs "
+                    f"or set train.model.allow_legacy_split_positions=true to opt in."
+                )
+            raise ValueError(
+                "Chemprop split indices do not match curated row IDs. "
+                f"row_index_column={row_index_col!r} "
+                f"missing(train/val/test)=({missing_train[:10]}, {missing_val[:10]}, {missing_test[:10]})."
+                f"{legacy_hint}"
+            )
+
+    return train_pos, val_pos, test_pos, row_ids
+
+
 def train_chemprop_model(
     curated_df: pd.DataFrame,
     target_column: str,
@@ -576,18 +794,14 @@ def train_chemprop_model(
     if target_column not in curated_df.columns:
         raise ValueError(f"Target column {target_column!r} not found in curated_df.")
 
-    y_all = _ensure_binary_labels(curated_df[target_column])
-    # Keep a stable row_id (0..N-1) for joining predictions to the curated dataset.
     df = curated_df.reset_index(drop=True).copy()
-    df["_row_id"] = df.index.astype(int)
-    df["_label"] = y_all.reset_index(drop=True).astype(int)
-
-    # Split indices are defined over curated_df row positions.
-    tr_idx = [int(i) for i in split_indices.get("train", [])]
-    va_idx = [int(i) for i in split_indices.get("val", [])]
-    te_idx = [int(i) for i in split_indices.get("test", [])]
-    if not te_idx and va_idx:
-        te_idx, va_idx = va_idx, []
+    allow_legacy_split_positions = _as_bool(model_config.get("allow_legacy_split_positions", False))
+    tr_idx, va_idx, te_idx, row_ids = _resolve_chemprop_split_positions(
+        df,
+        split_indices,
+        row_index_col=_ROW_INDEX_COL,
+        allow_legacy_positions=allow_legacy_split_positions,
+    )
     if not tr_idx or not te_idx:
         raise ValueError("chemprop training requires non-empty train and test splits.")
     if not va_idx:
@@ -595,6 +809,10 @@ def train_chemprop_model(
             "chemprop training requires an explicit validation split from the split node. "
             "Set split.val_size > 0."
         )
+    y_all = _ensure_binary_labels(df[target_column])
+    # Keep stable row identifiers for prediction joins/debugging.
+    df["_row_id"] = row_ids
+    df["_label"] = y_all.reset_index(drop=True).astype(int)
 
     # Hyperparameters.
     params = dict(model_config.get("params", {}))
@@ -1556,6 +1774,13 @@ def train_model(
         X_train.shape,
         X_test.shape,
     )
+    X_train, X_test, X_val, feature_name_map_path = _maybe_sanitize_xgboost_feature_frames(
+        model_type=model_type,
+        X_train=X_train,
+        X_test=X_test,
+        X_val=X_val,
+        output_dir=output_dir,
+    )
 
     if task_type == "classification" and model_type == "catboost_classifier":
         from catboost import CatBoostClassifier
@@ -1760,6 +1985,8 @@ def train_model(
             "r2": float(r2_score(y_test, y_pred)),
             "mae": float(mean_absolute_error(y_test, y_pred)),
         }
+    if feature_name_map_path:
+        metrics["feature_name_map_path"] = feature_name_map_path
 
     if plot_split_performance:
         split_metrics: Dict[str, Dict[str, float | None]] = {}
@@ -1908,12 +2135,18 @@ def run_explainability(
     output_dir: str,
     background_samples: int = 100,
     task_type: str = "regression",
-    ) -> None:
+) -> None:
     _ensure_dir(output_dir)
     if task_type == "classification":
         y_test = _ensure_binary_labels(y_test)
     is_dl = model_type.startswith("dl_")
     n_jobs = _resolve_n_jobs()
+    X_train, X_test = _maybe_apply_xgboost_feature_map_for_explain(
+        model_type=model_type,
+        output_dir=output_dir,
+        X_train=X_train,
+        X_test=X_test,
+    )
 
     try:
         import shap

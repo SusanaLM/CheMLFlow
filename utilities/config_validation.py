@@ -28,6 +28,7 @@ _NODE_TO_BLOCK = {
     "curate": "curate",
     "label.normalize": "label",
     "split": "split",
+    "featurize.none": "featurize",
     "featurize.lipinski": "featurize",
     "featurize.rdkit": "featurize",
     "featurize.rdkit_labeled": "featurize",
@@ -39,7 +40,7 @@ _NODE_TO_BLOCK = {
 }
 
 _CONFIGLESS_NODE_TO_BLOCK = {
-    "use.curated_features": "use",
+    "featurize.none": "featurize",
 }
 
 _ALWAYS_ALLOWED_BLOCKS = {"global", "pipeline"}
@@ -53,7 +54,13 @@ _KNOWN_TOP_LEVEL_BLOCKS = {
     "preprocess",
     "train",
     "train_tdc",
-    "use",
+}
+_FEATURE_INPUT_NODES = {
+    "featurize.none",
+    "featurize.rdkit",
+    "featurize.rdkit_labeled",
+    "featurize.morgan",
+    "use.curated_features",
 }
 
 
@@ -66,6 +73,14 @@ def _as_dict(value: Any) -> dict[str, Any]:
 def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     blocks_present = set(config.keys())
+    configless_blocks = {
+        block for node, block in _CONFIGLESS_NODE_TO_BLOCK.items() if node in nodes
+    }
+    blocks_required_by_configurable_nodes = {
+        block
+        for node, block in _NODE_TO_BLOCK.items()
+        if node in nodes and node not in _CONFIGLESS_NODE_TO_BLOCK
+    }
 
     allowed_blocks = set(_ALWAYS_ALLOWED_BLOCKS)
     for node in nodes:
@@ -95,7 +110,7 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
             )
             continue
         if block not in allowed_blocks:
-            if block == "use" and "use.curated_features" in nodes:
+            if block in configless_blocks:
                 continue
             issues.append(
                 ValidationIssue(
@@ -106,14 +121,21 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
             )
 
     # Configless-node specific checks.
-    if "use.curated_features" in nodes and "use" in blocks_present:
-        issues.append(
-            ValidationIssue(
-                code="CFG_CONFIGLESS_NODE_HAS_BLOCK",
-                path="use",
-                message="Node use.curated_features is configless and does not accept a top-level use block.",
+    for node, block in _CONFIGLESS_NODE_TO_BLOCK.items():
+        if (
+            node in nodes
+            and block in blocks_present
+            and block not in blocks_required_by_configurable_nodes
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="CFG_CONFIGLESS_NODE_HAS_BLOCK",
+                    path=block,
+                    message=(
+                        f"Node {node} is configless and does not accept a top-level {block} block."
+                    ),
+                )
             )
-        )
 
     # Required blocks for specific nodes.
     if "train" in nodes and "train" not in blocks_present:
@@ -162,6 +184,32 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                         message="train.model.type is required.",
                     )
                 )
+
+    has_explicit_feature_input = any(node in _FEATURE_INPUT_NODES for node in nodes)
+    if any(node in nodes for node in ("preprocess.features", "select.features")) and not has_explicit_feature_input:
+        issues.append(
+            ValidationIssue(
+                code="CFG_FEATURE_INPUT_NODE_REQUIRED",
+                path="pipeline.nodes",
+                message=(
+                    "preprocess.features/select.features require an explicit feature input node "
+                    "(featurize.none/featurize.rdkit/featurize.rdkit_labeled/featurize.morgan)."
+                ),
+            )
+        )
+    if "train" in nodes and not has_explicit_feature_input:
+        model_type = str(_as_dict(train_cfg.get("model")).get("type", "")).strip().lower()
+        if model_type and model_type != "chemprop":
+            issues.append(
+                ValidationIssue(
+                    code="CFG_FEATURE_INPUT_NODE_REQUIRED",
+                    path="pipeline.nodes",
+                    message=(
+                        "train for non-chemprop models requires an explicit feature input node "
+                        "(featurize.none/featurize.rdkit/featurize.rdkit_labeled/featurize.morgan)."
+                    ),
+                )
+            )
 
     if "train_tdc" in blocks_present and not isinstance(config.get("train_tdc"), dict):
         issues.append(

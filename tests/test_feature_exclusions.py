@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from MLModels import data_preprocessing
 
@@ -34,3 +35,13 @@ def test_load_features_labels_drops_excluded_columns(tmp_path):
     assert "SMILES" not in X.columns
     assert list(X.columns) == ["feature_a"]
     assert y.tolist() == [150.0, 151.0, 152.0]
+
+
+def test_load_features_labels_surfaces_original_exception_type(tmp_path):
+    missing = tmp_path / "does_not_exist.csv"
+    with pytest.raises(FileNotFoundError):
+        data_preprocessing.load_features_labels(
+            str(missing),
+            str(missing),
+            target_column="pIC50",
+        )

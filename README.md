@@ -20,7 +20,7 @@ Downstream steps enforce only the minimum required columns for their node (e.g.,
 
 ### Tabular descriptors (no featurizer)
 
-If your dataset already includes numeric descriptors, use the `use.curated_features` node to point training at the curated CSV directly (no RDKit/Morgan). You can also allowlist low‑cardinality categorical columns for one‑hot encoding via:
+If your dataset already includes numeric descriptors, use the `featurize.none` node to point training at the curated CSV directly (no RDKit/Morgan). You can also allowlist low-cardinality categorical columns for one-hot encoding via:
 
 ```
 train:
@@ -182,7 +182,7 @@ and will not create their own random splits.
 CheMLFlow enforces strict node-scoped config:
 
 - A top-level block is only allowed when its corresponding node is present in `pipeline.nodes`.
-- `use.curated_features` is configless (do not add a top-level `use:` block).
+- `featurize.none` is configless (do not add featurizer params unless another `featurize.*` node is present).
 - Training config is under `train.*`:
   - `train.model.*` (type + model params)
   - `train.tuning.*`
@@ -275,6 +275,23 @@ Coverage/comparability controls:
 - `split.require_full_test_coverage: true` fails if cleaned features/labels drop any test rows
 - `split.min_test_coverage`, `split.min_train_coverage`, `split.min_val_coverage` set explicit thresholds
 - This protects model comparisons from "winning by dropping hard rows"
+
+### DOE config generation
+
+You can generate many runnable configs from one DOE YAML:
+
+```bash
+python scripts/generate_doe.py --doe config/doe.example.yaml
+```
+
+The generator expands your search space and writes:
+
+- one config YAML per valid case
+- `manifest.jsonl` (valid/skipped + reason codes)
+- `summary.json` (counts + selection metadata)
+- isolated case paths by default (`base_dir`/`run_dir` scoped per `case_id`)
+
+Details and schema are in `docs/doe.md`.
 
 ## Quick start (pipelines)
 

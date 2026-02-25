@@ -37,6 +37,10 @@ class DataPreparer:
         properties_of_interest=None,
         dedupe_strategy: str | None = None,
         label_column: str | None = None,
+        drop_missing_smiles: bool = True,
+        target_column: str | None = None,
+        drop_missing_target: bool = True,
+        required_non_null_columns: list[str] | None = None,
     ):
         """Load data, identify the SMILES column, handle missing values, and remove duplicates.
         - Auto-detect the SMILES column if not provided (try 'canonical_smiles', 'smiles', 'SMILES').
@@ -64,14 +68,67 @@ class DataPreparer:
                 raise ValueError("Could not find a SMILES column. Tried: " + ", ".join([c for c in candidate_smiles if c]))
 
             logging.info(f"Using '{smiles_col}' as the SMILES column.")
+            original_smiles_col = smiles_col
 
-            # Keep only rows with SMILES
-            df_clean = df[df[smiles_col].notna()].copy()
+            # Optionally drop rows with missing SMILES at raw-curation stage.
+            if drop_missing_smiles:
+                before = len(df)
+                df_clean = df[df[smiles_col].notna()].copy()
+                removed = before - len(df_clean)
+                if removed:
+                    logging.info("Dropped %s row(s) with missing SMILES values.", removed)
+            else:
+                df_clean = df.copy()
 
             # Normalize name for downstream steps
             if smiles_col != 'canonical_smiles':
                 df_clean = df_clean.rename(columns={smiles_col: 'canonical_smiles'})
                 smiles_col = 'canonical_smiles'
+
+            # Optionally drop rows with missing target values when available at curate time.
+            if drop_missing_target and target_column:
+                resolved_target = str(target_column).strip()
+                if resolved_target:
+                    if resolved_target in df_clean.columns:
+                        before = len(df_clean)
+                        df_clean = df_clean[df_clean[resolved_target].notna()].copy()
+                        removed = before - len(df_clean)
+                        if removed:
+                            logging.info(
+                                "Dropped %s row(s) with missing target values in %r.",
+                                removed,
+                                resolved_target,
+                            )
+                    else:
+                        logging.warning(
+                            "drop_missing_target=true but target_column=%r was not found during curate; skipping.",
+                            resolved_target,
+                        )
+
+            required_cols_raw = [str(c).strip() for c in (required_non_null_columns or []) if str(c).strip()]
+            required_cols: list[str] = []
+            for col in required_cols_raw:
+                normalized = col
+                if original_smiles_col != "canonical_smiles" and col == original_smiles_col:
+                    normalized = "canonical_smiles"
+                if normalized not in required_cols:
+                    required_cols.append(normalized)
+            if required_cols:
+                missing_required = [c for c in required_cols if c not in df_clean.columns]
+                if missing_required:
+                    raise ValueError(
+                        "required_non_null_columns contain missing columns: "
+                        + ", ".join(sorted(missing_required))
+                    )
+                before = len(df_clean)
+                df_clean = df_clean.dropna(subset=required_cols).copy()
+                removed = before - len(df_clean)
+                if removed:
+                    logging.info(
+                        "Dropped %s row(s) missing required_non_null_columns=%s.",
+                        removed,
+                        required_cols,
+                    )
 
             # Remove exact duplicates by SMILES text (pre-canonicalization)
             if dedupe_strategy in {None, "first", "last"}:
@@ -104,6 +161,8 @@ class DataPreparer:
                 selected_columns = []
                 if id_col:
                     selected_columns.append(id_col)
+                if "__row_index" in df_clean.columns and "__row_index" not in selected_columns:
+                    selected_columns.append("__row_index")
                 selected_columns.append(smiles_col)
                 selected_columns.extend([c for c in present_props if c not in selected_columns])
                 if label_column and label_column in df_clean.columns and label_column not in selected_columns:
@@ -152,7 +211,17 @@ class DataPreparer:
                 df_clean.to_csv(self.curated_file, index=False)
             else:
                 # Keep typical useful columns if present
-                keep_cols = [c for c in ['molecule_chembl_id', 'canonical_smiles', 'standard_value', 'class'] if c in df_clean.columns]
+                keep_cols = [
+                    c
+                    for c in [
+                        'molecule_chembl_id',
+                        '__row_index',
+                        'canonical_smiles',
+                        'standard_value',
+                        'class',
+                    ]
+                    if c in df_clean.columns
+                ]
                 if not keep_cols:
                     keep_cols = df_clean.columns.tolist()
                 df_clean[keep_cols].to_csv(self.curated_file, index=False)
@@ -169,6 +238,7 @@ class DataPreparer:
         prefer_largest_fragment=True,
         dedupe_strategy: str | None = None,
         label_column: str | None = None,
+        drop_invalid_smiles: bool = True,
     ):
         """Clean the 'canonical_smiles' column:
         - Canonicalize SMILES with RDKit if available.
@@ -225,20 +295,39 @@ class DataPreparer:
                 except Exception:
                     return None, False
 
-            # Apply canonicalization row-wise
+            # Apply canonicalization row-wise.
             cans = []
             keep_mask = []
-            for s in df['canonical_smiles'].astype(str):
-                c, ok = rdkit_canonical(s)
-                cans.append(c)
-                keep_mask.append(ok and c is not None)
+            for original in df['canonical_smiles']:
+                if pd.isna(original) or not str(original).strip():
+                    c, ok = None, False
+                else:
+                    c, ok = rdkit_canonical(str(original))
+                if ok and c is not None:
+                    cans.append(c)
+                    keep_mask.append(True)
+                else:
+                    cans.append(original)
+                    keep_mask.append(not drop_invalid_smiles)
 
             if Chem is None:
                 logging.warning("RDKit not available; SMILES were not re-canonicalized. Install RDKit for full cleaning.")
 
             df['canonical_smiles'] = cans
+            before_filter = len(df)
             df = df[keep_mask].copy()
-            logging.info(f"After sanitization/canonicalization: {len(df)} rows remain.")
+            dropped_invalid = before_filter - len(df)
+            if drop_invalid_smiles:
+                logging.info(
+                    "After sanitization/canonicalization: %s rows remain (dropped %s invalid SMILES row(s)).",
+                    len(df),
+                    dropped_invalid,
+                )
+            else:
+                logging.info(
+                    "After sanitization/canonicalization: %s rows remain (invalid SMILES retained).",
+                    len(df),
+                )
 
             # Drop or reconcile duplicates after canonicalization
             before = len(df)
@@ -304,6 +393,11 @@ def main(
     keep_all_columns=False,
     dedupe_strategy=None,
     label_column=None,
+    drop_missing_smiles=True,
+    target_column=None,
+    drop_missing_target=True,
+    required_non_null_columns=None,
+    drop_invalid_smiles=True,
 ):
     """Main function to preprocess, optionally label, and clean SMILES data."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -314,6 +408,10 @@ def main(
         properties_of_interest=properties_of_interest,
         dedupe_strategy=dedupe_strategy,
         label_column=label_column,
+        drop_missing_smiles=drop_missing_smiles,
+        target_column=target_column,
+        drop_missing_target=drop_missing_target,
+        required_non_null_columns=required_non_null_columns,
     )
     # Label if bioactivity present; otherwise pass-through
     preparer.label_bioactivity(active_threshold=active_threshold, inactive_threshold=inactive_threshold)
@@ -324,6 +422,7 @@ def main(
         prefer_largest_fragment=prefer_largest_fragment,
         dedupe_strategy=dedupe_strategy,
         label_column=label_column,
+        drop_invalid_smiles=drop_invalid_smiles,
     )
 
 if __name__ == "__main__":
@@ -344,19 +443,42 @@ if __name__ == "__main__":
                         help="If set, keep the largest fragment by heavy-atom count when multiple fragments are present.")
     parser.add_argument('--no_prefer_largest_fragment', dest='prefer_largest_fragment', action='store_false',
                         help="Disable largest-fragment preference and keep the first valid fragment.")
-    parser.set_defaults(prefer_largest_fragment=True)
     parser.add_argument('--keep_all_columns', action='store_true',
                         help="If set, keep all columns (do not drop to only selected properties).")
     parser.add_argument('--dedupe_strategy', type=str, default=None,
                         help="Duplicate handling strategy: keep_first|keep_last|first|last|drop_conflicts|majority.")
     parser.add_argument('--label_column', type=str, default=None,
                         help="Label column name for dedupe resolution (required for conflict handling).")
-
+    parser.add_argument('--target_column', type=str, default=None,
+                        help="Optional target column to enforce non-null values during curate.")
+    parser.add_argument('--required_non_null_columns', type=str, default=None,
+                        help="Optional comma-separated columns that must be non-null; rows missing values are dropped.")
+    parser.add_argument('--drop_missing_smiles', action='store_true',
+                        help="Drop rows with missing SMILES during curate preprocessing.")
+    parser.add_argument('--no_drop_missing_smiles', dest='drop_missing_smiles', action='store_false',
+                        help="Keep rows with missing SMILES during curate preprocessing.")
+    parser.add_argument('--drop_missing_target', action='store_true',
+                        help="Drop rows with missing target_column values during curate when target_column exists.")
+    parser.add_argument('--no_drop_missing_target', dest='drop_missing_target', action='store_false',
+                        help="Keep rows with missing target_column values during curate.")
+    parser.add_argument('--drop_invalid_smiles', action='store_true',
+                        help="Drop rows that fail SMILES sanitization/canonicalization.")
+    parser.add_argument('--no_drop_invalid_smiles', dest='drop_invalid_smiles', action='store_false',
+                        help="Keep rows even when SMILES sanitization fails.")
+    parser.set_defaults(
+        prefer_largest_fragment=True,
+        drop_missing_smiles=True,
+        drop_missing_target=True,
+        drop_invalid_smiles=True,
+    )
     args = parser.parse_args()
 
     props = None
     if args.properties:
         props = [p.strip() for p in args.properties.split(",") if p.strip()]
+    required_cols = None
+    if args.required_non_null_columns:
+        required_cols = [c.strip() for c in args.required_non_null_columns.split(",") if c.strip()]
 
     main(
         args.raw_data_file,
@@ -372,4 +494,9 @@ if __name__ == "__main__":
         keep_all_columns=args.keep_all_columns,
         dedupe_strategy=args.dedupe_strategy,
         label_column=args.label_column,
+        drop_missing_smiles=args.drop_missing_smiles,
+        target_column=args.target_column,
+        drop_missing_target=args.drop_missing_target,
+        required_non_null_columns=required_cols,
+        drop_invalid_smiles=args.drop_invalid_smiles,
     )

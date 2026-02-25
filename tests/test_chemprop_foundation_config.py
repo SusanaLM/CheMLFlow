@@ -1,6 +1,10 @@
+import pandas as pd
 import pytest
 
-from MLModels.train_models import _resolve_chemprop_foundation_config
+from MLModels.train_models import (
+    _resolve_chemprop_foundation_config,
+    _resolve_chemprop_split_positions,
+)
 
 
 def test_resolve_chemprop_foundation_defaults() -> None:
@@ -46,3 +50,65 @@ def test_resolve_chemprop_foundation_with_checkpoint_and_freeze(tmp_path) -> Non
 def test_resolve_chemprop_foundation_freeze_requires_chemeleon() -> None:
     with pytest.raises(ValueError, match="freeze_encoder"):
         _resolve_chemprop_foundation_config({"freeze_encoder": True})
+
+
+def test_resolve_chemprop_split_positions_maps_row_ids() -> None:
+    curated = pd.DataFrame(
+        {
+            "__row_index": [10, 11, 12],
+            "canonical_smiles": ["CC", "CCC", "CCCC"],
+            "label": [0, 1, 0],
+        }
+    )
+    splits = {"train": [10, 11], "val": [12], "test": []}
+    tr_idx, va_idx, te_idx, row_ids = _resolve_chemprop_split_positions(curated, splits)
+    assert tr_idx == [0, 1]
+    assert va_idx == []
+    assert te_idx == [2]
+    assert row_ids == [10, 11, 12]
+
+
+def test_resolve_chemprop_split_positions_rejects_legacy_positions_by_default() -> None:
+    curated = pd.DataFrame(
+        {
+            "__row_index": [100, 101, 102],
+            "canonical_smiles": ["CC", "CCC", "CCCC"],
+            "label": [0, 1, 0],
+        }
+    )
+    splits = {"train": [0], "val": [1], "test": [2]}
+    with pytest.raises(ValueError, match="allow_legacy_split_positions"):
+        _resolve_chemprop_split_positions(curated, splits)
+
+
+def test_resolve_chemprop_split_positions_allows_legacy_positions_when_opted_in() -> None:
+    curated = pd.DataFrame(
+        {
+            "__row_index": [100, 101, 102],
+            "canonical_smiles": ["CC", "CCC", "CCCC"],
+            "label": [0, 1, 0],
+        }
+    )
+    splits = {"train": [0], "val": [1], "test": [2]}
+    tr_idx, va_idx, te_idx, row_ids = _resolve_chemprop_split_positions(
+        curated,
+        splits,
+        allow_legacy_positions=True,
+    )
+    assert tr_idx == [0]
+    assert va_idx == [1]
+    assert te_idx == [2]
+    assert row_ids == [100, 101, 102]
+
+
+def test_resolve_chemprop_split_positions_rejects_unknown_row_ids() -> None:
+    curated = pd.DataFrame(
+        {
+            "__row_index": [100, 101, 102],
+            "canonical_smiles": ["CC", "CCC", "CCCC"],
+            "label": [0, 1, 0],
+        }
+    )
+    splits = {"train": [999], "val": [], "test": [101]}
+    with pytest.raises(ValueError, match="do not match curated row IDs"):
+        _resolve_chemprop_split_positions(curated, splits)
