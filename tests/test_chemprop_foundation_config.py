@@ -2,8 +2,10 @@ import pandas as pd
 import pytest
 
 from MLModels.train_models import (
+    _resolve_chemprop_predictor_ctor,
     _resolve_chemprop_foundation_config,
     _resolve_chemprop_split_positions,
+    train_chemprop_model,
 )
 
 
@@ -112,3 +114,34 @@ def test_resolve_chemprop_split_positions_rejects_unknown_row_ids() -> None:
     splits = {"train": [999], "val": [], "test": [101]}
     with pytest.raises(ValueError, match="do not match curated row IDs"):
         _resolve_chemprop_split_positions(curated, splits)
+
+
+def test_resolve_chemprop_predictor_ctor_requires_regression_ffn() -> None:
+    class _NNModule:
+        BinaryClassificationFFN = object
+
+    with pytest.raises(ValueError, match="RegressionFFN"):
+        _resolve_chemprop_predictor_ctor(_NNModule, "regression")
+
+
+def test_train_chemprop_model_regression_rejects_non_numeric_target(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("MLModels.train_models._require_chemprop", lambda: None)
+
+    curated = pd.DataFrame(
+        {
+            "canonical_smiles": ["CC", "CCC", "CCCC"],
+            "target": [1.2, "bad", 3.4],
+        }
+    )
+    splits = {"train": [0], "val": [1], "test": [2]}
+
+    with pytest.raises(ValueError, match="numeric target values"):
+        train_chemprop_model(
+            curated_df=curated,
+            target_column="target",
+            split_indices=splits,
+            output_dir=str(tmp_path),
+            random_state=42,
+            task_type="regression",
+            model_config={},
+        )

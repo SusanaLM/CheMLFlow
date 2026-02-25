@@ -407,7 +407,8 @@ train:
 |------|-------------|
 | Regression | `random_forest`, `svm`, `decision_tree`, `xgboost`, `ensemble` |
 | Regression (DL) | `dl_simple`, `dl_deep`, `dl_gru`, `dl_resmlp`, `dl_tabtransformer`, `dl_aereg` |
-| Classification | `catboost_classifier` |
+| Regression (SMILES-native) | `chemprop` |
+| Classification | `random_forest`, `decision_tree`, `xgboost`, `svm`, `ensemble`, `catboost_classifier` |
 | Classification (SMILES-native) | `chemprop` |
 
 **General keys:**

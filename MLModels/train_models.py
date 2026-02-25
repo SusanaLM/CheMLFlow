@@ -14,10 +14,15 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from sklearn.model_selection import RandomizedSearchCV, GridSearchCV
-from sklearn.ensemble import RandomForestRegressor, VotingRegressor
-from sklearn.svm import SVR
-from sklearn.tree import DecisionTreeRegressor
-from xgboost import XGBRegressor
+from sklearn.ensemble import (
+    RandomForestRegressor,
+    RandomForestClassifier,
+    VotingClassifier,
+    VotingRegressor,
+)
+from sklearn.svm import SVR, SVC
+from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
+from xgboost import XGBRegressor, XGBClassifier
 from sklearn.metrics import (
     r2_score,
     mean_absolute_error,
@@ -246,6 +251,53 @@ def _save_roc_curve(output_dir: str, model_type: str, y_true, y_score) -> str | 
     plt.savefig(roc_path)
     plt.close()
     return roc_path
+
+
+def _sigmoid(values: np.ndarray | pd.Series | list[float]) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    return 1.0 / (1.0 + np.exp(-arr))
+
+
+def _predict_classification_outputs(
+    estimator: object,
+    model_type: str,
+    X: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if model_type.startswith("dl_"):
+        logits = np.asarray(_predict_dl(estimator, X.values)).reshape(-1)
+        y_proba = _sigmoid(logits)
+        y_pred = (y_proba >= 0.5).astype(int)
+        return y_proba, y_pred, logits
+
+    if hasattr(estimator, "predict_proba"):
+        proba_raw = np.asarray(estimator.predict_proba(X))
+        if proba_raw.ndim == 2:
+            if proba_raw.shape[1] < 2:
+                classes = np.asarray(getattr(estimator, "classes_", []))
+                if classes.size == 1 and int(classes[0]) == 1:
+                    y_proba = np.ones(proba_raw.shape[0], dtype=float)
+                else:
+                    y_proba = np.zeros(proba_raw.shape[0], dtype=float)
+            else:
+                y_proba = proba_raw[:, 1].reshape(-1).astype(float)
+        else:
+            y_proba = proba_raw.reshape(-1).astype(float)
+        y_pred = _ensure_binary_labels(pd.Series(estimator.predict(X))).to_numpy(dtype=int)
+        return y_proba, y_pred, y_proba
+
+    if hasattr(estimator, "decision_function"):
+        scores_raw = np.asarray(estimator.decision_function(X))
+        if scores_raw.ndim == 2 and scores_raw.shape[1] >= 2:
+            scores = scores_raw[:, 1].reshape(-1).astype(float)
+        else:
+            scores = scores_raw.reshape(-1).astype(float)
+        y_proba = _sigmoid(scores)
+        y_pred = _ensure_binary_labels(pd.Series(estimator.predict(X))).to_numpy(dtype=int)
+        return y_proba, y_pred, scores
+
+    y_pred = _ensure_binary_labels(pd.Series(estimator.predict(X))).to_numpy(dtype=int)
+    y_proba = y_pred.astype(float)
+    return y_proba, y_pred, y_pred.astype(float)
 
 
 def _save_pr_curve(
@@ -757,6 +809,21 @@ def _resolve_chemprop_split_positions(
     return train_pos, val_pos, test_pos, row_ids
 
 
+def _resolve_chemprop_predictor_ctor(nn_module, task_type: str):
+    if task_type == "classification":
+        predictor_ctor = getattr(nn_module, "BinaryClassificationFFN", None)
+        predictor_name = "BinaryClassificationFFN"
+    else:
+        predictor_ctor = getattr(nn_module, "RegressionFFN", None)
+        predictor_name = "RegressionFFN"
+    if predictor_ctor is None:
+        raise ValueError(
+            f"chemprop {task_type} requires nn.{predictor_name}, "
+            "but it is unavailable in the installed chemprop version."
+        )
+    return predictor_ctor
+
+
 def train_chemprop_model(
     curated_df: pd.DataFrame,
     target_column: str,
@@ -768,8 +835,9 @@ def train_chemprop_model(
 ) -> Tuple[object, TrainResult]:
     """Train a Chemprop D-MPNN model in-process (no CLI/subprocess).
 
-    This path is intentionally SMILES-native. It expects the curated dataset to include a
-    `canonical_smiles` column (or an override via model_config.smiles_column).
+    This path is intentionally SMILES-native. It supports both classification and
+    regression tasks and expects the curated dataset to include a `canonical_smiles`
+    column (or an override via model_config.smiles_column).
 
     Artifacts written (consistent with other trainers):
     - <output_dir>/chemprop_best_model.ckpt
@@ -781,9 +849,6 @@ def train_chemprop_model(
     _require_chemprop()
     model_config = model_config or {}
     foundation_mode, foundation_checkpoint, freeze_encoder = _resolve_chemprop_foundation_config(model_config)
-
-    if task_type != "classification":
-        raise ValueError("chemprop integration currently supports classification only.")
 
     smiles_column = model_config.get("smiles_column", "canonical_smiles")
     if smiles_column not in curated_df.columns:
@@ -809,10 +874,18 @@ def train_chemprop_model(
             "chemprop training requires an explicit validation split from the split node. "
             "Set split.val_size > 0."
         )
-    y_all = _ensure_binary_labels(df[target_column])
+    if task_type == "classification":
+        y_all = _ensure_binary_labels(df[target_column]).astype(int)
+    else:
+        y_all = pd.to_numeric(df[target_column], errors="coerce")
+        if y_all.isna().any():
+            raise ValueError(
+                "chemprop regression requires numeric target values; "
+                f"found non-numeric entries in target_column={target_column!r}."
+            )
     # Keep stable row identifiers for prediction joins/debugging.
     df["_row_id"] = row_ids
-    df["_label"] = y_all.reset_index(drop=True).astype(int)
+    df["_label"] = y_all.reset_index(drop=True)
 
     # Hyperparameters.
     params = dict(model_config.get("params", {}))
@@ -951,10 +1024,12 @@ def train_chemprop_model(
     mp_depth_effective = int(getattr(mp, "depth", configured_or_ckpt_depth))
     agg = nn.MeanAggregation()
 
-    # Chemprop FFN constructor changed across versions:
-    # - older: BinaryClassificationFFN(..., d_mp=..., d_h=...)
-    # - newer: BinaryClassificationFFN(..., input_dim=..., hidden_dim=...)
-    ffn_sig = inspect.signature(nn.BinaryClassificationFFN.__init__)
+    predictor_ctor = _resolve_chemprop_predictor_ctor(nn, task_type)
+
+    # Chemprop FFN constructors changed across versions:
+    # - older: *(..., d_mp=..., d_h=...)
+    # - newer: *(..., input_dim=..., hidden_dim=...)
+    ffn_sig = inspect.signature(predictor_ctor.__init__)
     ffn_kwargs: Dict[str, Any] = {"n_tasks": 1}
     if "d_mp" in ffn_sig.parameters:
         ffn_kwargs["d_mp"] = mp_output_dim
@@ -964,7 +1039,7 @@ def train_chemprop_model(
         ffn_kwargs["d_h"] = ff_hidden
     if "hidden_dim" in ffn_sig.parameters:
         ffn_kwargs["hidden_dim"] = ff_hidden
-    ffn = nn.BinaryClassificationFFN(**ffn_kwargs)
+    ffn = predictor_ctor(**ffn_kwargs)
     mpnn = models.MPNN(
         message_passing=mp,
         agg=agg,
@@ -1010,7 +1085,7 @@ def train_chemprop_model(
     )
     trainer.fit(mpnn, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-    # Predict probabilities from the best checkpoint.
+    # Predict outputs from the best checkpoint.
     def _extract_tensor(obj):
         if isinstance(obj, torch.Tensor):
             return obj
@@ -1030,7 +1105,7 @@ def train_chemprop_model(
             # Backward compatibility with older Lightning signatures.
             return trainer.predict(dataloaders=loader, ckpt_path="best")
 
-    def _predict_probs(loader) -> np.ndarray:
+    def _predict_values(loader) -> np.ndarray:
         pred_batches = _predict_batches(loader)
         if isinstance(pred_batches, list):
             preds_t = torch.cat(
@@ -1041,21 +1116,14 @@ def train_chemprop_model(
         else:
             preds = _extract_tensor(pred_batches).detach().cpu().numpy().reshape(-1)
         preds = preds.astype(float)
-        if np.nanmin(preds) < 0.0 or np.nanmax(preds) > 1.0:
+        if task_type == "classification" and (np.nanmin(preds) < 0.0 or np.nanmax(preds) > 1.0):
             # Some configs may emit logits; convert to probabilities for metrics.
             preds = 1.0 / (1.0 + np.exp(-preds))
         return preds
 
-    preds = _predict_probs(test_loader)
-
-    y_true = df.loc[te_idx, "_label"].to_numpy(dtype=int)
-    y_pred = (preds >= 0.5).astype(int)
+    preds = _predict_values(test_loader)
 
     metrics = {
-        "auc": _safe_auc(y_true, preds),
-        "auprc": _safe_auprc(y_true, preds),
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "f1": float(f1_score(y_true, y_pred)),
         "max_epochs": int(max_epochs),
         "batch_size": int(batch_size),
         "init_lr": float(init_lr),
@@ -1068,31 +1136,60 @@ def train_chemprop_model(
         "foundation_checkpoint": foundation_checkpoint,
         "freeze_encoder": bool(freeze_encoder),
     }
+    if task_type == "classification":
+        y_true = df.loc[te_idx, "_label"].to_numpy(dtype=int)
+        y_pred = (preds >= 0.5).astype(int)
+        metrics.update(
+            {
+                "auc": _safe_auc(y_true, preds),
+                "auprc": _safe_auprc(y_true, preds),
+                "accuracy": float(accuracy_score(y_true, y_pred)),
+                "f1": float(f1_score(y_true, y_pred)),
+            }
+        )
+    else:
+        y_true = df.loc[te_idx, "_label"].to_numpy(dtype=float)
+        y_pred = preds.astype(float)
+        metrics.update(
+            {
+                "r2": float(r2_score(y_true, y_pred)),
+                "mae": float(mean_absolute_error(y_true, y_pred)),
+            }
+        )
     if plot_split_performance:
-        train_preds = _predict_probs(train_eval_loader)
-        val_preds = _predict_probs(val_loader)
-        train_y = df.loc[tr_idx, "_label"].to_numpy(dtype=int)
-        val_y = df.loc[va_idx, "_label"].to_numpy(dtype=int)
-        split_metrics: Dict[str, Dict[str, float | None]] = {
-            "train": {
-                "auc": _safe_auc(train_y, train_preds),
-                "auprc": _safe_auprc(train_y, train_preds),
-                "accuracy": float(accuracy_score(train_y, (train_preds >= 0.5).astype(int))),
-                "f1": float(f1_score(train_y, (train_preds >= 0.5).astype(int))),
-            },
-            "val": {
-                "auc": _safe_auc(val_y, val_preds),
-                "auprc": _safe_auprc(val_y, val_preds),
-                "accuracy": float(accuracy_score(val_y, (val_preds >= 0.5).astype(int))),
-                "f1": float(f1_score(val_y, (val_preds >= 0.5).astype(int))),
-            },
-            "test": {
-                "auc": metrics["auc"],
-                "auprc": metrics["auprc"],
-                "accuracy": metrics["accuracy"],
-                "f1": metrics["f1"],
-            },
-        }
+        train_preds = _predict_values(train_eval_loader)
+        val_preds = _predict_values(val_loader)
+        if task_type == "classification":
+            train_y = df.loc[tr_idx, "_label"].to_numpy(dtype=int)
+            val_y = df.loc[va_idx, "_label"].to_numpy(dtype=int)
+            split_metrics: Dict[str, Dict[str, float | None]] = {
+                "train": {
+                    "auc": _safe_auc(train_y, train_preds),
+                    "auprc": _safe_auprc(train_y, train_preds),
+                    "accuracy": float(accuracy_score(train_y, (train_preds >= 0.5).astype(int))),
+                    "f1": float(f1_score(train_y, (train_preds >= 0.5).astype(int))),
+                },
+                "val": {
+                    "auc": _safe_auc(val_y, val_preds),
+                    "auprc": _safe_auprc(val_y, val_preds),
+                    "accuracy": float(accuracy_score(val_y, (val_preds >= 0.5).astype(int))),
+                    "f1": float(f1_score(val_y, (val_preds >= 0.5).astype(int))),
+                },
+                "test": {
+                    "auc": metrics["auc"],
+                    "auprc": metrics["auprc"],
+                    "accuracy": metrics["accuracy"],
+                    "f1": metrics["f1"],
+                },
+            }
+        else:
+            train_y = df.loc[tr_idx, "_label"].to_numpy(dtype=float)
+            val_y = df.loc[va_idx, "_label"].to_numpy(dtype=float)
+            split_metrics = {
+                "train": {"r2": _safe_r2(train_y, train_preds), "mae": _safe_mae(train_y, train_preds)},
+                "val": {"r2": _safe_r2(val_y, val_preds), "mae": _safe_mae(val_y, val_preds)},
+                "test": {"r2": metrics["r2"], "mae": metrics["mae"]},
+            }
         split_metrics_path, split_plot_path = _save_split_metrics_artifacts(
             output_dir,
             "chemprop",
@@ -1102,29 +1199,42 @@ def train_chemprop_model(
             metrics["split_metrics_path"] = split_metrics_path
         if split_plot_path:
             metrics["split_metrics_plot_path"] = split_plot_path
-        metrics.update(
-            _save_classification_split_plots(
+        if task_type == "classification":
+            metrics.update(
+                _save_classification_split_plots(
+                    output_dir,
+                    "chemprop",
+                    {
+                        "train": {
+                            "y_true": train_y,
+                            "y_proba": train_preds,
+                            "y_pred": (train_preds >= 0.5).astype(int),
+                        },
+                        "val": {
+                            "y_true": val_y,
+                            "y_proba": val_preds,
+                            "y_pred": (val_preds >= 0.5).astype(int),
+                        },
+                        "test": {
+                            "y_true": y_true,
+                            "y_proba": preds,
+                            "y_pred": y_pred,
+                        },
+                    },
+                )
+            )
+        else:
+            parity_paths = _save_regression_parity_plots(
                 output_dir,
                 "chemprop",
                 {
-                    "train": {
-                        "y_true": train_y,
-                        "y_proba": train_preds,
-                        "y_pred": (train_preds >= 0.5).astype(int),
-                    },
-                    "val": {
-                        "y_true": val_y,
-                        "y_proba": val_preds,
-                        "y_pred": (val_preds >= 0.5).astype(int),
-                    },
-                    "test": {
-                        "y_true": y_true,
-                        "y_proba": preds,
-                        "y_pred": y_pred,
-                    },
+                    "train": (train_y, train_preds),
+                    "val": (val_y, val_preds),
+                    "test": (y_true, y_pred),
                 },
             )
-        )
+            for split_name, path in parity_paths.items():
+                metrics[f"parity_plot_{split_name}_path"] = path
 
     # Save artifacts.
     model_path = os.path.join(output_dir, "chemprop_best_model.ckpt")
@@ -1155,11 +1265,17 @@ def train_chemprop_model(
     pred_path = os.path.join(output_dir, "chemprop_predictions.csv")
     out_pred = df.loc[te_idx, ["_row_id", smiles_column, target_column]].copy()
     out_pred.rename(columns={target_column: "y_true", smiles_column: "smiles"}, inplace=True)
-    out_pred["y_proba"] = preds
     out_pred["y_pred"] = y_pred
+    if task_type == "classification":
+        out_pred["y_proba"] = preds
     out_pred.to_csv(pred_path, index=False)
 
-    logging.info("Training complete (chemprop): metrics=%s", {k: metrics[k] for k in ["auc", "auprc", "accuracy", "f1"]})
+    report_keys = ["auc", "auprc", "accuracy", "f1"] if task_type == "classification" else ["r2", "mae"]
+    logging.info(
+        "Training complete (chemprop): task=%s metrics=%s",
+        task_type,
+        {k: metrics[k] for k in report_keys},
+    )
     logging.info("Artifacts: model=%s metrics=%s params=%s preds=%s", model_path, metrics_path, params_path, pred_path)
 
     return mpnn, TrainResult(model_path, params_path, metrics_path)
@@ -1288,11 +1404,14 @@ def _initialize_model(
     n_jobs: int = -1,
     tuning_method: str = "fixed",
     model_params: Dict[str, Any] | None = None,
+    task_type: str = "regression",
 ):
     tuning_method = str(tuning_method or "fixed").strip().lower()
     if tuning_method not in {"train_cv", "fixed"}:
         raise ValueError(f"Unsupported model.tuning.method={tuning_method!r}; expected 'train_cv' or 'fixed'.")
     model_params = model_params or {}
+
+    is_classification = str(task_type or "").strip().lower() == "classification"
 
     if model_type == "random_forest":
         param_dist = {
@@ -1303,6 +1422,21 @@ def _initialize_model(
             "max_features": ["sqrt", "log2", None],
             "bootstrap": [True, False],
         }
+        if is_classification:
+            if tuning_method == "fixed":
+                params = {"random_state": random_state, **model_params}
+                params.setdefault("n_jobs", n_jobs)
+                return RandomForestClassifier(**params)
+            base_rf_cls = RandomForestClassifier(random_state=random_state)
+            return RandomizedSearchCV(
+                estimator=base_rf_cls,
+                param_distributions=param_dist,
+                n_iter=search_iters,
+                cv=cv_folds,
+                scoring="accuracy",
+                n_jobs=n_jobs,
+                random_state=random_state,
+            )
         if tuning_method == "fixed":
             params = {"random_state": random_state, **model_params}
             params.setdefault("n_jobs", n_jobs)
@@ -1318,6 +1452,21 @@ def _initialize_model(
             random_state=random_state,
         )
     if model_type == "svm":
+        if is_classification:
+            param_grid_svc = {
+                "C": [0.1, 1, 10, 100],
+                "gamma": ["scale", "auto", 0.1, 0.01],
+            }
+            if tuning_method == "fixed":
+                params = {"probability": True, **model_params}
+                return SVC(**params)
+            return GridSearchCV(
+                estimator=SVC(kernel="rbf", probability=True),
+                param_grid=param_grid_svc,
+                cv=cv_folds,
+                scoring="accuracy",
+                n_jobs=n_jobs,
+            )
         param_grid_svm = {
             "C": [0.1, 1, 10, 100],
             "gamma": ["scale", "auto", 0.1, 0.01],
@@ -1339,6 +1488,20 @@ def _initialize_model(
             "min_samples_leaf": [1, 2, 4, 8],
             "max_features": ["sqrt", "log2", None],
         }
+        if is_classification:
+            if tuning_method == "fixed":
+                params = {"random_state": random_state, **model_params}
+                return DecisionTreeClassifier(**params)
+            base_dt_cls = DecisionTreeClassifier(random_state=random_state)
+            return RandomizedSearchCV(
+                estimator=base_dt_cls,
+                param_distributions=param_dist_dt,
+                n_iter=search_iters,
+                cv=cv_folds,
+                scoring="accuracy",
+                n_jobs=n_jobs,
+                random_state=random_state,
+            )
         if tuning_method == "fixed":
             params = {"random_state": random_state, **model_params}
             return DecisionTreeRegressor(**params)
@@ -1362,6 +1525,31 @@ def _initialize_model(
             "reg_alpha": [0, 0.01, 0.1, 1],
             "reg_lambda": [0.1, 1, 10, 100],
         }
+        if is_classification:
+            if tuning_method == "fixed":
+                params = {
+                    "objective": "binary:logistic",
+                    "eval_metric": "logloss",
+                    "random_state": random_state,
+                    "n_jobs": n_jobs,
+                    **model_params,
+                }
+                return XGBClassifier(**params)
+            base_xgb_cls = XGBClassifier(
+                objective="binary:logistic",
+                eval_metric="logloss",
+                random_state=random_state,
+                n_jobs=n_jobs,
+            )
+            return RandomizedSearchCV(
+                estimator=base_xgb_cls,
+                param_distributions=param_dist_xgb,
+                n_iter=search_iters,
+                cv=cv_folds,
+                scoring="accuracy",
+                n_jobs=n_jobs,
+                random_state=random_state,
+            )
         if tuning_method == "fixed":
             params = {
                 "objective": "reg:squarederror",
@@ -1385,6 +1573,53 @@ def _initialize_model(
             random_state=random_state,
         )
     if model_type == "ensemble":
+        ensemble_cfg = model_params if isinstance(model_params, dict) else {}
+        rf_override = (
+            ensemble_cfg.get("rf_params")
+            if isinstance(ensemble_cfg.get("rf_params"), dict)
+            else {}
+        )
+        xgb_override = (
+            ensemble_cfg.get("xgb_params")
+            if isinstance(ensemble_cfg.get("xgb_params"), dict)
+            else {}
+        )
+        voting = str(ensemble_cfg.get("voting", "soft")).strip().lower() or "soft"
+
+        if is_classification:
+            rf_params = {
+                "n_estimators": 200,
+                "max_depth": 30,
+                "max_features": "sqrt",
+                "bootstrap": False,
+                "min_samples_leaf": 1,
+                "min_samples_split": 2,
+                "random_state": random_state,
+                "n_jobs": n_jobs,
+                **rf_override,
+            }
+            xgb_params = {
+                "n_estimators": 200,
+                "max_depth": 5,
+                "learning_rate": 0.1,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+                "reg_alpha": 0,
+                "reg_lambda": 1,
+                "objective": "binary:logistic",
+                "eval_metric": "logloss",
+                "random_state": random_state,
+                "n_jobs": n_jobs,
+                **xgb_override,
+            }
+            rf = RandomForestClassifier(**rf_params)
+            xgb = XGBClassifier(**xgb_params)
+            return VotingClassifier(
+                estimators=[("rf", rf), ("xgb", xgb)],
+                voting=voting,
+                n_jobs=n_jobs,
+            )
+
         rf = RandomForestRegressor(
             n_estimators=300,
             max_depth=30,
@@ -1393,6 +1628,7 @@ def _initialize_model(
             min_samples_leaf=1,
             min_samples_split=2,
             random_state=random_state,
+            **rf_override,
         )
         xgb = XGBRegressor(
             n_estimators=300,
@@ -1404,6 +1640,7 @@ def _initialize_model(
             reg_lambda=1,
             random_state=random_state,
             n_jobs=n_jobs,
+            **xgb_override,
         )
         return VotingRegressor([("rf", rf), ("xgb", xgb)], n_jobs=n_jobs)
     
@@ -1782,13 +2019,14 @@ def train_model(
         output_dir=output_dir,
     )
 
-    if task_type == "classification" and model_type == "catboost_classifier":
-        from catboost import CatBoostClassifier
-
+    if task_type == "classification":
         y_train = _ensure_binary_labels(y_train)
         y_test = _ensure_binary_labels(y_test)
         if y_val is not None:
             y_val = _ensure_binary_labels(y_val)
+
+    if task_type == "classification" and model_type == "catboost_classifier":
+        from catboost import CatBoostClassifier
 
         params = {
             "loss_function": "Logloss",
@@ -1883,14 +2121,17 @@ def train_model(
         logging.info("Training complete (classification): metrics=%s", metrics)
         logging.info("Artifacts: model=%s metrics=%s params=%s", model_path, metrics_path, params_path)
         return estimator, TrainResult(model_path, params_path, metrics_path)
-    
-    if task_type == "classification" and is_dl:
-        y_train = _ensure_binary_labels(y_train)
-        y_test = _ensure_binary_labels(y_test)
-        if y_val is not None:
-            y_val = _ensure_binary_labels(y_val)
 
-    if task_type == "classification" and not (model_type == "catboost_classifier" or is_dl):
+    classification_model_types = {
+        "catboost_classifier",
+        "random_forest",
+        "decision_tree",
+        "xgboost",
+        "svm",
+        "ensemble",
+    }
+
+    if task_type == "classification" and not (model_type in classification_model_types or is_dl):
         raise ValueError(f"Unsupported classification model type: {model_type}")
 
     model = _initialize_model(
@@ -1902,6 +2143,7 @@ def train_model(
         n_jobs=n_jobs,
         tuning_method=tuning_method,
         model_params=model_params,
+        task_type=task_type,
     )
     if isinstance(model, DLSearchConfig):
         # ── DL Training ──
@@ -1959,8 +2201,11 @@ def train_model(
         best_params = model.best_params_ if hasattr(model, "best_params_") else {}
 
     if task_type == "classification":
-        y_pred_proba = 1.0 / (1.0 + np.exp(-np.asarray(y_pred).reshape(-1)))
-        y_pred_label = (y_pred_proba >= 0.5).astype(int)
+        y_pred_proba, y_pred_label, y_pred_score = _predict_classification_outputs(
+            estimator=estimator,
+            model_type=model_type,
+            X=X_test,
+        )
         y_true = np.asarray(y_test).reshape(-1).astype(int)
 
         metrics = {
@@ -1976,7 +2221,7 @@ def train_model(
         pred_path = os.path.join(output_dir, f"{model_type}_predictions.csv")
         pd.DataFrame({
             "y_true": y_true,
-            "y_score": np.asarray(y_pred).reshape(-1),
+            "y_score": np.asarray(y_pred_score).reshape(-1),
             "y_proba": y_pred_proba,
             "y_pred": y_pred_label,
         }).to_csv(pred_path, index=False)
@@ -1993,61 +2238,49 @@ def train_model(
 
         if task_type == "classification":
             # --- TRAIN predictions ---
-            if model_type == "catboost_classifier":
-                tr_proba = estimator.predict_proba(X_train)[:, 1]
-                tr_pred = estimator.predict(X_train)
-            elif is_dl:
-                tr_logits = _predict_dl(estimator, X_train.values)
-                tr_proba = 1.0 / (1.0 + np.exp(-np.asarray(tr_logits).reshape(-1)))
-                tr_pred = (tr_proba >= 0.5).astype(int)
-            else:
-                tr_proba, tr_pred = None, None
+            tr_proba, tr_pred, _ = _predict_classification_outputs(
+                estimator=estimator,
+                model_type=model_type,
+                X=X_train,
+            )
 
             y_tr = np.asarray(y_train).reshape(-1).astype(int)
             split_metrics["train"] = {
-                "auc": _safe_auc(y_tr, tr_proba) if tr_proba is not None else None,
-                "auprc": _safe_auprc(y_tr, tr_proba) if tr_proba is not None else None,
-                "accuracy": float(accuracy_score(y_tr, tr_pred)) if tr_pred is not None else None,
-                "f1": float(f1_score(y_tr, tr_pred)) if tr_pred is not None else None,
+                "auc": _safe_auc(y_tr, tr_proba),
+                "auprc": _safe_auprc(y_tr, tr_proba),
+                "accuracy": float(accuracy_score(y_tr, tr_pred)),
+                "f1": float(f1_score(y_tr, tr_pred)),
             }
 
             # --- TEST predictions ---
-            if model_type == "catboost_classifier":
-                te_proba = estimator.predict_proba(X_test)[:, 1]
-                te_pred = estimator.predict(X_test)
-            elif is_dl:
-                te_logits = _predict_dl(estimator, X_test.values)
-                te_proba = 1.0 / (1.0 + np.exp(-np.asarray(te_logits).reshape(-1)))
-                te_pred = (te_proba >= 0.5).astype(int)
-            else:
-                te_proba, te_pred = None, None
+            te_proba, te_pred, _ = _predict_classification_outputs(
+                estimator=estimator,
+                model_type=model_type,
+                X=X_test,
+            )
 
             y_te = np.asarray(y_test).reshape(-1).astype(int)
             split_metrics["test"] = {
-                "auc": _safe_auc(y_te, te_proba) if te_proba is not None else None,
-                "auprc": _safe_auprc(y_te, te_proba) if te_proba is not None else None,
-                "accuracy": float(accuracy_score(y_te, te_pred)) if te_pred is not None else None,
-                "f1": float(f1_score(y_te, te_pred)) if te_pred is not None else None,
+                "auc": _safe_auc(y_te, te_proba),
+                "auprc": _safe_auprc(y_te, te_proba),
+                "accuracy": float(accuracy_score(y_te, te_pred)),
+                "f1": float(f1_score(y_te, te_pred)),
             }
 
             # --- VAL predictions  ---
             if X_val is not None and y_val is not None and len(y_val) > 0:
-                if model_type == "catboost_classifier":
-                    va_proba = estimator.predict_proba(X_val)[:, 1]
-                    va_pred = estimator.predict(X_val)
-                elif is_dl:
-                    va_logits = _predict_dl(estimator, X_val.values)
-                    va_proba = 1.0 / (1.0 + np.exp(-np.asarray(va_logits).reshape(-1)))
-                    va_pred = (va_proba >= 0.5).astype(int)
-                else:
-                    va_proba, va_pred = None, None
+                va_proba, va_pred, _ = _predict_classification_outputs(
+                    estimator=estimator,
+                    model_type=model_type,
+                    X=X_val,
+                )
 
                 y_va = np.asarray(y_val).reshape(-1).astype(int)
                 split_metrics["val"] = {
-                    "auc": _safe_auc(y_va, va_proba) if va_proba is not None else None,
-                    "auprc": _safe_auprc(y_va, va_proba) if va_proba is not None else None,
-                    "accuracy": float(accuracy_score(y_va, va_pred)) if va_pred is not None else None,
-                    "f1": float(f1_score(y_va, va_pred)) if va_pred is not None else None,
+                    "auc": _safe_auc(y_va, va_proba),
+                    "auprc": _safe_auprc(y_va, va_proba),
+                    "accuracy": float(accuracy_score(y_va, va_pred)),
+                    "f1": float(f1_score(y_va, va_pred)),
                 }
 
         else:
