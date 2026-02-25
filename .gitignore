@@ -44,6 +44,7 @@ coverage.xml
 /local_data/
 /config/
 /config/generated/
+/scripts/
 *.zip
 
 # CatBoost
