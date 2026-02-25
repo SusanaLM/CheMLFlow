@@ -95,6 +95,23 @@ def test_generate_doe_requires_validation_split_for_chemprop(tmp_path: Path) -> 
     assert summary["issue_counts"].get("DOE_VALIDATION_SPLIT_REQUIRED", 0) == 1
 
 
+def test_generate_doe_propagates_chemprop_legacy_split_flag(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["none"]
+    spec["search_space"]["pipeline.explain"] = [False]
+    spec["search_space"]["train.model.type"] = ["chemprop"]
+    spec["defaults"]["train.model.allow_legacy_split_positions"] = True
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 1
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["train"]["model"]["type"] == "chemprop"
+    assert config["train"]["model"]["allow_legacy_split_positions"] is True
+
+
 def test_generate_doe_skips_chemprop_with_preprocess_and_no_features(tmp_path: Path) -> None:
     spec = _base_clf_doe(tmp_path)
     spec["search_space"]["pipeline.feature_input"] = ["none"]
@@ -342,6 +359,47 @@ def test_generate_doe_validates_invalid_dedupe_strategy(tmp_path: Path) -> None:
 
     assert summary["valid_cases"] == 0
     assert summary["issue_counts"].get("DOE_CURATE_DEDUPE_INVALID", 0) == 1
+
+
+def test_generate_doe_propagates_curate_drop_controls(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["defaults"]["curate.drop_missing_smiles"] = False
+    spec["defaults"]["curate.drop_invalid_smiles"] = False
+    spec["defaults"]["curate.drop_missing_target"] = False
+    spec["defaults"]["curate.required_non_null_columns"] = "SMILES,Activity"
+
+    result = generate_doe(spec)
+    assert result["summary"]["valid_cases"] == 1
+
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    curate_cfg = config["curate"]
+    assert curate_cfg["drop_missing_smiles"] is False
+    assert curate_cfg["drop_invalid_smiles"] is False
+    assert curate_cfg["drop_missing_target"] is False
+    assert curate_cfg["required_non_null_columns"] == ["SMILES", "Activity"]
+
+
+def test_generate_doe_rejects_missing_required_non_null_columns(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["defaults"]["curate.required_non_null_columns"] = ["does_not_exist"]
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 0
+    assert summary["issue_counts"].get("DOE_CURATE_REQUIRED_COLUMNS_MISSING", 0) == 1
+
+
+def test_generate_doe_allows_required_non_null_canonical_smiles_alias(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["defaults"]["curate.required_non_null_columns"] = ["canonical_smiles", "Activity"]
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 1
+    assert summary["issue_counts"].get("DOE_CURATE_REQUIRED_COLUMNS_MISSING", 0) == 0
 
 
 def test_generate_doe_writes_spec_snapshot_and_hash(tmp_path: Path) -> None:

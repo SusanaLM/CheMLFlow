@@ -6,6 +6,8 @@ import pandas as pd
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 
+ROW_INDEX_COL = "__row_index"
+
 
 class RDKitDescriptorCalculator:
     """Calculate RDKit descriptors and attach label columns."""
@@ -75,19 +77,31 @@ def main(
 
     calculator = RDKitDescriptorCalculator(input_file, output_file)
     df = calculator.load_data()
+    if ROW_INDEX_COL not in df.columns:
+        df[ROW_INDEX_COL] = df.index.astype(int)
+    else:
+        df[ROW_INDEX_COL] = pd.to_numeric(df[ROW_INDEX_COL], errors="raise").astype(int)
 
     smiles_list = df["canonical_smiles"].astype(str).tolist()
     descriptors_df = calculator.calculate_descriptors(smiles_list)
+    descriptors_df[ROW_INDEX_COL] = df[ROW_INDEX_COL].tolist()
 
     calculator.save_descriptors(descriptors_df)
 
     if labeled_output_file:
         labels = df[[c for c in property_columns if c in df.columns]].copy()
+        labels[ROW_INDEX_COL] = df[ROW_INDEX_COL].tolist()
         if labels.empty:
             logging.warning("No property columns found in input; labeled output will include descriptors only.")
             combined = descriptors_df
         else:
-            combined = pd.concat([descriptors_df, labels], axis=1)
+            combined = pd.concat(
+                [
+                    descriptors_df.reset_index(drop=True),
+                    labels.reset_index(drop=True).drop(columns=[ROW_INDEX_COL]),
+                ],
+                axis=1,
+            )
         combined.to_csv(labeled_output_file, index=False)
         logging.info(f"Labeled descriptors saved to {labeled_output_file}")
 

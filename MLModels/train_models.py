@@ -31,6 +31,8 @@ from sklearn.metrics import (
 )
 from sklearn.inspection import permutation_importance
 
+_ROW_INDEX_COL = "__row_index"
+
 
 @dataclass
 class TrainResult:
@@ -662,6 +664,99 @@ def _resolve_chemprop_foundation_config(model_config: Dict[str, Any]) -> tuple[s
     return foundation, checkpoint_path, freeze_encoder
 
 
+def _resolve_chemprop_split_positions(
+    curated_df: pd.DataFrame,
+    split_indices: Dict[str, Any],
+    row_index_col: str = _ROW_INDEX_COL,
+    allow_legacy_positions: bool = False,
+) -> tuple[list[int], list[int], list[int], list[int]]:
+    """Resolve split membership to positional indices for Chemprop.
+
+    Preferred mode:
+    - split indices are row IDs that match ``row_index_col`` values.
+
+    Optional backward-compatible fallback:
+    - if ``allow_legacy_positions`` is true and row-ID mapping fails but all
+      indices are valid row positions, treat them as legacy positional indices.
+    """
+
+    def _to_int_list(split_name: str, values: Any) -> list[int]:
+        out: list[int] = []
+        for value in values or []:
+            try:
+                out.append(int(value))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"split.{split_name} contains a non-integer index value: {value!r}."
+                ) from exc
+        return out
+
+    train_raw = _to_int_list("train", split_indices.get("train", []))
+    val_raw = _to_int_list("val", split_indices.get("val", []))
+    test_raw = _to_int_list("test", split_indices.get("test", []))
+    if not test_raw and val_raw:
+        test_raw, val_raw = val_raw, []
+
+    n_rows = int(len(curated_df))
+    if row_index_col in curated_df.columns:
+        row_id_series = pd.to_numeric(curated_df[row_index_col], errors="coerce")
+        if row_id_series.isna().any():
+            raise ValueError(
+                f"Curated data contains non-numeric {row_index_col!r} values; cannot map split row IDs."
+            )
+        row_ids = [int(v) for v in row_id_series.tolist()]
+    else:
+        row_ids = list(range(n_rows))
+
+    if len(set(row_ids)) != len(row_ids):
+        raise ValueError(
+            f"Curated data contains duplicate {row_index_col!r} values; split row-ID mapping is ambiguous."
+        )
+
+    id_to_pos = {rid: pos for pos, rid in enumerate(row_ids)}
+
+    def _map_row_ids(raw_ids: list[int]) -> tuple[list[int], list[int]]:
+        mapped: list[int] = []
+        missing: list[int] = []
+        for rid in raw_ids:
+            pos = id_to_pos.get(rid)
+            if pos is None:
+                missing.append(rid)
+            else:
+                mapped.append(int(pos))
+        return mapped, missing
+
+    train_pos, missing_train = _map_row_ids(train_raw)
+    val_pos, missing_val = _map_row_ids(val_raw)
+    test_pos, missing_test = _map_row_ids(test_raw)
+
+    missing_total = len(missing_train) + len(missing_val) + len(missing_test)
+    if missing_total > 0:
+        all_raw = train_raw + val_raw + test_raw
+        looks_like_legacy_positions = all(0 <= idx < n_rows for idx in all_raw)
+        if looks_like_legacy_positions and allow_legacy_positions:
+            logging.warning(
+                "Chemprop split indices did not match %s values; treating them as legacy positional indices.",
+                row_index_col,
+            )
+            train_pos, val_pos, test_pos = train_raw, val_raw, test_raw
+        else:
+            legacy_hint = ""
+            if looks_like_legacy_positions:
+                legacy_hint = (
+                    " Indices look like legacy positional indices; regenerate splits with row IDs "
+                    f"or set train.model.allow_legacy_split_positions=true to opt in."
+                )
+            raise ValueError(
+                "Chemprop split indices do not match curated row IDs. "
+                f"row_index_column={row_index_col!r} "
+                f"missing(train/val/test)=({missing_train[:10]}, {missing_val[:10]}, {missing_test[:10]})."
+                f"{legacy_hint}"
+            )
+
+    return train_pos, val_pos, test_pos, row_ids
+
+
 def train_chemprop_model(
     curated_df: pd.DataFrame,
     target_column: str,
@@ -699,18 +794,14 @@ def train_chemprop_model(
     if target_column not in curated_df.columns:
         raise ValueError(f"Target column {target_column!r} not found in curated_df.")
 
-    y_all = _ensure_binary_labels(curated_df[target_column])
-    # Keep a stable row_id (0..N-1) for joining predictions to the curated dataset.
     df = curated_df.reset_index(drop=True).copy()
-    df["_row_id"] = df.index.astype(int)
-    df["_label"] = y_all.reset_index(drop=True).astype(int)
-
-    # Split indices are defined over curated_df row positions.
-    tr_idx = [int(i) for i in split_indices.get("train", [])]
-    va_idx = [int(i) for i in split_indices.get("val", [])]
-    te_idx = [int(i) for i in split_indices.get("test", [])]
-    if not te_idx and va_idx:
-        te_idx, va_idx = va_idx, []
+    allow_legacy_split_positions = _as_bool(model_config.get("allow_legacy_split_positions", False))
+    tr_idx, va_idx, te_idx, row_ids = _resolve_chemprop_split_positions(
+        df,
+        split_indices,
+        row_index_col=_ROW_INDEX_COL,
+        allow_legacy_positions=allow_legacy_split_positions,
+    )
     if not tr_idx or not te_idx:
         raise ValueError("chemprop training requires non-empty train and test splits.")
     if not va_idx:
@@ -718,6 +809,10 @@ def train_chemprop_model(
             "chemprop training requires an explicit validation split from the split node. "
             "Set split.val_size > 0."
         )
+    y_all = _ensure_binary_labels(df[target_column])
+    # Keep stable row identifiers for prediction joins/debugging.
+    df["_row_id"] = row_ids
+    df["_label"] = y_all.reset_index(drop=True).astype(int)
 
     # Hyperparameters.
     params = dict(model_config.get("params", {}))

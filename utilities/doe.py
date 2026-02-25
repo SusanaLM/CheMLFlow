@@ -622,15 +622,15 @@ def _build_pipeline_nodes(
         nodes.extend(["featurize.lipinski", "label.ic50"])
     elif label_normalize_enabled:
         nodes.append("label.normalize")
+
+    if feature_input != "none":
+        nodes.append(feature_input)
     nodes.append("split")
 
     if analyze_stats_enabled:
         nodes.append("analyze.stats")
     if analyze_eda_enabled:
         nodes.append("analyze.eda")
-
-    if feature_input != "none":
-        nodes.append(feature_input)
     if preprocess_enabled:
         nodes.append("preprocess.features")
     if select_enabled:
@@ -790,6 +790,19 @@ def _build_case_config(
             curate_cfg["keep_all_columns"] = True
         elif profile.name == "reg_chembl_ic50":
             curate_cfg["keep_all_columns"] = True
+        for bool_key in ("drop_missing_smiles", "drop_invalid_smiles", "drop_missing_target"):
+            merged_key = f"curate.{bool_key}"
+            if merged_key in merged:
+                curate_cfg[bool_key] = _as_bool(merged[merged_key])
+            elif bool_key in dataset_curate:
+                curate_cfg[bool_key] = _as_bool(dataset_curate.get(bool_key))
+        raw_required_non_null = merged.get(
+            "curate.required_non_null_columns",
+            dataset_curate.get("required_non_null_columns"),
+        )
+        required_non_null = _as_str_list(raw_required_non_null)
+        if required_non_null:
+            curate_cfg["required_non_null_columns"] = required_non_null
         config["curate"] = curate_cfg
 
     if "label.normalize" in nodes:
@@ -894,6 +907,7 @@ def _build_case_config(
             "train.model.foundation_checkpoint",
             "train.model.freeze_encoder",
             "train.model.smiles_column",
+            "train.model.allow_legacy_split_positions",
         ):
             if passthrough in merged:
                 key = passthrough.removeprefix("train.model.")
@@ -1266,6 +1280,8 @@ def _validate_case(
 
     columns = set(str(col) for col in probe.get("columns", []))
     if columns:
+        resolved_smiles_probe = probe.get("resolved_smiles_column")
+        resolved_smiles_column = str(resolved_smiles_probe).strip() if resolved_smiles_probe else ""
         if task_type == "regression" and profile.default_source == "local_csv" and not profile.supports_label_ic50:
             target_column = str(_get_dotted(config, "global.target_column", "")).strip()
             if not target_column or target_column not in columns:
@@ -1299,7 +1315,7 @@ def _validate_case(
                             f"Configure curate.keep_all_columns=true, curate.label_column={target_column!r}, "
                             f"or include {target_column!r} in curate.properties."
                         ),
-                    )
+                )
         smiles_column = str(_get_dotted(config, "curate.smiles_column", "")).strip()
         if smiles_column and smiles_column not in columns:
             _add_issue(
@@ -1309,10 +1325,6 @@ def _validate_case(
                 message=f"Configured smiles column {smiles_column!r} was not found in the dataset.",
             )
         elif source_type == "local_csv" and not smiles_column:
-            resolved_smiles = probe.get("resolved_smiles_column")
-            resolved_smiles_column = ""
-            if resolved_smiles is not None:
-                resolved_smiles_column = str(resolved_smiles).strip()
             if not resolved_smiles_column:
                 _add_issue(
                     issues,
@@ -1321,6 +1333,43 @@ def _validate_case(
                     message=(
                         "No SMILES column could be resolved for local_csv data. "
                         "Set dataset.smiles_column/curate.smiles_column explicitly."
+                    ),
+                )
+        required_non_null = _as_str_list(_get_dotted(config, "curate.required_non_null_columns", []))
+        if required_non_null:
+            smiles_for_normalization = smiles_column or resolved_smiles_column
+            normalized_required: list[str] = []
+            for col in required_non_null:
+                normalized = str(col).strip()
+                if not normalized:
+                    continue
+                if (
+                    smiles_for_normalization
+                    and smiles_for_normalization != "canonical_smiles"
+                    and normalized == smiles_for_normalization
+                ):
+                    normalized = "canonical_smiles"
+                if normalized not in normalized_required:
+                    normalized_required.append(normalized)
+
+            missing_required: list[str] = []
+            for col in normalized_required:
+                if col == "canonical_smiles":
+                    if col in columns:
+                        continue
+                    if smiles_for_normalization and smiles_for_normalization in columns:
+                        continue
+                elif col in columns:
+                    continue
+                missing_required.append(col)
+            if missing_required:
+                _add_issue(
+                    issues,
+                    code="DOE_CURATE_REQUIRED_COLUMNS_MISSING",
+                    path="curate.required_non_null_columns",
+                    message=(
+                        "curate.required_non_null_columns contains columns missing from dataset: "
+                        + ", ".join(missing_required)
                     ),
                 )
         if task_type == "classification" and "label.normalize" in nodes:

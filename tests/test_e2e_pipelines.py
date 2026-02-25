@@ -69,7 +69,7 @@ def test_e2e_qm9_fast(tmp_path: Path) -> None:
             "thresholds": {"active": 1000, "inactive": 10000},
             "run_dir": str(run_dir),
         },
-        "pipeline": {"nodes": ["get_data", "curate", "split", "featurize.rdkit", "train"]},
+        "pipeline": {"nodes": ["get_data", "curate", "featurize.rdkit", "split", "train"]},
         "get_data": {
             "data_source": "local_csv",
             "source": {"path": str(FIXTURES / "qm9_small.csv")},
@@ -106,7 +106,7 @@ def test_e2e_ara_fast(tmp_path: Path) -> None:
             "run_dir": str(run_dir),
         },
         "pipeline": {
-            "nodes": ["get_data", "curate", "label.normalize", "split", "featurize.morgan", "train"]
+            "nodes": ["get_data", "curate", "label.normalize", "featurize.morgan", "split", "train"]
         },
         "get_data": {
             "data_source": "local_csv",
@@ -165,7 +165,7 @@ def test_e2e_pgp_fast(tmp_path: Path) -> None:
             "run_dir": str(run_dir),
         },
         "pipeline": {
-            "nodes": ["get_data", "curate", "label.normalize", "split", "featurize.morgan", "train"]
+            "nodes": ["get_data", "curate", "label.normalize", "featurize.morgan", "split", "train"]
         },
         "get_data": {
             "data_source": "local_csv",
@@ -297,7 +297,7 @@ def test_e2e_flash_fast(tmp_path: Path) -> None:
             "run_dir": str(run_dir),
         },
         "pipeline": {
-            "nodes": ["get_data", "curate", "split", "featurize.none", "train"]
+            "nodes": ["get_data", "curate", "featurize.none", "split", "train"]
         },
         "get_data": {
             "data_source": "local_csv",
@@ -341,7 +341,7 @@ def test_e2e_ysi_fast(tmp_path: Path) -> None:
             "thresholds": {"active": 1000, "inactive": 10000},
             "run_dir": str(run_dir),
         },
-        "pipeline": {"nodes": ["get_data", "curate", "split", "featurize.rdkit", "train"]},
+        "pipeline": {"nodes": ["get_data", "curate", "featurize.rdkit", "split", "train"]},
         "get_data": {
             "data_source": "local_csv",
             "source": {"path": str(FIXTURES / "ysi_small.csv")},
@@ -381,7 +381,7 @@ def test_e2e_pah_fast(tmp_path: Path) -> None:
             "thresholds": {"active": 1000, "inactive": 10000},
             "run_dir": str(run_dir),
         },
-        "pipeline": {"nodes": ["get_data", "curate", "split", "featurize.rdkit", "train"]},
+        "pipeline": {"nodes": ["get_data", "curate", "featurize.rdkit", "split", "train"]},
         "get_data": {
             "data_source": "local_csv",
             "source": {"path": str(FIXTURES / "pah_small.csv")},

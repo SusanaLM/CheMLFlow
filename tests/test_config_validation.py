@@ -63,3 +63,30 @@ def test_strict_rejects_legacy_preprocess_keys() -> None:
     issues = collect_config_issues(cfg, ["preprocess.features"])
     codes = {issue.code for issue in issues}
     assert "CFG_LEGACY_PREPROCESS_KEY_FORBIDDEN" in codes
+
+
+def test_strict_requires_feature_input_node_for_preprocess() -> None:
+    cfg = _base_config(["split", "preprocess.features"])
+    cfg["split"] = {"strategy": "random"}
+    cfg["preprocess"] = {}
+    issues = collect_config_issues(cfg, ["split", "preprocess.features"])
+    codes = {issue.code for issue in issues}
+    assert "CFG_FEATURE_INPUT_NODE_REQUIRED" in codes
+
+
+def test_strict_requires_feature_input_node_for_non_chemprop_train() -> None:
+    cfg = _base_config(["split", "train"])
+    cfg["split"] = {"strategy": "random"}
+    cfg["train"] = {"model": {"type": "random_forest"}}
+    issues = collect_config_issues(cfg, ["split", "train"])
+    codes = {issue.code for issue in issues}
+    assert "CFG_FEATURE_INPUT_NODE_REQUIRED" in codes
+
+
+def test_strict_allows_train_without_feature_node_for_chemprop() -> None:
+    cfg = _base_config(["split", "train"])
+    cfg["split"] = {"strategy": "random"}
+    cfg["train"] = {"model": {"type": "chemprop"}}
+    issues = collect_config_issues(cfg, ["split", "train"])
+    codes = {issue.code for issue in issues}
+    assert "CFG_FEATURE_INPUT_NODE_REQUIRED" not in codes

@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from main import _resolve_split_partitions, build_paths, run_node_split
+from main import _resolve_feature_inputs, _resolve_split_partitions, build_paths, run_node_split
 
 
 def _make_curated_df(n_rows: int = 60) -> pd.DataFrame:
@@ -216,3 +216,151 @@ def test_holdout_split_uses_global_seed_when_split_seed_missing(tmp_path: Path) 
     assert ctx_a["split_indices"] == ctx_b["split_indices"]
     assert int(ctx_a["split_meta"]["random_state"]) == 777
     assert int(ctx_b["split_meta"]["random_state"]) == 777
+
+
+def test_split_skips_stale_default_feature_files_without_explicit_feature_node(tmp_path: Path) -> None:
+    curated_df = _make_curated_df(20)
+    split_cfg = {
+        "mode": "holdout",
+        "strategy": "random",
+        "test_size": 0.2,
+        "val_size": 0.1,
+        "stratify": False,
+    }
+    ctx = _build_context(
+        tmp_path,
+        split_config=split_cfg,
+        curated_df=curated_df,
+        run_name="run_no_feature_input",
+        base_name="shared_no_feature_input_data",
+    )
+    ctx["pipeline_nodes"] = ["get_data", "curate", "split", "train"]
+
+    stale_features = pd.DataFrame(
+        {
+            "__row_index": [0, 1, 2, 3, 4],
+            "f1": [1, 2, 3, 4, 5],
+        }
+    )
+    stale_labels = pd.DataFrame(
+        {
+            "__row_index": [0, 1, 2, 3, 4],
+            "label": [0, 1, 0, 1, 0],
+        }
+    )
+    pd.DataFrame(stale_features).to_csv(ctx["paths"]["rdkit_descriptors"], index=False)
+    pd.DataFrame(stale_labels).to_csv(ctx["paths"]["pic50_3class"], index=False)
+
+    run_node_split(ctx)
+
+    assert ctx["split_meta"]["split_source"] == "curated_no_explicit_feature_input"
+    assert int(ctx["split_meta"]["dataset_rows"]) == len(curated_df)
+
+
+def test_split_rejects_duplicate_row_index_values(tmp_path: Path) -> None:
+    curated_df = _make_curated_df(12)
+    curated_df["__row_index"] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 11]
+    split_cfg = {
+        "mode": "holdout",
+        "strategy": "random",
+        "test_size": 0.2,
+        "val_size": 0.1,
+        "stratify": False,
+    }
+    ctx = _build_context(
+        tmp_path,
+        split_config=split_cfg,
+        curated_df=curated_df,
+        run_name="run_duplicate_row_index",
+        base_name="shared_duplicate_row_index_data",
+    )
+    with pytest.raises(ValueError, match="must be unique"):
+        run_node_split(ctx)
+
+
+def test_split_rejects_non_integer_row_index_values(tmp_path: Path) -> None:
+    curated_df = _make_curated_df(12)
+    curated_df["__row_index"] = [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10.5",
+        "11",
+    ]
+    split_cfg = {
+        "mode": "holdout",
+        "strategy": "random",
+        "test_size": 0.2,
+        "val_size": 0.1,
+        "stratify": False,
+    }
+    ctx = _build_context(
+        tmp_path,
+        split_config=split_cfg,
+        curated_df=curated_df,
+        run_name="run_non_integer_row_index",
+        base_name="shared_non_integer_row_index_data",
+    )
+    with pytest.raises(ValueError, match="integer-like"):
+        run_node_split(ctx)
+
+
+def test_split_rejects_feature_cleaned_row_id_mismatch(tmp_path: Path) -> None:
+    curated_df = _make_curated_df(20)
+    curated_df["__row_index"] = list(range(100, 120))
+    split_cfg = {
+        "mode": "holdout",
+        "strategy": "random",
+        "test_size": 0.2,
+        "val_size": 0.1,
+        "stratify": False,
+    }
+    ctx = _build_context(
+        tmp_path,
+        split_config=split_cfg,
+        curated_df=curated_df,
+        run_name="run_row_id_mismatch",
+        base_name="shared_row_id_mismatch_data",
+    )
+    ctx["pipeline_nodes"] = ["get_data", "curate", "featurize.rdkit", "split", "train"]
+
+    pd.DataFrame(
+        {
+            "__row_index": list(range(20)),
+            "f1": list(range(20)),
+            "f2": [v + 1 for v in range(20)],
+        }
+    ).to_csv(ctx["paths"]["rdkit_descriptors"], index=False)
+    pd.DataFrame(
+        {
+            "__row_index": list(range(20)),
+            "label": [i % 2 for i in range(20)],
+        }
+    ).to_csv(ctx["paths"]["pic50_3class"], index=False)
+
+    with pytest.raises(ValueError, match="not present in curated row-id universe"):
+        run_node_split(ctx)
+
+
+def test_resolve_feature_inputs_prefers_curated_path_for_missing_labels() -> None:
+    context = {
+        "feature_matrix": "features.csv",
+        "labels_matrix": None,
+        "curated_path": "curated_latest.csv",
+        "paths": {
+            "curated": "curated_default.csv",
+            "rdkit_descriptors": "rdkit.csv",
+            "pic50_3class": "labels.csv",
+            "rdkit_labeled": "rdkit_labeled.csv",
+        },
+    }
+    features_file, labels_file = _resolve_feature_inputs(context)
+    assert features_file == "features.csv"
+    assert labels_file == "curated_latest.csv"

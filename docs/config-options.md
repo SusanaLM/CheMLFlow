@@ -90,8 +90,8 @@ pipeline:
   nodes:
     - get_data
     - curate
-    - split
     - featurize.morgan
+    - split
     - train
 ```
 
@@ -113,7 +113,7 @@ pipeline:
 - Only one `train.tdc` node allowed per pipeline.
 - `train` and `train.tdc` cannot both be in the same pipeline.
 - If using `train.tdc`, it must be the last node.
-- `split` must come **after** any of: `curate`, `label.normalize`, `label.ic50`.
+- `split` must come **after** any of: `curate`, `label.normalize`, `label.ic50`, `featurize.none`, `featurize.lipinski`, `featurize.rdkit`, `featurize.rdkit_labeled`, `featurize.morgan`.
 - `split` must come **before** any of: `preprocess.features`, `select.features`, `train`, `explain`.
 
 ## `get_data` Block
@@ -164,6 +164,10 @@ Controls how raw data is cleaned and standardized.
 curate:
   smiles_column: SMILES
   dedupe_strategy: keep_first
+  drop_missing_smiles: true
+  drop_invalid_smiles: true
+  drop_missing_target: true
+  required_non_null_columns: Name, FP Exp.
   keep_all_columns: true
 ```
 
@@ -175,6 +179,10 @@ curate:
 | `smiles_column` | (auto-detect) | Name of the SMILES column in raw data. |
 | `dedupe_strategy` | (none) | How to handle duplicate SMILES: `keep_first`/`first`, `keep_last`/`last`, `drop_conflicts`, or `majority`. |
 | `label_column` | `target_column` | Label column for classification tasks. |
+| `drop_missing_smiles` | `true` | When `true`, drops raw rows where the detected SMILES column is null. |
+| `drop_invalid_smiles` | `true` | When `true`, drops rows that fail SMILES sanitization/canonicalization. |
+| `drop_missing_target` | `true` | When `true`, drops rows with null values in `global.target_column` if that column exists during curate. |
+| `required_non_null_columns` | (none) | Optional list or comma-separated string of columns that must be non-null; rows missing values in any listed column are dropped. |
 | `require_neutral_charge` | `false` | When `true`, removes molecules with net charge. |
 | `prefer_largest_fragment` | `true` | When `true`, keeps only the largest fragment of multi-fragment molecules. |
 | `keep_all_columns` | `false` | When `true`, preserves all source columns through curation. When `false`, only essential columns (SMILES, target) are kept. |
@@ -543,7 +551,7 @@ Each run with a `split` node writes two files:
   "test": [4, 6, 9, ...]
 }
 ```
-Row indices into the curated dataset for each split.
+Row IDs into the split dataset universe (after pre-split cleaning). If curated/features include `__row_index`, IDs map by that value; otherwise they map by curated row order.
 
 **`<run_dir>/split_meta.json`**
 ```json

@@ -42,6 +42,7 @@ coverage.xml
 /runs/
 /urease/
 /local_data/
+/config/
 /config/generated/
 *.zip
 

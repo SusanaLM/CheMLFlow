@@ -1,6 +1,5 @@
 # data_preprocessing.py
 import os
-import sys
 import logging
 import numpy as np
 import pandas as pd
@@ -47,8 +46,8 @@ def load_data(features_file: str, labels_file: str):
         logging.info(f"Data shape after initial cleaning: {X_clean.shape}")
         return X_clean, y_clean
     except Exception as e:
-        logging.error(f"Error loading data: {e}")
-        sys.exit(1)
+        logging.error(f"Error loading data: {e}", exc_info=True)
+        raise
 
 # ── 2) Preprocess ──────────────────────────────────────────────────────────────
 def preprocess_data(
@@ -100,8 +99,8 @@ def preprocess_data(
 
         return X_final
     except Exception as e:
-        logging.error(f"Error during data preprocessing: {e}")
-        sys.exit(1)
+        logging.error(f"Error during data preprocessing: {e}", exc_info=True)
+        raise
 
 
 def fit_preprocessor(
@@ -186,8 +185,8 @@ def select_stable_features(X: pd.DataFrame,
 
         return X_sel
     except Exception as e:
-        logging.error(f"Error during stable feature selection: {e}")
-        sys.exit(1)
+        logging.error(f"Error during stable feature selection: {e}", exc_info=True)
+        raise
 
 
 def _find_target_column(columns: Iterable[str], target_column: str) -> tuple[str, int]:
@@ -230,6 +229,12 @@ def load_features_labels(
     target_column: str,
     categorical_features: Sequence[str] | None = None,
     exclude_columns: Sequence[str] | None = None,
+    restrict_to_indices: Sequence[int] | None = None,
+    *,
+    drop_invalid_rows: bool = True,
+    drop_duplicate_rows: bool = True,
+    fail_on_invalid_rows: bool = False,
+    fail_on_duplicate_rows: bool = False,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """Load features and labels, align them, and drop duplicates and target columns."""
     try:
@@ -252,6 +257,19 @@ def load_features_labels(
         y = select_target_series(y_df, target_column)
         if not X.index.equals(y.index):
             y = y.reindex(X.index)
+        if restrict_to_indices is not None:
+            requested_indices = [int(i) for i in restrict_to_indices]
+            if requested_indices:
+                available_index = set(X.index.tolist()) & set(y.index.tolist())
+                missing = [i for i in requested_indices if i not in available_index]
+                if missing:
+                    preview = missing[:10]
+                    raise ValueError(
+                        "Feature/label files are missing split rows. "
+                        f"missing_count={len(missing)} preview={preview}"
+                    )
+                X = X.reindex(requested_indices)
+                y = y.reindex(requested_indices)
         if y.dtype == object:
             y_num = pd.to_numeric(y, errors="coerce")
             if y_num.notna().sum() >= 0.9 * y.notna().sum():
@@ -286,15 +304,29 @@ def load_features_labels(
         X.replace([np.inf, -np.inf], np.nan, inplace=True)
         y.replace([np.inf, -np.inf], np.nan, inplace=True)
         valid_mask = ~X.isna().any(axis=1) & ~y.isna()
+        invalid_rows = int((~valid_mask).sum())
+        if invalid_rows:
+            if not drop_invalid_rows and fail_on_invalid_rows:
+                raise ValueError(
+                    f"Found {invalid_rows} row(s) with NaN/Inf after feature coercion. "
+                    "Set curate/pre-split cleaning so rows are filtered before split."
+                )
+            if drop_invalid_rows:
+                logging.info("Dropping %s invalid row(s) with NaN/Inf in features/labels.", invalid_rows)
+                X = X[valid_mask]
+                y = y[valid_mask]
 
-        X_clean = X[valid_mask]
-        y_clean = y[valid_mask]
-
-        combined = pd.concat([X_clean, y_clean], axis=1)
-        combined_before = combined.shape[0]
-        combined = combined.drop_duplicates()
-        combined_after = combined.shape[0]
-        logging.info(f"Removed {combined_before - combined_after} duplicate entries.")
+        combined = pd.concat([X, y], axis=1)
+        duplicate_rows = int(combined.duplicated().sum())
+        if duplicate_rows:
+            if not drop_duplicate_rows and fail_on_duplicate_rows:
+                raise ValueError(
+                    f"Found {duplicate_rows} duplicate row(s) after alignment. "
+                    "Set curate/pre-split cleaning so duplicates are removed before split."
+                )
+            if drop_duplicate_rows:
+                combined = combined.drop_duplicates()
+                logging.info("Removed %s duplicate entries.", duplicate_rows)
 
         X_clean = combined.drop(columns=[target_col])
         y_clean = combined[target_col]
@@ -302,8 +334,8 @@ def load_features_labels(
         logging.info(f"Data shape after initial cleaning: {X_clean.shape}")
         return X_clean, y_clean
     except Exception as e:
-        logging.error(f"Error loading data: {e}")
-        sys.exit(1)
+        logging.error(f"Error loading data: {e}", exc_info=True)
+        raise
 
 # ── 4) Data quality ───────────────────────────────────────────────────────────
 def verify_data_quality(X: pd.DataFrame, y: pd.Series):
