@@ -2,6 +2,7 @@ import sys
 import types
 
 import numpy as np
+import pandas as pd
 
 from MLModels import train_models
 
@@ -138,3 +139,84 @@ def test_run_optuna_seeds_before_model_construction(monkeypatch) -> None:
     assert best_model_a["draw"] == best_model_b["draw"]
     assert seed_calls == [124, 125, 124, 125]
     assert len(model_draws) == 4
+
+
+def test_train_model_dl_fixed_respects_model_params(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeDlModel:
+        def __init__(self, params: dict[str, object]) -> None:
+            self.params = dict(params)
+
+        def state_dict(self) -> dict[str, object]:
+            return {}
+
+    cfg = train_models.DLSearchConfig(
+        model_class=_FakeDlModel,
+        search_space={},
+        default_params={
+            "epochs": 20,
+            "batch_size": 32,
+            "learning_rate": 1e-3,
+            "hidden_dim": 64,
+            "num_layers": 2,
+            "dropout": 0.1,
+            "task_type": "regression",
+        },
+    )
+
+    monkeypatch.setattr(train_models, "_initialize_model", lambda *args, **kwargs: cfg)
+    monkeypatch.setattr(train_models, "_seed_dl_runtime", lambda _seed: None)
+
+    def _fake_train_dl(
+        model,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        epochs,
+        batch_size,
+        learning_rate,
+        patience,
+        random_state,
+        task_type,
+    ):
+        _ = (X_train, y_train, X_val, y_val, patience, random_state, task_type)
+        captured["model_params"] = dict(model.params)
+        captured["epochs"] = int(epochs)
+        captured["batch_size"] = int(batch_size)
+        captured["learning_rate"] = float(learning_rate)
+        return {"model": model, "best_params": {"epochs": int(epochs)}}
+
+    monkeypatch.setattr(train_models, "_train_dl", _fake_train_dl)
+    monkeypatch.setattr(train_models, "_predict_dl", lambda model, X: np.zeros(len(X), dtype=float))
+
+    X = pd.DataFrame(np.ones((16, 4), dtype=float), columns=["f0", "f1", "f2", "f3"])
+    y = pd.Series(np.linspace(0.0, 1.0, num=16))
+    X_train, X_val, X_test = X.iloc[:8], X.iloc[8:12], X.iloc[12:]
+    y_train, y_val, y_test = y.iloc[:8], y.iloc[8:12], y.iloc[12:]
+
+    train_models.train_model(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        model_type="dl_simple",
+        output_dir=str(tmp_path),
+        task_type="regression",
+        model_config={
+            "params": {
+                "epochs": 3,
+                "batch_size": 7,
+                "learning_rate": 0.02,
+                "hidden_dim": 17,
+            }
+        },
+        X_val=X_val,
+        y_val=y_val,
+    )
+
+    assert captured["epochs"] == 3
+    assert captured["batch_size"] == 7
+    assert captured["learning_rate"] == 0.02
+    assert captured["model_params"]["hidden_dim"] == 17
