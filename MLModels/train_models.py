@@ -2025,6 +2025,9 @@ def train_model(
         if y_val is not None:
             y_val = _ensure_binary_labels(y_val)
 
+    if task_type == "regression" and model_type == "catboost_classifier":
+        raise ValueError("Model type 'catboost_classifier' only supports classification tasks.")
+
     if task_type == "classification" and model_type == "catboost_classifier":
         from catboost import CatBoostClassifier
 
@@ -2166,18 +2169,19 @@ def train_model(
                 task_type=task_type,
             )
         else:
-            logging.info(f"Training DL model: {model_type} (default params)")
+            effective_params = {**model.default_params, **model_params}
+            logging.info(f"Training DL model: {model_type} (fixed params)")
             _seed_dl_runtime(int(random_state))
-            nn_model = model.model_class(model.default_params)
+            nn_model = model.model_class(effective_params)
             result = _train_dl(
                 nn_model,
                 X_train.values,
                 y_train.values,
                 X_val.values,
                 y_val.values,
-                epochs=model.default_params["epochs"],
-                batch_size=model.default_params["batch_size"],
-                learning_rate=model.default_params["learning_rate"],
+                epochs=effective_params["epochs"],
+                batch_size=effective_params["batch_size"],
+                learning_rate=effective_params["learning_rate"],
                 patience=patience,
                 random_state=random_state,
                 task_type=task_type,
@@ -2237,6 +2241,7 @@ def train_model(
         split_metrics: Dict[str, Dict[str, float | None]] = {}
 
         if task_type == "classification":
+            split_outputs: Dict[str, Dict[str, Any]] = {}
             # --- TRAIN predictions ---
             tr_proba, tr_pred, _ = _predict_classification_outputs(
                 estimator=estimator,
@@ -2250,6 +2255,11 @@ def train_model(
                 "auprc": _safe_auprc(y_tr, tr_proba),
                 "accuracy": float(accuracy_score(y_tr, tr_pred)),
                 "f1": float(f1_score(y_tr, tr_pred)),
+            }
+            split_outputs["train"] = {
+                "y_true": y_tr,
+                "y_proba": tr_proba,
+                "y_pred": tr_pred,
             }
 
             # --- TEST predictions ---
@@ -2266,6 +2276,11 @@ def train_model(
                 "accuracy": float(accuracy_score(y_te, te_pred)),
                 "f1": float(f1_score(y_te, te_pred)),
             }
+            split_outputs["test"] = {
+                "y_true": y_te,
+                "y_proba": te_proba,
+                "y_pred": te_pred,
+            }
 
             # --- VAL predictions  ---
             if X_val is not None and y_val is not None and len(y_val) > 0:
@@ -2281,6 +2296,11 @@ def train_model(
                     "auprc": _safe_auprc(y_va, va_proba),
                     "accuracy": float(accuracy_score(y_va, va_pred)),
                     "f1": float(f1_score(y_va, va_pred)),
+                }
+                split_outputs["val"] = {
+                    "y_true": y_va,
+                    "y_proba": va_proba,
+                    "y_pred": va_pred,
                 }
 
         else:
@@ -2307,17 +2327,20 @@ def train_model(
         if split_plot_path:
             metrics["split_metrics_plot_path"] = split_plot_path
 
-        parity_paths = _save_regression_parity_plots(
-            output_dir,
-            model_type,
-            {
-                "train": (y_train, y_train_pred),
-                "test": (y_test, y_test_pred),
-                "val": (y_val, y_val_pred),
-            },
-        )
-        for split_name, path in parity_paths.items():
-            metrics[f"parity_plot_{split_name}_path"] = path
+        if task_type == "classification":
+            metrics.update(_save_classification_split_plots(output_dir, model_type, split_outputs))
+        else:
+            parity_paths = _save_regression_parity_plots(
+                output_dir,
+                model_type,
+                {
+                    "train": (y_train, y_train_pred),
+                    "test": (y_test, y_test_pred),
+                    "val": (y_val, y_val_pred),
+                },
+            )
+            for split_name, path in parity_paths.items():
+                metrics[f"parity_plot_{split_name}_path"] = path
 
     params_path = os.path.join(output_dir, f"{model_type}_best_params.pkl")
     metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")

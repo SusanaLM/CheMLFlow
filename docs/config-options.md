@@ -409,13 +409,14 @@ train:
 | Regression (DL) | `dl_simple`, `dl_deep`, `dl_gru`, `dl_resmlp`, `dl_tabtransformer`, `dl_aereg` |
 | Regression (SMILES-native) | `chemprop` |
 | Classification | `random_forest`, `decision_tree`, `xgboost`, `svm`, `ensemble`, `catboost_classifier` |
+| Classification (DL) | `dl_simple`, `dl_deep`, `dl_gru`, `dl_resmlp`, `dl_tabtransformer`, `dl_aereg` |
 | Classification (SMILES-native) | `chemprop` |
 
 **General keys:**
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `train.model.params` | `{}` | Model-specific hyperparameters (passed to the underlying model). |
+| `train.model.params` | `{}` | Model-specific hyperparameters passed to fixed and `train_cv` training paths. |
 | `train.model.n_jobs` | `-1` | Parallelism for sklearn/joblib. Use `1` to disable parallelism. |
 
 **Chemprop-specific keys:**

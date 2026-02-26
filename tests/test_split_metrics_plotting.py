@@ -207,13 +207,19 @@ def test_train_model_supports_classification_for_tabular_models(tmp_path, model_
         cv_folds=2,
         search_iters=1,
         task_type="classification",
-        model_config={"n_jobs": 1, "params": params_by_model[model_type]},
+        model_config={
+            "n_jobs": 1,
+            "plot_split_performance": True,
+            "params": params_by_model[model_type],
+        },
         X_val=X_val,
         y_val=y_val,
     )
 
     metrics = json.loads(Path(train_result.metrics_path).read_text(encoding="utf-8"))
     assert {"auc", "auprc", "accuracy", "f1"}.issubset(metrics.keys())
+    assert metrics.get("split_metrics_path")
+    assert metrics.get("split_metrics_plot_path")
 
     preds_path = Path(tmp_path / model_type / f"{model_type}_predictions.csv")
     assert preds_path.exists()
