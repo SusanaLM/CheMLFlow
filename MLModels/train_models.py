@@ -1722,7 +1722,7 @@ def _initialize_model(
             model_class=lambda params: GRURegressor(
                 seq_len=input_dim,
                 input_size=params.get("input_size", 1),
-                hidden_size=params.get("hidden_size", 512),
+                hidden_size=params.get("hidden_size", 128),
                 num_layers=params.get("num_layers", 2),
                 bidirectional=params.get("bidirectional", True),
                 dropout=params.get("dropout", 0.2),
@@ -1738,12 +1738,12 @@ def _initialize_model(
             },
             default_params={
                 "input_size": 1,
-                "hidden_size": 512,
+                "hidden_size": 128,
                 "num_layers": 2,
                 "bidirectional": True,
                 "dropout": 0.2,
                 "learning_rate": 1e-3,
-                "batch_size": 32,
+                "batch_size": 8,
                 "epochs": 200,
             },
         )
@@ -1783,7 +1783,7 @@ def _initialize_model(
         return DLSearchConfig(
             model_class=lambda params: TabTransformer(
                 input_dim=input_dim,
-                embed_dim=params.get("embed_dim", 64),
+                embed_dim=params.get("embed_dim", 128),
                 n_heads=params.get("n_heads", 4),
                 n_layers=params.get("n_layers", 2),
                 dropout=params.get("dropout", 0.2),
@@ -1798,13 +1798,13 @@ def _initialize_model(
                 "epochs": {"type": "categorical", "choices": [100, 200, 300]},
             },
             default_params={
-                "embed_dim": 64,
+                "embed_dim": 128,
                 "n_heads": 4,
                 "n_layers": 2,
                 "dropout": 0.2,
                 "learning_rate": 1e-3,
                 "batch_size": 8,
-                "epochs": 100,
+                "epochs": 200,
             },
         )
     
