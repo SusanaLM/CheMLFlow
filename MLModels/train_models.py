@@ -1783,28 +1783,28 @@ def _initialize_model(
         return DLSearchConfig(
             model_class=lambda params: TabTransformer(
                 input_dim=input_dim,
-                embed_dim=params.get("embed_dim", 128),
-                n_heads=params.get("n_heads", 8),
-                n_layers=params.get("n_layers", 4),
-                dropout=params.get("dropout", 0.1),
+                embed_dim=params.get("embed_dim", 64),
+                n_heads=params.get("n_heads", 4),
+                n_layers=params.get("n_layers", 2),
+                dropout=params.get("dropout", 0.2),
             ),
             search_space={
                 "embed_dim": {"type": "categorical", "choices": [64, 128, 256]},
                 "n_heads": {"type": "categorical", "choices": [2, 4, 8]},
-                "n_layers": {"type": "categorical", "choices": [3, 4]}, #  (deleted 6)
+                "n_layers": {"type": "categorical", "choices": [2, 3, 4]},
                 "dropout": {"type": "float", "low": 0.0, "high": 0.4, "log": False},
                 "learning_rate": {"type": "float", "low": 1e-5, "high": 1e-2, "log": True},
-                "batch_size": {"type": "categorical", "choices": [16, 32]}, # Change to adapt to higher dimensional data (deleted 128, 64)
+                "batch_size": {"type": "categorical", "choices": [8, 16, 32]},
                 "epochs": {"type": "categorical", "choices": [100, 200, 300]},
             },
             default_params={
-                "embed_dim": 128,
-                "n_heads": 8,
-                "n_layers": 4,
-                "dropout": 0.1,
+                "embed_dim": 64,
+                "n_heads": 4,
+                "n_layers": 2,
+                "dropout": 0.2,
                 "learning_rate": 1e-3,
-                "batch_size": 32,
-                "epochs": 200,
+                "batch_size": 8,
+                "epochs": 100,
             },
         )
     
