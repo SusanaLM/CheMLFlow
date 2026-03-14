@@ -1,28 +1,29 @@
 # CheMLFlow
 
-CheMLFlow is an open source software to develop, implement and apply modern cheminformatics workflows.
+CheMLFlow is an open source software to develop, benchmark, and apply modern cheminformatics and materials informatics workflows.
 
-## Pipeline vision (dataset‑agnostic tabular ML)
+## Pipeline vision 
 
-The pipeline is intended to be dataset‑agnostic for tabular ML tasks in chemistry/materials. Datasets can be local files, ChEMBL, or other sources; the required contract is defined **between nodes**, not per dataset. The only required inputs are:
+The pipeline is intended to be dataset‑agnostic for ML and AI workflows in chemistry and materials, with support for diverse model classes, including classical ML methods, neural networks, pretrained models, and fine-tuned foundation models. Datasets can be local files or public datasets (for example ChEMBL). The required contract is defined **between nodes**, not per dataset. 
 
-- a tabular file (CSV),
-- a `target_column` defined in config (for supervised tasks),
-- and an optional featurizer (e.g., RDKit if SMILES are present).
+The required inputs are:
+
+- a tabular file (CSV).
+- a `target_column` defined in config (for supervised tasks).
+- splitting strategy (e.g., random, scaffold)
+- an optional featurizer (e.g., Morgan fingerprints, RDKit descriptors, PaDel descriptors).
+- optioanl ML and AI models to be trained on or using pre-trained or foundational models. 
 
 Downstream steps enforce only the minimum required columns for their node (e.g., `canonical_smiles` for RDKit, `target_column` for model training), and extra columns are allowed.
 
-### SMILES handling (important)
+### SMILES handling
 
-- Raw SMILES strings are **never** used directly as numeric features.
-- If you want SMILES to drive the model, use a featurizer (e.g., RDKit/Morgan) to convert SMILES into numeric descriptors/fingerprints.
-- If you are using existing tabular descriptors, SMILES is only used for **canonicalization** and **scaffold splitting**, then dropped from the feature matrix.
+- Raw SMILES strings are **never** used directly as numeric features. Use a featurizer to convert SMILES to numeric descriptors or fingerprints.
+- If using existing tabular descriptors, SMILES is used for **canonicalization** and **splitting**, then dropped from the feature matrix.
+- If the dataset includes numeric descriptors, use the `featurize.none` node to point training at the curated CSV directly. 
+- One can also use low-cardinality categorical columns for one-hot encoding via:
 
-### Tabular descriptors (no featurizer)
-
-If your dataset already includes numeric descriptors, use the `featurize.none` node to point training at the curated CSV directly (no RDKit/Morgan). You can also allowlist low-cardinality categorical columns for one-hot encoding via:
-
-```
+```yaml
 train:
   features:
     categorical_features:
@@ -35,25 +36,25 @@ train:
 
 1. Clone the repository
 
-git clone https://github.com/nijamudheen/CheMLFlow.git
+    git clone https://github.com/nijamudheen/CheMLFlow.git
 
 2. Create conda environment (Python 3.12 recommended)
 
-cd CheMLFlow
+    cd CheMLFlow
 
-conda create -n chemlflow_env_py312 python=3.12
+    conda create -n chemlflow_env python=3.12
 
-conda activate chemlflow_env_py312
+    conda activate chemlflow_env
 
 3. Install dependencies (macOS‑reliable, single path)
 
-Install compiled deps from conda-forge first:
+- Install compiled deps from conda-forge first:
 
-conda install -c conda-forge numpy scipy scikit-learn matplotlib-base seaborn lightgbm xgboost catboost rdkit shap numba llvmlite
+  conda install -c conda-forge numpy scipy scikit-learn matplotlib-base seaborn lightgbm xgboost catboost rdkit shap numba llvmlite
 
-Then install Python deps from pip (don’t re-resolve compiled libs):
+- Then install Python deps from pip (don’t re-resolve compiled libs):
 
-pip install -r requirements.txt --no-deps
+  pip install -r requirements.txt --no-deps
 
 Notes:
 - CatBoost is stable on Python 3.12. Python 3.13 often lacks wheels.
@@ -65,72 +66,62 @@ Notes:
 
 4. Optional: Install PyTorch + Optuna for DL models
 
-For Linux/Windows (check for cuda version available. for instance, cu121 here)
+- For Linux/Windows (check for cuda version available. for instance, cu121 here)
 
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-pip install pytorch-lightning
+  pip install pytorch-lightning
 
-pip install optuna
+  pip install optuna
 
-For AMD GPU (ROCm, Linux only)
+- For AMD GPU (ROCm, Linux only)
 
-pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.0
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.0
 
-pip install pytorch-lightning
+  pip install pytorch-lightning
 
-pip install optuna
+  pip install optuna
 
-For Apple Silicon (M1/M2/M3), no CUDA/GPU available 
+- For Apple Silicon (M1/M2/M3), no CUDA/GPU available 
 
-Can use the MPS backend (built into the default macOS wheels) when using mps as the device
+  Can use the MPS backend (built into the default macOS wheels) when using mps as the device
  
-pip install torch torchvision torchaudio
+  pip install torch torchvision torchaudio
 
-pip install pytorch-lightning 
+  pip install pytorch-lightning 
 
-pip install optuna
+  pip install optuna
 
-5. Optional: Install TDC (`pytdc`) for PGP export/benchmark workflows
+5. Optional: Install TDC (`pytdc`) to access datasets from Therapeutic Data Commons (e.g, PGP dataset) 
 
-Install in your active environment:
+  - Install in your active environment:
 
-pip install pytdc
+    pip install pytdc
 
-Quick import check:
+- Quick import check:
 
-python -c "from tdc.benchmark_group import admet_group; print('pytdc ok')"
+  python -c "from tdc.benchmark_group import admet_group; print('pytdc ok')"
 
 Troubleshooting:
-- If you want to keep the main env frozen after `pip install -r requirements.txt --no-deps`, use a small separate env for `pytdc` export tasks.
+- To keep the main env frozen after `pip install -r requirements.txt --no-deps`, use a small separate env for `pytdc` export tasks.
 - If import errors mention `huggingface_hub`, install/upgrade it in that same env: `pip install -U huggingface_hub`
 
 6. Remove additional install files
 
-make clean
+    make clean
 
-## Urease pIC50 regression benchmarks (context)
-
-These are not directly comparable (different datasets, descriptors, and splitting strategies), but useful for rough context.
-
-| Item | External benchmark (BindDB + CORAL) | This repo (ChEMBL + RDKit + RF) |
-| --- | --- | --- |
-| Dataset | 436 urease inhibitors from BindDB (IC50 → pIC50), 3 random splits into Train/InvTrain/Cal/Val | ChEMBL urease IC50 via API; size varies by run |
-| Model / descriptors | Monte-Carlo QSAR (CORALSEA 17) with hybrid SMILES + GRAPH descriptors | RandomForestRegressor + RDKit descriptors |
-| Validation metrics | Q2 (Val): 0.667–0.763; MAE (Val): 0.320–0.340 (across 3 splits) | Example run (2026-01-26): Test R2 0.507; MAE 0.462; Nested CV R2 0.319 ± 0.160 |
-| Source | https://chemrxiv.org/engage/api-gateway/chemrxiv/assets/orp/resource/item/60c74fcf4c8919392aad3c85/original/monte-carlo-method-based-qsar-model-to-discover-phytochemical-urease-inhibitors-using-smiles-and-graph-descriptors.pdf | Local run output (results/random_forest_evaluation_results.txt) |
 
 ## Running tests
 
-Scripts to run tests in CLI formats are in tests directory
+- Scripts to run tests in CLI formats are in tests directory
 
-For E2E tests that spawn `main.py`, ensure the subprocess uses your conda Python:
+- For end-to-end (E2E) tests that spawn `main.py`, ensure the subprocess uses the  conda Python:
 
-CHEMLFLOW_PYTHON=$(which python) pytest tests/test_e2e_pipelines.py -q
+  CHEMLFLOW_PYTHON=$(which python) pytest tests/test_e2e_pipelines.py -q
 
-For full test runs, install pytest in your env:
+- For full test runs, install pytest in your env:
 
-pip install pytest
+  pip install pytest
 
 ## Running pipelines and finding results
 
@@ -153,10 +144,11 @@ Outputs:
 Full options reference: `docs/config-options.md`
 
 Each node has its own config block, and global settings live under `global`:
-# - global: shared defaults used by multiple nodes
-# - pipeline: ordered list of nodes to execute
-# - node configs: per-node parameters (get_data, split, featurize, model, etc.)
+- global: shared defaults used by multiple nodes
+- pipeline: ordered list of nodes to execute
+- node configs: per-node parameters (get_data, split, featurize, model, etc.)
 
+```yaml
 global:
   pipeline_type: qm9
   task_type: regression
@@ -177,8 +169,9 @@ split:
   val_size: 0.1
   random_state: 42
   stratify: false
+```
 
-Note: Train/val/test membership is defined only by the `split` node. Other nodes consume `split_indices`
+Note: train/val/test membership is defined only by the `split` node. Other nodes consume `split_indices`
 and will not create their own random splits.
 
 ### Strict config scoping
@@ -195,9 +188,9 @@ CheMLFlow enforces strict node-scoped config:
   - `train.features.*`
 - Top-level `model:` is no longer supported.
 
-### Scientifically correct split modes (new)
+### Scientifically correct split modes
 
-CheMLFlow now supports three split protocols from the `split` node:
+CheMLFlow supports three split protocols from the `split` node:
 
 - `mode: holdout` (default): single train/val/test holdout (existing behavior)
 - `mode: cv`: k-fold evaluation (one fold per run, Slurm-friendly)
@@ -287,16 +280,16 @@ and running `main.py` from the `CheMLFlow` directory.
 
 ### Urease (ChEMBL → pIC50 → RDKit → Train → Explain)
 
-1. Activate your environment:
+1. Activate conda environment:
 
-conda activate chemlflow_env
+    conda activate chemlflow_env
 
 2. Run the pipeline:
 
-CHEMLFLOW_CONFIG=<path-to-chembl-config.yaml> python main.py
+    CHEMLFLOW_CONFIG=<path-to-chembl-config.yaml> python main.py
 
 3. Outputs:
-- Data artifacts: `data/urease/`
+- Data artifacts: `data/target/`
 - Models + metrics: `results/`
 - Explainability PNGs (permutation importance + SHAP): `results/`
 
@@ -308,11 +301,11 @@ Notes:
 
 1. Activate your environment:
 
-conda activate chemlflow_env
+    conda activate chemlflow_env
 
 2. Run the pipeline:
 
-CHEMLFLOW_CONFIG=<path-to-qm9-config.yaml> python main.py
+    CHEMLFLOW_CONFIG=<path-to-qm9-config.yaml> python main.py
 
 3. Outputs:
 - Data artifacts: `data/qm9/`
@@ -327,35 +320,35 @@ Notes:
 
 1. Ensure the dataset exists at:
 
-`local_data/ysi.csv`
+    `local_data/ysi.csv`
 
-Expected columns include `SMILES` and `YSI`.
+    Expected columns include `SMILES` and `YSI`.
 
 2. Run the pipeline:
 
-CHEMLFLOW_CONFIG=<path-to-ysi-config.yaml> python main.py
+    CHEMLFLOW_CONFIG=<path-to-ysi-config.yaml> python main.py
 
 ### PAH (logP, local CSV → RDKit → Train → Explain)
 
 1. Ensure the dataset exists at:
 
-`local_data/arockiaraj_pah_data.csv`
+    `local_data/arockiaraj_pah_data.csv`
 
-Expected columns include `smiles` and `log_p`.
+- Expected columns include `smiles` and `log_p`.
 
 2. Run the pipeline:
 
-CHEMLFLOW_CONFIG=<path-to-pah-config.yaml> python main.py
+    CHEMLFLOW_CONFIG=<path-to-pah-config.yaml> python main.py
 
 ### Pgp_Broccatelli (Local CSV → Morgan → CatBoost → AUROC)
 
 1. Activate your environment:
 
-conda activate chemlflow_env
+    conda activate chemlflow_env
 
 2. Run the pipeline:
 
-CHEMLFLOW_CONFIG=<path-to-pgp-config.yaml> python main.py
+    CHEMLFLOW_CONFIG=<path-to-pgp-config.yaml> python main.py
 
 3. Outputs:
 - Data artifacts: `data/pgp_broccatelli/`
@@ -376,15 +369,15 @@ instead of a single local train/test run.
 
 1. Ensure `pytdc` is installed:
 
-`pip install pytdc`
+    `pip install pytdc`
 
 Verify:
 
-`python -c "from tdc.benchmark_group import admet_group; print('pytdc ok')"`
+    `python -c "from tdc.benchmark_group import admet_group; print('pytdc ok')"`
 
 2. Run the benchmark config:
 
-`CHEMLFLOW_CONFIG=<path-to-pgp-tdc-benchmark-config.yaml> python main.py`
+    `CHEMLFLOW_CONFIG=<path-to-pgp-tdc-benchmark-config.yaml> python main.py`
 
 3. Outputs:
 - Run directory: `runs/<timestamp>/`
@@ -401,11 +394,11 @@ Notes:
 
 1. Place the dataset at:
 
-`local_data/AR.csv`
+    `local_data/AR.csv`
 
 2. Run the pipeline:
 
-CHEMLFLOW_CONFIG=<path-to-ara-config.yaml> python main.py
+    CHEMLFLOW_CONFIG=<path-to-ara-config.yaml> python main.py
 
 Notes:
 - Expected columns: `Smiles` and `Activity` (`active`/`inactive`).
