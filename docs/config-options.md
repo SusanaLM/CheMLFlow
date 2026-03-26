@@ -345,6 +345,7 @@ Controls feature preprocessing (variance filtering, correlation removal, scaling
 **Example:**
 ```yaml
 preprocess:
+  scaler: robust
   variance_threshold: 0.1
   corr_threshold: 0.9
   stable_features_k: 100
@@ -354,6 +355,7 @@ preprocess:
 
 | Key | Default | Description |
 |-----|---------|-------------|
+| `scaler` | `robust` | Feature scaling strategy before variance/correlation filtering. One of `robust`, `standard`, `minmax`, `none`. `minmax` uses clipped held-out transforms to keep values in `[0, 1]`. |
 | `variance_threshold` | `0.16` | Remove features with variance below this threshold. |
 | `corr_threshold` | `0.95` | Remove one of each pair of features with correlation above this. |
 | `clip_range` | `[-1e10, 1e10]` | Clip feature values to this range before processing. |
@@ -408,10 +410,10 @@ train:
 |------|-------------|
 | Regression | `random_forest`, `svm`, `decision_tree`, `xgboost`, `ensemble` |
 | Regression (DL) | `dl_simple`, `dl_deep`, `dl_gru`, `dl_resmlp`, `dl_tabtransformer`, `dl_aereg` |
-| Regression (SMILES-native) | `chemprop` |
+| Regression (SMILES-native) | `chemprop`, `chemeleon` |
 | Classification | `random_forest`, `decision_tree`, `xgboost`, `svm`, `ensemble`, `catboost_classifier` |
 | Classification (DL) | `dl_simple`, `dl_deep`, `dl_gru`, `dl_resmlp`, `dl_tabtransformer`, `dl_aereg` |
-| Classification (SMILES-native) | `chemprop` |
+| Classification (SMILES-native) | `chemprop`, `chemeleon` |
 
 **General keys:**
 
@@ -420,9 +422,10 @@ train:
 | `train.model.params` | `{}` | Model-specific hyperparameters passed to fixed and `train_cv` training paths. |
 | `train.model.n_jobs` | `-1` | Parallelism for sklearn/joblib. Use `1` to disable parallelism. |
 
-**Chemprop-specific keys:**
+**Chemprop / CheMeleon-specific keys:**
 
-Chemprop is a graph neural network that works directly on SMILES (no descriptor generation needed).
+Chemprop is a graph neural network that works directly on SMILES (no descriptor generation needed). `chemeleon` is a first-class model alias that uses the Chemprop training path with `foundation: chemeleon`.
+Set `pipeline.feature_input: smiles_native` for Chemprop/CheMeleon runs.
 
 | Key | Default | Description |
 |-----|---------|-------------|

@@ -83,10 +83,83 @@ def test_strict_requires_feature_input_node_for_non_chemprop_train() -> None:
     assert "CFG_FEATURE_INPUT_NODE_REQUIRED" in codes
 
 
-def test_strict_allows_train_without_feature_node_for_chemprop() -> None:
+@pytest.mark.parametrize("model_type", ["chemprop", "chemeleon"])
+def test_strict_allows_train_without_feature_node_for_chemprop_like(model_type: str) -> None:
     cfg = _base_config(["split", "train"])
+    cfg["pipeline"]["feature_input"] = "smiles_native"
     cfg["split"] = {"strategy": "random"}
-    cfg["train"] = {"model": {"type": "chemprop"}}
+    cfg["train"] = {"model": {"type": model_type}}
     issues = collect_config_issues(cfg, ["split", "train"])
     codes = {issue.code for issue in issues}
     assert "CFG_FEATURE_INPUT_NODE_REQUIRED" not in codes
+    assert "CFG_CHEMPROP_FEATURE_INPUT_UNSUPPORTED" not in codes
+
+
+@pytest.mark.parametrize("model_type", ["chemprop", "chemeleon"])
+def test_strict_allows_noop_preprocess_without_feature_node_for_chemprop_like(model_type: str) -> None:
+    cfg = _base_config(["split", "preprocess.features", "train"])
+    cfg["pipeline"]["feature_input"] = "smiles_native"
+    cfg["split"] = {"strategy": "random"}
+    cfg["preprocess"] = {"scaler": "none"}
+    cfg["train"] = {"model": {"type": model_type}}
+
+    issues = collect_config_issues(cfg, ["split", "preprocess.features", "train"])
+    codes = {issue.code for issue in issues}
+    assert "CFG_FEATURE_INPUT_NODE_REQUIRED" not in codes
+
+
+def test_strict_rejects_invalid_preprocess_scaler() -> None:
+    cfg = _base_config(["split", "featurize.rdkit", "preprocess.features", "train"])
+    cfg["split"] = {"strategy": "random"}
+    cfg["preprocess"] = {"scaler": "banana"}
+    cfg["train"] = {"model": {"type": "random_forest"}}
+
+    issues = collect_config_issues(cfg, ["split", "featurize.rdkit", "preprocess.features", "train"])
+    codes = {issue.code for issue in issues}
+    assert "CFG_PREPROCESS_SCALER_INVALID" in codes
+
+
+def test_strict_rejects_chemprop_with_explicit_tabular_featurizer() -> None:
+    cfg = _base_config(["split", "featurize.rdkit", "preprocess.features", "train"])
+    cfg["pipeline"]["feature_input"] = "smiles_native"
+    cfg["split"] = {"strategy": "random"}
+    cfg["preprocess"] = {"scaler": "none"}
+    cfg["train"] = {"model": {"type": "chemprop"}}
+
+    issues = collect_config_issues(cfg, ["split", "featurize.rdkit", "preprocess.features", "train"])
+    codes = {issue.code for issue in issues}
+    assert "CFG_PIPELINE_FEATURE_INPUT_MISMATCH" in codes
+    assert "CFG_CHEMPROP_FEATURE_INPUT_UNSUPPORTED" in codes
+
+
+def test_strict_rejects_chemprop_like_select_features_branch() -> None:
+    cfg = _base_config(["split", "preprocess.features", "select.features", "train"])
+    cfg["pipeline"]["feature_input"] = "smiles_native"
+    cfg["split"] = {"strategy": "random"}
+    cfg["preprocess"] = {"scaler": "none"}
+    cfg["train"] = {"model": {"type": "chemprop"}}
+
+    issues = collect_config_issues(cfg, ["split", "preprocess.features", "select.features", "train"])
+    codes = {issue.code for issue in issues}
+    assert "CFG_CHEMPROP_PREPROCESS_UNSUPPORTED" in codes
+
+
+def test_strict_requires_chemeleon_checkpoint() -> None:
+    cfg = _base_config(["split", "train"])
+    cfg["pipeline"]["feature_input"] = "smiles_native"
+    cfg["split"] = {"strategy": "random"}
+    cfg["train"] = {"model": {"type": "chemeleon"}}
+
+    issues = collect_config_issues(cfg, ["split", "train"])
+    codes = {issue.code for issue in issues}
+    assert "CFG_CHEMELEON_CHECKPOINT_REQUIRED" in codes
+
+
+def test_strict_requires_smiles_native_for_chemprop_like_models() -> None:
+    cfg = _base_config(["split", "train"])
+    cfg["split"] = {"strategy": "random"}
+    cfg["train"] = {"model": {"type": "chemprop"}}
+
+    issues = collect_config_issues(cfg, ["split", "train"])
+    codes = {issue.code for issue in issues}
+    assert "CFG_CHEMPROP_FEATURE_INPUT_UNSUPPORTED" in codes

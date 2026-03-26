@@ -119,6 +119,7 @@ You can override in `selection.primary_metric`.
 ## Practical defaults
 
 - `clf_local_csv` + non-chemprop models default to `pipeline.feature_input: featurize.morgan`.
+- `chemprop` / `chemeleon` default to `pipeline.feature_input: smiles_native` when the DOE omits that axis.
 - `reg_chembl_ic50` defaults `global.target_column` to `pIC50`.
 - For DOE comparisons across pipelines, strongly consider:
   - `split.require_disjoint: true`
@@ -146,6 +147,9 @@ Use these rules when building DOE files for cluster runs.
 - Put only true experiment axes in `search_space`.
 - Good: vary `train.model.type`, `split.strategy`, and maybe one featurizer.
 - Avoid large mixed grids unless you need them; they grow very quickly.
+- For `chemprop` / `chemeleon`, keep `pipeline.feature_input: smiles_native`.
+- If you keep `pipeline.preprocess: true` in a mixed-model DOE, only the no-op branch (`preprocess.scaler: none`) is meaningful for `chemprop` / `chemeleon`.
+- Treat `smiles_native` as reserved for SMILES-native models. DOE will skip tabular models on that branch.
 
 ### 3) For chemistry model comparison, prefer scaffold CV
 

@@ -37,6 +37,8 @@ _DOE_SPEC_NAMESPACE_LEN = 8
 _FEATURE_INPUT_ALIASES = {
     "use.curated_features": "featurize.none",
 }
+_CHEMPROP_LIKE_MODELS = {"chemprop", "chemeleon"}
+_CHEMPROP_LIKE_FEATURE_INPUTS = {"smiles_native"}
 _EXECUTION_ONLY_AXES = {
     "split.cv.fold_index",
     "split.cv.repeat_index",
@@ -81,8 +83,8 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         task_type="regression",
         train_node="train",
         default_source="local_csv",
-        allowed_feature_inputs=("none", "featurize.none", "featurize.rdkit", "featurize.morgan"),
-        allowed_models=("random_forest", "svm", "decision_tree", "xgboost", "ensemble", "chemprop", "dl_*"),
+        allowed_feature_inputs=("none", "smiles_native", "featurize.none", "featurize.rdkit", "featurize.morgan"),
+        allowed_models=("random_forest", "svm", "decision_tree", "xgboost", "ensemble", "chemprop", "chemeleon", "dl_*"),
         supports_label_normalize=False,
         supports_label_ic50=False,
         supports_split=True,
@@ -109,6 +111,7 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         default_source="local_csv",
         allowed_feature_inputs=(
             "none",
+            "smiles_native",
             "featurize.none",
             "featurize.rdkit",
             "featurize.morgan",
@@ -121,6 +124,7 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
             "ensemble",
             "catboost_classifier",
             "chemprop",
+            "chemeleon",
             "dl_*",
         ),
         supports_label_normalize=True,
@@ -731,7 +735,9 @@ def _build_label_block(
 
 
 def _profile_default_feature_input(profile: ProfileSpec, model_type: str) -> str:
-    if model_type == "chemprop":
+    if model_type in _CHEMPROP_LIKE_MODELS:
+        if "smiles_native" in set(profile.allowed_feature_inputs):
+            return "smiles_native"
         return "none"
     allowed_inputs = set(profile.allowed_feature_inputs)
     preferred = ("featurize.morgan", "featurize.rdkit", "featurize.none")
@@ -765,7 +771,7 @@ def _build_pipeline_nodes(
     elif label_normalize_enabled:
         nodes.append("label.normalize")
 
-    if feature_input != "none":
+    if feature_input not in {"none", "smiles_native"}:
         nodes.append(feature_input)
     nodes.append("split")
 
@@ -867,7 +873,10 @@ def _build_case_config(
 
     config: dict[str, Any] = {
         "global": global_cfg,
-        "pipeline": {"nodes": nodes},
+        "pipeline": {
+            "nodes": nodes,
+            "feature_input": feature_input,
+        },
     }
 
     if "get_data" in nodes:
@@ -1054,6 +1063,8 @@ def _build_case_config(
             if passthrough in merged:
                 key = passthrough.removeprefix("train.model.")
                 model_cfg[key] = merged[passthrough]
+        if model_type == "chemeleon":
+            model_cfg["foundation"] = "chemeleon"
         train_cfg: dict[str, Any] = {"model": model_cfg}
         if "train.random_state" in merged:
             train_cfg["random_state"] = int(merged["train.random_state"])
@@ -1225,13 +1236,24 @@ def _validate_case(
         "featurize.rdkit_labeled",
         "featurize.morgan",
     }
-    selected_feature_input = "none"
+    preprocess_scaler = str(_get_dotted(config, "preprocess.scaler", "robust")).strip().lower() or "robust"
+    selected_feature_input = _normalize_feature_input(
+        str(_get_dotted(config, "pipeline.feature_input", "none")).strip()
+    ) or "none"
     if "featurize.none" in nodes or "use.curated_features" in nodes:
         selected_feature_input = "featurize.none"
     elif "featurize.rdkit" in nodes or "featurize.rdkit_labeled" in nodes:
         selected_feature_input = "featurize.rdkit"
     elif "featurize.morgan" in nodes:
         selected_feature_input = "featurize.morgan"
+    chemprop_like_passthrough_preprocess = (
+        model_type in _CHEMPROP_LIKE_MODELS
+        and has_preprocess
+        and not has_select
+        and preprocess_scaler == "none"
+        and selected_feature_input == "smiles_native"
+        and not any(node in feature_nodes for node in nodes)
+    )
     if has_train and not profile.allows_feature_input(selected_feature_input):
         _add_issue(
             issues,
@@ -1239,28 +1261,70 @@ def _validate_case(
             path="pipeline.nodes",
             message=f"Feature input {selected_feature_input!r} is not supported for profile {profile.name!r}.",
         )
-    if has_train and model_type != "chemprop":
-        if not any(node in feature_nodes for node in nodes):
+    if has_train and model_type not in _CHEMPROP_LIKE_MODELS:
+        if selected_feature_input == "smiles_native":
+            _add_issue(
+                issues,
+                code="DOE_SMILES_NATIVE_MODEL_UNSUPPORTED",
+                path="pipeline.feature_input",
+                message=(
+                    "smiles_native is reserved for SMILES-native models (chemprop/chemeleon). "
+                    "Use featurize.rdkit, featurize.morgan, or featurize.none for tabular models."
+                ),
+            )
+        elif not any(node in feature_nodes for node in nodes):
             _add_issue(
                 issues,
                 code="DOE_FEATURE_INPUT_REQUIRED",
                 path="pipeline.nodes",
                 message="Non-chemprop training requires one feature input node (featurize.none or featurize.*).",
             )
-    if (has_preprocess or has_select) and not any(node in feature_nodes for node in nodes):
+    if (
+        (has_preprocess or has_select)
+        and not any(node in feature_nodes for node in nodes)
+        and not chemprop_like_passthrough_preprocess
+        and selected_feature_input != "smiles_native"
+    ):
         _add_issue(
             issues,
             code="DOE_FEATURE_INPUT_REQUIRED_FOR_PREPROCESS",
             path="pipeline.nodes",
             message="preprocess.features/select.features require an explicit feature input node.",
         )
-    if model_type == "chemprop" and (has_preprocess or has_select):
+    if model_type in _CHEMPROP_LIKE_MODELS and selected_feature_input not in _CHEMPROP_LIKE_FEATURE_INPUTS:
         _add_issue(
             issues,
-            code="DOE_CHEMPROP_PREPROCESS_UNSUPPORTED",
-            path="pipeline.nodes",
-            message="chemprop does not use tabular preprocess/select nodes; remove preprocess.features/select.features.",
-        )
+                code="DOE_CHEMPROP_FEATURE_INPUT_UNSUPPORTED",
+                path="pipeline.feature_input",
+                message=(
+                "chemprop and chemeleon are SMILES-native; set pipeline.feature_input to "
+                "'smiles_native' for these rows."
+                ),
+            )
+    if model_type in _CHEMPROP_LIKE_MODELS and (
+        has_select or (has_preprocess and not chemprop_like_passthrough_preprocess)
+    ):
+        _add_issue(
+            issues,
+                code="DOE_CHEMPROP_PREPROCESS_UNSUPPORTED",
+                path="pipeline.nodes",
+                message=(
+                "chemprop/chemeleon do not use tabular preprocess/select nodes; only the no-op combination "
+                "(pipeline.feature_input=smiles_native and preprocess.scaler=none) is supported."
+                ),
+            )
+    foundation_mode = str(_get_dotted(config, "train.model.foundation", "none")).strip().lower() or "none"
+    if model_type == "chemeleon":
+        foundation_mode = "chemeleon"
+    if foundation_mode == "chemeleon":
+        checkpoint = str(_get_dotted(config, "train.model.foundation_checkpoint", "")).strip()
+        if not checkpoint:
+            _add_issue(
+                issues,
+                code="DOE_CHEMELEON_CHECKPOINT_REQUIRED",
+                path="train.model.foundation_checkpoint",
+                message="CheMeleon runs require train.model.foundation_checkpoint to point to the .pt checkpoint.",
+            )
     if profile.name == "reg_chembl_ic50" and "featurize.rdkit" not in nodes:
         _add_issue(
             issues,
@@ -1400,7 +1464,7 @@ def _validate_case(
                     path="split.inner.repeat_index",
                     message="split.inner.repeat_index must satisfy 0 <= repeat_index < repeats.",
                 )
-        if model_type == "chemprop" or model_type.startswith(DL_PREFIX):
+        if model_type in _CHEMPROP_LIKE_MODELS or model_type.startswith(DL_PREFIX):
             if split_mode == "holdout":
                 val_size = float(_get_dotted(config, "split.val_size", 0.0) or 0.0)
             else:
@@ -1552,18 +1616,19 @@ def _validate_case(
                 message="train.tdc currently supports only model.type=catboost_classifier.",
             )
 
-    try:
-        from main import validate_pipeline_nodes
+    if not issues:
+        try:
+            from main import validate_pipeline_nodes
 
-        validate_pipeline_nodes(nodes)
-        validate_config_strict(config, nodes)
-    except Exception as exc:  # pragma: no cover - runtime path exercised in tests
-        _add_issue(
-            issues,
-            code="DOE_RUNTIME_SCHEMA_INVALID",
-            path="pipeline/config",
-            message=str(exc),
-        )
+            validate_pipeline_nodes(nodes)
+            validate_config_strict(config, nodes)
+        except Exception as exc:  # pragma: no cover - runtime path exercised in tests
+            _add_issue(
+                issues,
+                code="DOE_RUNTIME_SCHEMA_INVALID",
+                path="pipeline/config",
+                message=str(exc),
+            )
     return issues
 
 

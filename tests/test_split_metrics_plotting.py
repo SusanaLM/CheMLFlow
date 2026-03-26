@@ -6,7 +6,14 @@ import pandas as pd
 import pytest
 
 from MLModels import train_models
-from analysis import GeneralizationRecord, _aggregate_all_runs_metric_rows, _aggregate_generalization_records
+from analysis import (
+    GeneralizationRecord,
+    _aggregate_all_runs_metric_rows,
+    _aggregate_generalization_records,
+    _infer_feature_input,
+    _resolve_metrics_path,
+    _resolve_split_metrics,
+)
 
 
 def test_train_model_writes_split_metrics_artifacts(tmp_path):
@@ -321,6 +328,52 @@ def test_aggregate_generalization_records_marks_missing_metric_slices_partial():
     assert record.completed_slices == 2
     assert record.failed_slices == 1
     assert record.failure_reason == "missing_generalization_metrics=1"
+
+
+def test_analysis_prefers_explicit_feature_node_over_declared_pipeline_feature_input() -> None:
+    config = {
+        "pipeline": {
+            "feature_input": "smiles_native",
+            "nodes": ["get_data", "curate", "featurize.rdkit", "split", "train"],
+        }
+    }
+
+    assert _infer_feature_input(config) == "featurize.rdkit"
+
+
+def test_analysis_recognizes_legacy_use_curated_features_alias() -> None:
+    config = {
+        "pipeline": {
+            "nodes": ["get_data", "curate", "use.curated_features", "split", "train"],
+        }
+    }
+
+    assert _infer_feature_input(config) == "featurize.none"
+
+
+def test_analysis_normalizes_configured_use_curated_features_alias() -> None:
+    config = {
+        "pipeline": {
+            "feature_input": "use.curated_features",
+            "nodes": ["get_data", "curate", "split", "train"],
+        }
+    }
+
+    assert _infer_feature_input(config) == "featurize.none"
+
+
+def test_analysis_uses_chemprop_artifacts_for_chemeleon(tmp_path: Path) -> None:
+    run_dir = tmp_path / "chemeleon_run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = run_dir / "chemprop_metrics.json"
+    split_metrics_path = run_dir / "chemprop_split_metrics.json"
+    metrics_path.write_text(json.dumps({"split_metrics_path": str(split_metrics_path)}), encoding="utf-8")
+    split_metrics_path.write_text(json.dumps({"train": {"r2": 0.9}, "test": {"r2": 0.7}}), encoding="utf-8")
+
+    assert _resolve_metrics_path(run_dir, "chemeleon") == metrics_path
+    payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    resolved = _resolve_split_metrics("chemeleon", run_dir, payload)
+    assert resolved == {"train": {"r2": 0.9}, "test": {"r2": 0.7}}
 
 
 def test_classification_split_plot_artifacts(tmp_path):

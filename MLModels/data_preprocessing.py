@@ -8,7 +8,7 @@ from pandas.api.types import is_numeric_dtype
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.model_selection import KFold
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
 from typing import Iterable, Tuple, Dict, Any, Sequence
 
 # ── 1) Load data ───────────────────────────────────────────────────────────────
@@ -50,11 +50,35 @@ def load_data(features_file: str, labels_file: str):
         raise
 
 # ── 2) Preprocess ──────────────────────────────────────────────────────────────
+class _IdentityScaler:
+    def fit_transform(self, X):
+        return np.asarray(X, dtype=float)
+
+    def transform(self, X):
+        return np.asarray(X, dtype=float)
+
+
+def _resolve_scaler(scaler_name: str):
+    normalized = str(scaler_name or "robust").strip().lower()
+    if normalized == "robust":
+        return normalized, RobustScaler()
+    if normalized == "standard":
+        return normalized, StandardScaler()
+    if normalized == "minmax":
+        return normalized, MinMaxScaler(clip=True)
+    if normalized == "none":
+        return normalized, _IdentityScaler()
+    raise ValueError(
+        "preprocess.scaler must be one of: 'robust', 'standard', 'minmax', 'none'."
+    )
+
+
 def preprocess_data(
     X: pd.DataFrame,
     variance_threshold: float = 0.8 * (1 - 0.8),
     corr_threshold: float = 0.95,
     clip_range: tuple = (-1e10, 1e10),
+    scaler: str = "robust",
     allow_full_fit: bool = False,
 ):
     """Preprocess the data by scaling and removing low-variance and highly correlated features."""
@@ -65,10 +89,9 @@ def preprocess_data(
                 "Use fit_preprocessor/transform_preprocessor with a train/test split."
             )
 
-        # Scaling features using RobustScaler
-        logging.info("Scaling features using RobustScaler.")
-        scaler = RobustScaler()
-        X_scaled = scaler.fit_transform(X) #doing this to the whole data is considered data leakage
+        scaler_name, scaler_obj = _resolve_scaler(scaler)
+        logging.info("Scaling features using %s scaler.", scaler_name)
+        X_scaled = scaler_obj.fit_transform(X) #doing this to the whole data is considered data leakage
         X_scaled_df = pd.DataFrame(X_scaled, columns=X.columns)
 
         # Removing low-variance features (on both training dataset and test) - OR DO BEFORE SCALING
@@ -108,10 +131,11 @@ def fit_preprocessor(
     variance_threshold: float,
     corr_threshold: float,
     clip_range: tuple,
+    scaler: str = "robust",
 ) -> Dict[str, Any]:
     """Fit preprocessing steps on training data only."""
-    scaler = RobustScaler()
-    X_scaled = scaler.fit_transform(X_train)
+    scaler_name, scaler_obj = _resolve_scaler(scaler)
+    X_scaled = scaler_obj.fit_transform(X_train)
     X_scaled_df = pd.DataFrame(X_scaled, columns=X_train.columns)
 
     selector = VarianceThreshold(threshold=variance_threshold)
@@ -124,7 +148,8 @@ def fit_preprocessor(
     to_drop = [column for column in upper.columns if any(upper[column] > corr_threshold)]
 
     return {
-        "scaler": scaler,
+        "scaler": scaler_obj,
+        "scaler_name": scaler_name,
         "selector": selector,
         "variance_features": list(features_after_variance),
         "corr_drop": to_drop,

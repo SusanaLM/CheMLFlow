@@ -394,9 +394,20 @@ def _infer_feature_input(config: dict[str, Any]) -> str | None:
         return "featurize.rdkit"
     if "featurize.lipinski" in nodes:
         return "featurize.lipinski"
-    if "featurize.none" in nodes:
+    if "featurize.none" in nodes or "use.curated_features" in nodes:
         return "featurize.none"
+    pipeline_cfg = config.get("pipeline")
+    if isinstance(pipeline_cfg, dict):
+        configured = str(pipeline_cfg.get("feature_input", "")).strip()
+        if configured:
+            if configured == "use.curated_features":
+                return "featurize.none"
+            return configured
     return "none" if "train" in nodes else None
+
+
+def _is_chemprop_like_model_type(model_type: str) -> bool:
+    return str(model_type).strip().lower() in {"chemprop", "chemeleon"}
 
 
 def _scientific_config_payload(config: dict[str, Any]) -> dict[str, Any]:
@@ -479,7 +490,7 @@ def _load_json(path: Path) -> dict[str, Any] | None:
 
 
 def _resolve_metrics_path(run_dir: Path, model_type: str) -> Path:
-    if model_type == "chemprop":
+    if _is_chemprop_like_model_type(model_type):
         return run_dir / "chemprop_metrics.json"
     return run_dir / f"{model_type}_metrics.json"
 
@@ -496,7 +507,10 @@ def _resolve_split_metrics(
             payload = _load_json(path)
             if payload is not None:
                 return payload
-    fallback = run_dir / f"{model_type}_split_metrics.json"
+    if _is_chemprop_like_model_type(model_type):
+        fallback = run_dir / "chemprop_split_metrics.json"
+    else:
+        fallback = run_dir / f"{model_type}_split_metrics.json"
     return _load_json(fallback)
 
 

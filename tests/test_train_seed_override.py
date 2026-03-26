@@ -112,3 +112,48 @@ def test_train_random_state_falls_back_to_global(monkeypatch, tmp_path: Path) ->
     main.run_node_train(ctx)
 
     assert captured["seed"] == 999
+
+
+def test_run_node_train_routes_chemeleon_through_chemprop(monkeypatch, tmp_path: Path) -> None:
+    base_dir = tmp_path / "data_chemeleon"
+    run_dir = tmp_path / "run_chemeleon"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    paths = main.build_paths(str(base_dir))
+    curated_path = Path(paths["curated"])
+    pd.DataFrame({"canonical_smiles": ["CC", "CCC", "CCCC"], "y": [0.1, 0.2, 0.3]}).to_csv(
+        curated_path, index=False
+    )
+
+    captured: dict[str, object] = {}
+
+    def _fake_train_chemprop_model(**kwargs):
+        captured.update(kwargs)
+        return object(), train_models.TrainResult("chemprop_model.pt", "params.json", "chemprop_metrics.json")
+
+    monkeypatch.setattr(main, "validate_contract", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.train_models, "train_chemprop_model", _fake_train_chemprop_model)
+
+    ctx = {
+        "pipeline_type": "ysi_regression",
+        "run_dir": str(run_dir),
+        "model_type": "chemeleon",
+        "target_column": "y",
+        "paths": paths,
+        "task_type": "regression",
+        "train_config": {"model": {"type": "chemeleon", "foundation_checkpoint": "/tmp/chemeleon.pt"}, "tuning": {}, "early_stopping": {}},
+        "model_config": {"type": "chemeleon", "foundation_checkpoint": "/tmp/chemeleon.pt"},
+        "global_random_state": 42,
+        "split_indices": {"train": [0], "val": [1], "test": [2]},
+        "split_config": {},
+        "categorical_features": [],
+        "debug_logging": False,
+        "curated_path": str(curated_path),
+    }
+
+    main.run_node_train(ctx)
+
+    assert captured["task_type"] == "regression"
+    assert captured["model_config"]["foundation"] == "chemeleon"
+    assert captured["model_config"]["foundation_checkpoint"] == "/tmp/chemeleon.pt"
+    assert ctx["trained_model_path"] == "chemprop_model.pt"

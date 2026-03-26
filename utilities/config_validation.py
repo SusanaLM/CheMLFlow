@@ -62,12 +62,34 @@ _FEATURE_INPUT_NODES = {
     "featurize.morgan",
     "use.curated_features",
 }
+_CHEMPROP_LIKE_MODELS = {"chemprop", "chemeleon"}
+_FEATURE_INPUT_ALIASES = {
+    "use.curated_features": "featurize.none",
+}
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _normalize_feature_input(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    return _FEATURE_INPUT_ALIASES.get(normalized, normalized)
+
+
+def _feature_input_from_nodes(nodes: list[str]) -> str | None:
+    lowered = [str(node).strip().lower() for node in nodes]
+    if "featurize.morgan" in lowered:
+        return "featurize.morgan"
+    if "featurize.rdkit_labeled" in lowered:
+        return "featurize.rdkit_labeled"
+    if "featurize.rdkit" in lowered:
+        return "featurize.rdkit"
+    if "featurize.none" in lowered or "use.curated_features" in lowered:
+        return "featurize.none"
+    return None
 
 
 def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[ValidationIssue]:
@@ -185,29 +207,95 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                     )
                 )
 
+    pipeline_cfg = _as_dict(config.get("pipeline"))
+    configured_feature_input = _normalize_feature_input(pipeline_cfg.get("feature_input", ""))
     has_explicit_feature_input = any(node in _FEATURE_INPUT_NODES for node in nodes)
-    if any(node in nodes for node in ("preprocess.features", "select.features")) and not has_explicit_feature_input:
+    explicit_feature_input = _feature_input_from_nodes(nodes)
+    model_type = str(_as_dict(train_cfg.get("model")).get("type", "")).strip().lower()
+    model_cfg = _as_dict(train_cfg.get("model"))
+    foundation_mode = str(model_cfg.get("foundation", "none")).strip().lower() or "none"
+    foundation_checkpoint = str(model_cfg.get("foundation_checkpoint", "")).strip()
+    preprocess_cfg = _as_dict(config.get("preprocess"))
+    preprocess_scaler = str(preprocess_cfg.get("scaler", "robust")).strip().lower() or "robust"
+    chemprop_like_noop_preprocess = (
+        model_type in _CHEMPROP_LIKE_MODELS
+        and configured_feature_input == "smiles_native"
+        and preprocess_scaler == "none"
+        and "preprocess.features" in nodes
+        and "select.features" not in nodes
+    )
+    if configured_feature_input and explicit_feature_input and configured_feature_input != explicit_feature_input:
+        issues.append(
+            ValidationIssue(
+                code="CFG_PIPELINE_FEATURE_INPUT_MISMATCH",
+                path="pipeline.feature_input",
+                message=(
+                    f"pipeline.feature_input={configured_feature_input!r} does not match the explicit feature node "
+                    f"{explicit_feature_input!r}."
+                ),
+            )
+        )
+
+    if (
+        any(node in nodes for node in ("preprocess.features", "select.features"))
+        and not has_explicit_feature_input
+        and not chemprop_like_noop_preprocess
+    ):
         issues.append(
             ValidationIssue(
                 code="CFG_FEATURE_INPUT_NODE_REQUIRED",
                 path="pipeline.nodes",
                 message=(
                     "preprocess.features/select.features require an explicit feature input node "
-                    "(featurize.none/featurize.rdkit/featurize.rdkit_labeled/featurize.morgan)."
+                    "(featurize.none/featurize.rdkit/featurize.rdkit_labeled/featurize.morgan), "
+                    "except for the Chemprop/CheMeleon no-op preprocess branch."
                 ),
             )
         )
     if "train" in nodes and not has_explicit_feature_input:
-        model_type = str(_as_dict(train_cfg.get("model")).get("type", "")).strip().lower()
-        if model_type and model_type != "chemprop":
+        if model_type and model_type not in _CHEMPROP_LIKE_MODELS:
             issues.append(
                 ValidationIssue(
                     code="CFG_FEATURE_INPUT_NODE_REQUIRED",
                     path="pipeline.nodes",
                     message=(
-                        "train for non-chemprop models requires an explicit feature input node "
+                        "train for non-SMILES-native models requires an explicit feature input node "
                         "(featurize.none/featurize.rdkit/featurize.rdkit_labeled/featurize.morgan)."
                     ),
+                )
+            )
+    if model_type in _CHEMPROP_LIKE_MODELS:
+        resolved_feature_input = explicit_feature_input or configured_feature_input or ""
+        if resolved_feature_input != "smiles_native":
+            issues.append(
+                ValidationIssue(
+                    code="CFG_CHEMPROP_FEATURE_INPUT_UNSUPPORTED",
+                    path="pipeline.feature_input",
+                    message=(
+                        "Chemprop/CheMeleon are SMILES-native and must use pipeline.feature_input=smiles_native "
+                        "with no explicit tabular featurizer node."
+                    ),
+                )
+            )
+        if "select.features" in nodes or ("preprocess.features" in nodes and preprocess_scaler != "none"):
+            issues.append(
+                ValidationIssue(
+                    code="CFG_CHEMPROP_PREPROCESS_UNSUPPORTED",
+                    path="pipeline.nodes",
+                    message=(
+                        "Chemprop/CheMeleon only support the no-op preprocess branch "
+                        "(preprocess.scaler=none, no select.features)."
+                    ),
+                )
+            )
+        if model_type == "chemeleon":
+            foundation_mode = "chemeleon"
+        if foundation_mode == "chemeleon" and not foundation_checkpoint:
+            issues.append(
+                ValidationIssue(
+                    code="CFG_CHEMELEON_CHECKPOINT_REQUIRED",
+                    path="train.model.foundation_checkpoint",
+                    message="CheMeleon runs require train.model.foundation_checkpoint.",
                 )
             )
 
@@ -242,7 +330,6 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                 )
 
     # Legacy preprocess keys that leaked into other nodes.
-    preprocess_cfg = _as_dict(config.get("preprocess"))
     if "keep_all_columns" in preprocess_cfg:
         issues.append(
             ValidationIssue(
@@ -261,6 +348,16 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                 hint="Move to train.features.exclude_columns",
             )
         )
+    if "scaler" in preprocess_cfg:
+        scaler_value = str(preprocess_cfg.get("scaler", "")).strip().lower()
+        if scaler_value not in {"robust", "standard", "minmax", "none"}:
+            issues.append(
+                ValidationIssue(
+                    code="CFG_PREPROCESS_SCALER_INVALID",
+                    path="preprocess.scaler",
+                    message="preprocess.scaler must be one of: robust, standard, minmax, none.",
+                )
+            )
 
     return issues
 

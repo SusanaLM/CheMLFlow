@@ -215,10 +215,15 @@ def _hashable_config_payload(config: dict) -> dict:
 _PIPELINE_NODE_ALIASES = {
     "use.curated_features": "featurize.none",
 }
+_CHEMPROP_LIKE_MODELS = {"chemprop", "chemeleon"}
 
 
 def _canonicalize_pipeline_nodes(nodes: list[str]) -> list[str]:
     return [_PIPELINE_NODE_ALIASES.get(str(node), str(node)) for node in nodes]
+
+
+def _is_chemprop_like_model(model_type: object) -> bool:
+    return str(model_type or "").strip().lower() in _CHEMPROP_LIKE_MODELS
 
 
 def _normalize_runtime_config(config: dict, nodes: list[str]) -> dict:
@@ -643,6 +648,10 @@ def _resolve_feature_method(context: dict) -> str | None:
     feature_method = context.get("feature_method")
     if isinstance(feature_method, str) and feature_method.strip():
         return feature_method.strip().lower()
+
+    pipeline_feature_input = str(context.get("pipeline_feature_input", "")).strip().lower()
+    if pipeline_feature_input == "smiles_native":
+        return "smiles_native"
 
     pipeline_nodes = [str(node).strip().lower() for node in (context.get("pipeline_nodes") or [])]
     for candidate in ("featurize.morgan", "featurize.rdkit_labeled", "featurize.rdkit", "featurize.none"):
@@ -1454,19 +1463,32 @@ def _resolve_feature_inputs(
     return context["paths"]["rdkit_descriptors"], context["paths"]["pic50_3class"]
 
 
-def _preprocess_params(context: dict) -> tuple[float, float, tuple[float, float], int, int]:
+def _preprocess_params(context: dict) -> tuple[float, float, tuple[float, float], str, int, int]:
     preprocess_config = context.get("preprocess_config", {})
     variance_threshold = preprocess_config.get("variance_threshold", 0.8 * (1 - 0.8))
     corr_threshold = preprocess_config.get("corr_threshold", 0.95)
     clip_range = preprocess_config.get("clip_range", (-1e10, 1e10))
     if isinstance(clip_range, list):
         clip_range = tuple(clip_range)
+    scaler = str(preprocess_config.get("scaler", "robust")).strip().lower() or "robust"
     stable_k = preprocess_config.get("stable_features_k", 50)
     random_state = _resolve_seed(
         context.get("global_random_state", 42),
         preprocess_config.get("random_state"),
     )
-    return variance_threshold, corr_threshold, clip_range, stable_k, random_state
+    return variance_threshold, corr_threshold, clip_range, scaler, stable_k, random_state
+
+
+def _should_skip_tabular_preprocess_for_chemprop(context: dict) -> bool:
+    if not _is_chemprop_like_model(context.get("model_type")):
+        return False
+    _, _, _, scaler, _, _ = _preprocess_params(context)
+    if scaler != "none":
+        return False
+    if _has_explicit_feature_input_node(context):
+        return False
+    pipeline_nodes = set(context.get("pipeline_nodes") or [])
+    return "select.features" not in pipeline_nodes
 
 
 def _exclude_feature_columns(context: dict) -> list[str]:
@@ -1590,6 +1612,16 @@ def run_node_preprocess_features(context: dict) -> None:
             "Add 'split' before 'preprocess.features' in pipeline.nodes."
         )
 
+    if _should_skip_tabular_preprocess_for_chemprop(context):
+        model_type = str(context.get("model_type", "chemprop")).strip() or "chemprop"
+        logging.info(
+            "Skipping tabular preprocess.features for %s because pipeline.feature_input is smiles-native "
+            "and preprocess.scaler is none.",
+            model_type,
+        )
+        context["preprocessed_ready"] = False
+        return
+
     features_file, labels_file = _resolve_feature_inputs(
         context,
         require_explicit=True,
@@ -1630,12 +1662,13 @@ def run_node_preprocess_features(context: dict) -> None:
     X_train = X_clean.loc[train_idx]
     X_test = X_clean.loc[test_idx]
 
-    variance_threshold, corr_threshold, clip_range, _, _ = _preprocess_params(context)
+    variance_threshold, corr_threshold, clip_range, scaler, _, _ = _preprocess_params(context)
     preprocessor = data_preprocessing.fit_preprocessor(
         X_train,
         variance_threshold=variance_threshold,
         corr_threshold=corr_threshold,
         clip_range=clip_range,
+        scaler=scaler,
     )
     X_preprocessed = data_preprocessing.transform_preprocessor(X_clean, preprocessor)
     X_preprocessed.index = X_clean.index
@@ -1728,7 +1761,7 @@ def run_node_select_features(context: dict) -> None:
     y_train = y.loc[train_idx]
     X_test = X.loc[test_idx]
 
-    _, _, _, stable_k, random_state = _preprocess_params(context)
+    _, _, _, _, stable_k, random_state = _preprocess_params(context)
     X_selected_train = data_preprocessing.select_stable_features(
         X_train,
         y_train,
@@ -2115,17 +2148,20 @@ def run_node_train(context: dict) -> None:
             "Add 'split' before 'train' in pipeline.nodes."
         )
 
-    # Chemprop is a SMILES-native model; it does not use tabular descriptors.
+    # Chemprop-like models are SMILES-native; they do not use tabular descriptors.
     # For apples-to-apples benchmarking, we still rely on CheMLFlow's split_indices.
-    if model_type == "chemprop":
+    if _is_chemprop_like_model(model_type):
         curated_path = context.get("curated_path", paths["curated"])
         curated_df = pd.read_csv(curated_path)
         if not split_indices.get("val"):
             raise ValueError(
-                "chemprop training requires an explicit validation split from the split node. "
+                "SMILES-native training requires an explicit validation split from the split node. "
                 "Set split.val_size > 0."
             )
 
+        chemprop_model_config = dict(model_config)
+        if str(model_type).strip().lower() == "chemeleon":
+            chemprop_model_config["foundation"] = "chemeleon"
         _, train_result = train_models.train_chemprop_model(
             curated_df=curated_df,
             target_column=target_column,
@@ -2133,7 +2169,7 @@ def run_node_train(context: dict) -> None:
             output_dir=output_dir,
             random_state=train_random_state,
             task_type=task_type,
-            model_config=model_config,
+            model_config=chemprop_model_config,
         )
         context["trained_model_path"] = train_result.model_path
 
@@ -2262,7 +2298,7 @@ def run_node_explain(context: dict) -> None:
     paths = context["paths"]
     is_dl = model_type.startswith("dl_")
     feature_method = _resolve_feature_method(context)
-    if model_type == "chemprop":
+    if _is_chemprop_like_model(model_type):
         skip_path = _write_explain_skip_marker(
             output_dir,
             reason="chemprop_explainability_not_supported",
@@ -2270,7 +2306,7 @@ def run_node_explain(context: dict) -> None:
             feature_method=feature_method,
         )
         logging.warning(
-            "Explainability is not implemented for chemprop; skipping explain node and writing %s.",
+            "Explainability is not implemented for Chemprop/CheMeleon; skipping explain node and writing %s.",
             skip_path,
         )
         return
@@ -2512,6 +2548,7 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
         "config_hash": config_hash,
         "config_fingerprint": config_fingerprint,
         "feature_method": None,
+        "pipeline_feature_input": (runtime_config.get("pipeline", {}) or {}).get("feature_input"),
         "pipeline_nodes": list(nodes),
     }
 
@@ -2598,7 +2635,7 @@ def main() -> int:
         # subprocess runs, force a hard exit on success to avoid false-negative e2e failures.
         if (
             os.environ.get("PYTEST_CURRENT_TEST")
-            and (config.get("train", {}) or {}).get("model", {}).get("type") == "chemprop"
+            and _is_chemprop_like_model((config.get("train", {}) or {}).get("model", {}).get("type"))
         ):
             logging.shutdown()
             os._exit(0)

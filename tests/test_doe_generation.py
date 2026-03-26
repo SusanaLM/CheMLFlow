@@ -138,7 +138,7 @@ def test_generate_doe_allows_tree_models_for_classification(tmp_path: Path) -> N
 
 def test_generate_doe_requires_validation_split_for_chemprop(tmp_path: Path) -> None:
     spec = _base_clf_doe(tmp_path)
-    spec["search_space"]["pipeline.feature_input"] = ["none"]
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
     spec["search_space"]["train.model.type"] = ["chemprop"]
     spec["defaults"]["split.val_size"] = 0.0
 
@@ -152,7 +152,7 @@ def test_generate_doe_requires_validation_split_for_chemprop(tmp_path: Path) -> 
 
 def test_generate_doe_propagates_chemprop_legacy_split_flag(tmp_path: Path) -> None:
     spec = _base_clf_doe(tmp_path)
-    spec["search_space"]["pipeline.feature_input"] = ["none"]
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
     spec["search_space"]["pipeline.explain"] = [False]
     spec["search_space"]["train.model.type"] = ["chemprop"]
     spec["defaults"]["train.model.allow_legacy_split_positions"] = True
@@ -167,19 +167,39 @@ def test_generate_doe_propagates_chemprop_legacy_split_flag(tmp_path: Path) -> N
     assert config["train"]["model"]["allow_legacy_split_positions"] is True
 
 
-def test_generate_doe_skips_chemprop_with_preprocess_and_no_features(tmp_path: Path) -> None:
+def test_generate_doe_allows_chemprop_with_noop_preprocess_and_no_features(tmp_path: Path) -> None:
     spec = _base_clf_doe(tmp_path)
-    spec["search_space"]["pipeline.feature_input"] = ["none"]
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
     spec["search_space"]["pipeline.preprocess"] = [True]
     spec["search_space"]["train.model.type"] = ["chemprop"]
+    spec["defaults"]["preprocess.scaler"] = "none"
+    spec["defaults"]["split.val_size"] = 0.1
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 1
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert "preprocess.features" in config["pipeline"]["nodes"]
+    assert "featurize.none" not in config["pipeline"]["nodes"]
+    assert config["preprocess"]["scaler"] == "none"
+
+
+def test_generate_doe_skips_chemprop_with_non_noop_preprocess(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
+    spec["search_space"]["pipeline.preprocess"] = [True]
+    spec["search_space"]["train.model.type"] = ["chemprop"]
+    spec["defaults"]["preprocess.scaler"] = "standard"
     spec["defaults"]["split.val_size"] = 0.1
 
     result = generate_doe(spec)
     summary = result["summary"]
 
     assert summary["valid_cases"] == 0
-    assert summary["issue_counts"].get("DOE_FEATURE_INPUT_REQUIRED_FOR_PREPROCESS", 0) == 1
     assert summary["issue_counts"].get("DOE_CHEMPROP_PREPROCESS_UNSUPPORTED", 0) == 1
+    assert summary["issue_counts"].get("DOE_RUNTIME_SCHEMA_INVALID", 0) == 0
 
 
 def test_generate_doe_allows_chemprop_for_regression_local_csv(tmp_path: Path) -> None:
@@ -202,7 +222,7 @@ def test_generate_doe_allows_chemprop_for_regression_local_csv(tmp_path: Path) -
         "search_space": {
             "split.mode": ["holdout"],
             "split.strategy": ["random"],
-            "pipeline.feature_input": ["none"],
+            "pipeline.feature_input": ["smiles_native"],
             "pipeline.preprocess": [False],
             "pipeline.select": [False],
             "pipeline.explain": [False],
@@ -232,6 +252,102 @@ def test_generate_doe_allows_chemprop_for_regression_local_csv(tmp_path: Path) -
     assert config["global"]["task_type"] == "regression"
     assert config["train"]["model"]["type"] == "chemprop"
     assert "featurize.none" not in config["pipeline"]["nodes"]
+    assert config["pipeline"]["feature_input"] == "smiles_native"
+
+
+def test_generate_doe_skips_chemprop_with_tabular_feature_input(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["featurize.rdkit"]
+    spec["search_space"]["train.model.type"] = ["chemprop"]
+    spec["defaults"]["split.val_size"] = 0.1
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 0
+    assert summary["issue_counts"].get("DOE_CHEMPROP_FEATURE_INPUT_UNSUPPORTED", 0) == 1
+
+
+def test_generate_doe_skips_chemprop_with_featurize_none_alias(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["featurize.none"]
+    spec["search_space"]["train.model.type"] = ["chemprop"]
+    spec["defaults"]["split.val_size"] = 0.1
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 0
+    assert summary["issue_counts"].get("DOE_CHEMPROP_FEATURE_INPUT_UNSUPPORTED", 0) == 1
+    assert summary["issue_counts"].get("DOE_RUNTIME_SCHEMA_INVALID", 0) == 0
+
+
+def test_generate_doe_allows_chemprop_with_smiles_native_feature_input(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
+    spec["search_space"]["train.model.type"] = ["chemprop"]
+    spec["search_space"]["pipeline.preprocess"] = [True]
+    spec["defaults"]["preprocess.scaler"] = "none"
+    spec["defaults"]["split.val_size"] = 0.1
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 1
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["pipeline"]["feature_input"] == "smiles_native"
+    assert "preprocess.features" in config["pipeline"]["nodes"]
+    assert "featurize.rdkit" not in config["pipeline"]["nodes"]
+    assert "featurize.morgan" not in config["pipeline"]["nodes"]
+
+
+def test_generate_doe_skips_tabular_models_with_smiles_native_feature_input(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
+    spec["search_space"]["train.model.type"] = ["random_forest"]
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 0
+    assert summary["issue_counts"].get("DOE_SMILES_NATIVE_MODEL_UNSUPPORTED", 0) == 1
+    assert summary["issue_counts"].get("DOE_RUNTIME_SCHEMA_INVALID", 0) == 0
+
+
+def test_generate_doe_allows_chemeleon_with_smiles_native_feature_input(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "chemeleon_mp.pt"
+    checkpoint.write_bytes(b"fake-checkpoint")
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
+    spec["search_space"]["pipeline.preprocess"] = [True]
+    spec["search_space"]["train.model.type"] = ["chemeleon"]
+    spec["defaults"]["preprocess.scaler"] = "none"
+    spec["defaults"]["train.model.foundation_checkpoint"] = str(checkpoint)
+    spec["defaults"]["split.val_size"] = 0.1
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 1
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["train"]["model"]["type"] == "chemeleon"
+    assert config["train"]["model"]["foundation"] == "chemeleon"
+    assert config["train"]["model"]["foundation_checkpoint"] == str(checkpoint)
+    assert config["pipeline"]["feature_input"] == "smiles_native"
+
+
+def test_generate_doe_requires_chemeleon_checkpoint(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
+    spec["search_space"]["train.model.type"] = ["chemeleon"]
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 0
+    assert summary["issue_counts"].get("DOE_CHEMELEON_CHECKPOINT_REQUIRED", 0) == 1
 
 
 def test_generate_doe_enforces_split_mode_strategy_compatibility(tmp_path: Path) -> None:
