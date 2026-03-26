@@ -362,6 +362,19 @@ def test_analysis_normalizes_configured_use_curated_features_alias() -> None:
     assert _infer_feature_input(config) == "featurize.none"
 
 
+def test_analysis_infers_smiles_native_for_historical_chemprop_runs() -> None:
+    config = {
+        "pipeline": {
+            "nodes": ["get_data", "curate", "split", "train"],
+        },
+        "train": {
+            "model": {"type": "chemprop"},
+        },
+    }
+
+    assert _infer_feature_input(config) == "smiles_native"
+
+
 def test_analysis_uses_chemprop_artifacts_for_chemeleon(tmp_path: Path) -> None:
     run_dir = tmp_path / "chemeleon_run"
     run_dir.mkdir(parents=True, exist_ok=True)

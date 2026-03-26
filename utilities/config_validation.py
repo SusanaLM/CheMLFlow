@@ -66,6 +66,36 @@ _CHEMPROP_LIKE_MODELS = {"chemprop", "chemeleon"}
 _FEATURE_INPUT_ALIASES = {
     "use.curated_features": "featurize.none",
 }
+_CLASSIFICATION_ONLY_MODELS = {"catboost_classifier"}
+_DL_WILDCARD = "dl_*"
+_RUNTIME_PROFILE_CONTRACTS: dict[str, dict[str, Any]] = {
+    "reg_local_csv": {
+        "allowed_feature_inputs": ("none", "smiles_native", "featurize.none", "featurize.rdkit", "featurize.morgan"),
+        "allowed_models": ("random_forest", "svm", "decision_tree", "xgboost", "ensemble", "chemprop", "chemeleon", _DL_WILDCARD),
+    },
+    "reg_chembl_ic50": {
+        "allowed_feature_inputs": ("featurize.rdkit",),
+        "allowed_models": ("random_forest", "svm", "decision_tree", "xgboost", "ensemble", _DL_WILDCARD),
+    },
+    "clf_local_csv": {
+        "allowed_feature_inputs": ("none", "smiles_native", "featurize.none", "featurize.rdkit", "featurize.morgan"),
+        "allowed_models": (
+            "random_forest",
+            "decision_tree",
+            "xgboost",
+            "svm",
+            "ensemble",
+            "catboost_classifier",
+            "chemprop",
+            "chemeleon",
+            _DL_WILDCARD,
+        ),
+    },
+    "clf_tdc_benchmark": {
+        "allowed_feature_inputs": ("none",),
+        "allowed_models": ("catboost_classifier",),
+    },
+}
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -89,6 +119,28 @@ def _feature_input_from_nodes(nodes: list[str]) -> str | None:
         return "featurize.rdkit"
     if "featurize.none" in lowered or "use.curated_features" in lowered:
         return "featurize.none"
+    return None
+
+
+def _allows_model(model_type: str, allowed_models: tuple[str, ...]) -> bool:
+    if model_type.startswith("dl_"):
+        return _DL_WILDCARD in allowed_models
+    return model_type in set(allowed_models)
+
+
+def _infer_runtime_profile_key(task_type: str, source_type: str) -> str | None:
+    if source_type == "tdc":
+        if task_type == "classification":
+            return "clf_tdc_benchmark"
+        return None
+    if source_type == "chembl":
+        if task_type == "regression":
+            return "reg_chembl_ic50"
+        return None
+    if task_type == "regression":
+        return "reg_local_csv"
+    if task_type == "classification":
+        return "clf_local_csv"
     return None
 
 
@@ -217,6 +269,10 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
     foundation_checkpoint = str(model_cfg.get("foundation_checkpoint", "")).strip()
     preprocess_cfg = _as_dict(config.get("preprocess"))
     preprocess_scaler = str(preprocess_cfg.get("scaler", "robust")).strip().lower() or "robust"
+    global_cfg = _as_dict(config.get("global"))
+    task_type = str(global_cfg.get("task_type", "")).strip().lower()
+    get_data_cfg = _as_dict(config.get("get_data"))
+    source_type = str(get_data_cfg.get("data_source", "")).strip().lower()
     chemprop_like_noop_preprocess = (
         model_type in _CHEMPROP_LIKE_MODELS
         and configured_feature_input == "smiles_native"
@@ -233,6 +289,15 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                     f"pipeline.feature_input={configured_feature_input!r} does not match the explicit feature node "
                     f"{explicit_feature_input!r}."
                 ),
+            )
+        )
+
+    if "select.features" in nodes and "preprocess.features" not in nodes:
+        issues.append(
+            ValidationIssue(
+                code="CFG_SELECT_REQUIRES_PREPROCESS",
+                path="pipeline.nodes",
+                message="select.features requires preprocess.features in this pipeline.",
             )
         )
 
@@ -264,6 +329,15 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                     ),
                 )
             )
+
+    if task_type == "regression" and model_type in _CLASSIFICATION_ONLY_MODELS:
+        issues.append(
+            ValidationIssue(
+                code="CFG_MODEL_TASK_MISMATCH",
+                path="train.model.type",
+                message=f"Model {model_type!r} is classification-only but task_type is regression.",
+            )
+        )
     if model_type in _CHEMPROP_LIKE_MODELS:
         resolved_feature_input = explicit_feature_input or configured_feature_input or ""
         if resolved_feature_input != "smiles_native":
@@ -328,6 +402,80 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                         message="train_tdc.model.type is required.",
                     )
                 )
+
+    if "get_data" in nodes:
+        source_cfg = _as_dict(get_data_cfg.get("source"))
+        if source_type == "local_csv" and not str(source_cfg.get("path", "")).strip():
+            issues.append(
+                ValidationIssue(
+                    code="CFG_DATA_SOURCE_CONFIG_INVALID",
+                    path="get_data.source.path",
+                    message="local_csv source requires get_data.source.path.",
+                )
+            )
+        if source_type == "chembl" and not str(source_cfg.get("target_name", "")).strip():
+            issues.append(
+                ValidationIssue(
+                    code="CFG_DATA_SOURCE_CONFIG_INVALID",
+                    path="get_data.source.target_name",
+                    message="chembl source requires get_data.source.target_name.",
+                )
+            )
+        profile_key = _infer_runtime_profile_key(task_type, source_type or "local_csv")
+        if task_type and source_type and profile_key is None:
+            issues.append(
+                ValidationIssue(
+                    code="CFG_SOURCE_TASK_UNSUPPORTED",
+                    path="get_data.data_source",
+                    message=(
+                        f"source.type={source_type!r} is not supported with task_type={task_type!r} "
+                        "in the current runtime profiles."
+                    ),
+                )
+            )
+        elif profile_key:
+            profile_contract = _RUNTIME_PROFILE_CONTRACTS[profile_key]
+            resolved_feature_input = explicit_feature_input or configured_feature_input or "none"
+            if resolved_feature_input == "featurize.rdkit_labeled":
+                resolved_feature_input = "featurize.rdkit"
+            if resolved_feature_input not in set(profile_contract["allowed_feature_inputs"]):
+                issues.append(
+                    ValidationIssue(
+                        code="CFG_FEATURE_INPUT_NOT_SUPPORTED",
+                        path="pipeline.feature_input",
+                        message=(
+                            f"Feature input {resolved_feature_input!r} is not supported for runtime profile "
+                            f"{profile_key!r}."
+                        ),
+                    )
+                )
+            if model_type and not _allows_model(model_type, profile_contract["allowed_models"]):
+                issues.append(
+                    ValidationIssue(
+                        code="CFG_MODEL_NOT_SUPPORTED_FOR_PROFILE",
+                        path="train.model.type",
+                        message=(
+                            f"Model {model_type!r} is not supported for runtime profile {profile_key!r}."
+                        ),
+                    )
+                )
+            if profile_key == "clf_tdc_benchmark":
+                if "split" in nodes:
+                    issues.append(
+                        ValidationIssue(
+                            code="CFG_PROFILE_NODE_UNSUPPORTED",
+                            path="pipeline.nodes",
+                            message="TDC benchmark profile does not support the split node.",
+                        )
+                    )
+                if "train.tdc" not in nodes:
+                    issues.append(
+                        ValidationIssue(
+                            code="CFG_PROFILE_TRAIN_NODE_MISMATCH",
+                            path="pipeline.nodes",
+                            message="TDC benchmark profile requires the train.tdc node.",
+                        )
+                    )
 
     # Legacy preprocess keys that leaked into other nodes.
     if "keep_all_columns" in preprocess_cfg:

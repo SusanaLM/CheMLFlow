@@ -403,6 +403,9 @@ def _infer_feature_input(config: dict[str, Any]) -> str | None:
             if configured == "use.curated_features":
                 return "featurize.none"
             return configured
+    model_type = str((((config.get("train") or {}).get("model") or {}).get("type", ""))).strip().lower()
+    if _is_chemprop_like_model_type(model_type):
+        return "smiles_native"
     return "none" if "train" in nodes else None
 
 
