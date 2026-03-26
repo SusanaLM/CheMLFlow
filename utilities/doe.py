@@ -577,6 +577,72 @@ def _expand_search_space(search_space: dict[str, Any], max_cases: int | None) ->
     return combos
 
 
+def _execution_axis_values(axis_key: str, merged: dict[str, Any], declared_axes: set[str], upper_bound: int) -> list[int]:
+    if axis_key in declared_axes:
+        return [int(merged.get(axis_key, 0))]
+    return list(range(max(int(upper_bound), 1)))
+
+
+def _expand_execution_axes(merged: dict[str, Any], declared_axes: set[str]) -> list[dict[str, Any]]:
+    split_mode = str(merged.get("split.mode", "holdout")).strip().lower() or "holdout"
+    if split_mode == "cv":
+        n_splits = int(merged.get("split.cv.n_splits", 5))
+        repeats = int(merged.get("split.cv.repeats", 1))
+        fold_values = _execution_axis_values("split.cv.fold_index", merged, declared_axes, upper_bound=n_splits)
+        repeat_values = _execution_axis_values("split.cv.repeat_index", merged, declared_axes, upper_bound=repeats)
+        return [
+            {
+                "split.cv.fold_index": int(fold_index),
+                "split.cv.repeat_index": int(repeat_index),
+            }
+            for repeat_index, fold_index in itertools.product(repeat_values, fold_values)
+        ]
+
+    if split_mode == "nested_holdout_cv":
+        stage = str(merged.get("split.stage", "inner")).strip().lower() or "inner"
+        if stage != "inner":
+            return [{}]
+        n_splits = int(merged.get("split.inner.n_splits", 5))
+        repeats = int(merged.get("split.inner.repeats", 1))
+        fold_values = _execution_axis_values(
+            "split.inner.fold_index",
+            merged,
+            declared_axes,
+            upper_bound=n_splits,
+        )
+        repeat_values = _execution_axis_values(
+            "split.inner.repeat_index",
+            merged,
+            declared_axes,
+            upper_bound=repeats,
+        )
+        return [
+            {
+                "split.inner.fold_index": int(fold_index),
+                "split.inner.repeat_index": int(repeat_index),
+            }
+            for repeat_index, fold_index in itertools.product(repeat_values, fold_values)
+        ]
+
+    return [{}]
+
+
+def _case_execution_tokens(config: dict[str, Any]) -> list[str]:
+    split_mode = str(_get_dotted(config, "split.mode", "")).strip().lower()
+    if split_mode == "cv":
+        repeat_index = int(_get_dotted(config, "split.cv.repeat_index", 0))
+        fold_index = int(_get_dotted(config, "split.cv.fold_index", 0))
+        return [f"rep{repeat_index}", f"fold{fold_index}"]
+    if split_mode == "nested_holdout_cv":
+        stage = str(_get_dotted(config, "split.stage", "inner")).strip().lower() or "inner"
+        if stage == "inner":
+            repeat_index = int(_get_dotted(config, "split.inner.repeat_index", 0))
+            fold_index = int(_get_dotted(config, "split.inner.fold_index", 0))
+            return [stage, f"rep{repeat_index}", f"fold{fold_index}"]
+        return [stage]
+    return []
+
+
 def _build_label_block(
     dataset_cfg: dict[str, Any],
     target_column: str,
@@ -1472,84 +1538,109 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
 
     defaults_flat = _flatten_dict(defaults_cfg)
     search_space_flat = _flatten_dict(search_space)
+    declared_axes = set(defaults_flat) | set(search_space_flat)
     max_cases = constraints_cfg.get("max_cases")
     if max_cases is not None:
         max_cases = int(max_cases)
     isolate_case_artifacts = _as_bool(constraints_cfg.get("isolate_case_artifacts", True))
     expanded = _expand_search_space(search_space_flat, max_cases=max_cases)
 
+    expanded_case_total = 0
+    for factors in expanded:
+        merged_preview = dict(defaults_flat)
+        merged_preview.update(factors)
+        expanded_case_total += len(_expand_execution_axes(merged_preview, declared_axes))
+        limit = max_cases if max_cases is not None else _DEFAULT_MAX_EXPANDED_CASES
+        if expanded_case_total > limit:
+            limit_name = "constraints.max_cases" if max_cases is not None else "default safety limit"
+            raise DOEGenerationError(
+                "Expanded DOE is too large after CV/nested execution-axis expansion. "
+                f"Expanded cases={expanded_case_total:,} exceeds {limit_name}={limit:,}."
+            )
+
     valid_records: list[dict[str, Any]] = []
     all_records: list[dict[str, Any]] = []
     seen_config_hashes: set[str] = set()
+    case_index = 0
+    for factors in expanded:
+        merged_base = dict(defaults_flat)
+        merged_base.update(factors)
+        execution_axes = _expand_execution_axes(merged_base, declared_axes)
 
-    for index, factors in enumerate(expanded, start=1):
-        case_id = f"case_{index:04d}"
-        merged = dict(defaults_flat)
-        merged.update(factors)
-        base_config = _build_case_config(
-            profile=profile,
-            dataset_cfg=dataset_cfg,
-            merged=merged,
-            resolved_task=resolved_task,
-            probe=probe,
-        )
-        issues = _validate_case(profile=profile, config=base_config, probe=probe)
-
-        record: dict[str, Any] = {
-            "case_id": case_id,
-            "profile": profile.name,
-            "task_type": resolved_task,
-            "status": "valid",
-            "factors": factors,
-            "issues": [],
-        }
-
-        if issues:
-            record["status"] = "skipped"
-            record["issues"] = [issue.__dict__ for issue in issues]
-            all_records.append(record)
-            continue
-
-        config_fingerprint = _stable_hash(_hashable_config_payload(base_config))
-        if config_fingerprint in seen_config_hashes:
-            record["status"] = "skipped"
-            record["issues"] = [
-                {
-                    "code": "DOE_DUPLICATE_CONFIG",
-                    "path": "search_space",
-                    "message": "Different factor combinations rendered the same runtime config.",
-                }
-            ]
-            all_records.append(record)
-            continue
-        seen_config_hashes.add(config_fingerprint)
-
-        config = json.loads(json.dumps(base_config))
-        if isolate_case_artifacts:
-            _apply_case_isolation(
-                config,
-                case_id=case_id,
-                output_dir=output_dir,
-                spec_namespace=spec_namespace,
+        for execution_factors in execution_axes:
+            case_index += 1
+            case_id = f"case_{case_index:04d}"
+            merged = dict(merged_base)
+            merged.update(execution_factors)
+            base_config = _build_case_config(
+                profile=profile,
+                dataset_cfg=dataset_cfg,
+                merged=merged,
+                resolved_task=resolved_task,
+                probe=probe,
             )
-        config_hash = _stable_hash(config)
+            issues = _validate_case(profile=profile, config=base_config, probe=probe)
 
-        model_type = _get_dotted(config, "train.model.type", _get_dotted(config, "train_tdc.model.type", "model"))
-        split_mode = _get_dotted(config, "split.mode", "nosplit")
-        split_strategy = _get_dotted(config, "split.strategy", "na")
-        filename = (
-            f"{case_id}__{_sanitize_token(profile.name)}__{_sanitize_token(model_type)}__"
-            f"{_sanitize_token(split_mode)}__{_sanitize_token(split_strategy)}.yaml"
-        )
-        config_path = os.path.join(output_dir, filename)
-        with open(config_path, "w", encoding="utf-8") as fh:
-            yaml.safe_dump(config, fh, sort_keys=False)
+            record: dict[str, Any] = {
+                "case_id": case_id,
+                "profile": profile.name,
+                "task_type": resolved_task,
+                "status": "valid",
+                "factors": factors,
+                "execution_factors": execution_factors,
+                "issues": [],
+            }
 
-        record["config_path"] = config_path
-        record["config_hash"] = config_hash
-        record["config_fingerprint"] = config_fingerprint
-        valid_records.append(record)
-        all_records.append(record)
+            if issues:
+                record["status"] = "skipped"
+                record["issues"] = [issue.__dict__ for issue in issues]
+                all_records.append(record)
+                continue
+
+            config_fingerprint = _stable_hash(_hashable_config_payload(base_config))
+            if config_fingerprint in seen_config_hashes:
+                record["status"] = "skipped"
+                record["issues"] = [
+                    {
+                        "code": "DOE_DUPLICATE_CONFIG",
+                        "path": "search_space",
+                        "message": "Different factor combinations rendered the same runtime config.",
+                    }
+                ]
+                all_records.append(record)
+                continue
+            seen_config_hashes.add(config_fingerprint)
+
+            config = json.loads(json.dumps(base_config))
+            if isolate_case_artifacts:
+                _apply_case_isolation(
+                    config,
+                    case_id=case_id,
+                    output_dir=output_dir,
+                    spec_namespace=spec_namespace,
+                )
+            config_hash = _stable_hash(config)
+
+            model_type = _get_dotted(config, "train.model.type", _get_dotted(config, "train_tdc.model.type", "model"))
+            split_mode = _get_dotted(config, "split.mode", "nosplit")
+            split_strategy = _get_dotted(config, "split.strategy", "na")
+            execution_tokens = _case_execution_tokens(config)
+            filename = (
+                f"{case_id}__{_sanitize_token(profile.name)}__{_sanitize_token(model_type)}__"
+                f"{_sanitize_token(split_mode)}__{_sanitize_token(split_strategy)}"
+            )
+            if execution_tokens:
+                filename += "__" + "__".join(_sanitize_token(token) for token in execution_tokens)
+            filename += ".yaml"
+            config_path = os.path.join(output_dir, filename)
+            with open(config_path, "w", encoding="utf-8") as fh:
+                yaml.safe_dump(config, fh, sort_keys=False)
+
+            record["config_path"] = config_path
+            record["config_hash"] = config_hash
+            record["config_fingerprint"] = config_fingerprint
+            valid_records.append(record)
+            all_records.append(record)
 
     manifest_path = os.path.join(output_dir, "manifest.jsonl")
     with open(manifest_path, "w", encoding="utf-8") as fh:

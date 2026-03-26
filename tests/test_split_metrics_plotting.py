@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from MLModels import train_models
+from analysis import GeneralizationRecord, _aggregate_all_runs_metric_rows, _aggregate_generalization_records
 
 
 def test_train_model_writes_split_metrics_artifacts(tmp_path):
@@ -59,6 +60,172 @@ def test_train_model_writes_split_metrics_artifacts(tmp_path):
     split_metrics = json.loads(Path(split_metrics_path).read_text(encoding="utf-8"))
     assert set(split_metrics.keys()) == {"train", "val", "test"}
     assert {"r2", "mae"}.issubset(split_metrics["train"].keys())
+
+
+def test_aggregate_all_runs_metric_rows_groups_execution_slices():
+    rows = [
+        {
+            "case_name": "case_0001",
+            "scientific_config_id": "cfg-a",
+            "job_id": "101",
+            "state": "COMPLETED",
+            "failure_reason": "",
+            "profile": "reg_local_csv",
+            "model_type": "random_forest",
+            "feature_input": "featurize.morgan",
+            "split_mode": "cv",
+            "split_strategy": "random",
+            "execution_label": "rep0_fold0",
+            "config_path": "/tmp/case_0001.yaml",
+            "run_dir": "/tmp/run1",
+            "metrics_path": "/tmp/m1.json",
+            "test_r2": 0.2,
+            "test_mae": 1.0,
+        },
+        {
+            "case_name": "case_0002",
+            "scientific_config_id": "cfg-a",
+            "job_id": "102",
+            "state": "COMPLETED",
+            "failure_reason": "",
+            "profile": "reg_local_csv",
+            "model_type": "random_forest",
+            "feature_input": "featurize.morgan",
+            "split_mode": "cv",
+            "split_strategy": "random",
+            "execution_label": "rep0_fold1",
+            "config_path": "/tmp/case_0002.yaml",
+            "run_dir": "/tmp/run2",
+            "metrics_path": "/tmp/m2.json",
+            "test_r2": 0.4,
+            "test_mae": 2.0,
+        },
+        {
+            "case_name": "case_0003",
+            "scientific_config_id": "cfg-b",
+            "job_id": "103",
+            "state": "FAILED",
+            "failure_reason": "timeout",
+            "profile": "reg_local_csv",
+            "model_type": "svm",
+            "feature_input": "featurize.rdkit",
+            "split_mode": "cv",
+            "split_strategy": "scaffold",
+            "execution_label": "rep0_fold0",
+            "config_path": "/tmp/case_0003.yaml",
+            "run_dir": "/tmp/run3",
+            "metrics_path": "",
+        },
+    ]
+
+    aggregated = _aggregate_all_runs_metric_rows(rows)
+
+    assert len(aggregated) == 2
+    first = aggregated[0]
+    second = aggregated[1]
+
+    assert first["scientific_config_id"] == "cfg-a"
+    assert first["state"] == "COMPLETED"
+    assert first["slice_count"] == 2
+    assert first["completed_slices"] == 2
+    assert first["failed_slices"] == 0
+    assert abs(float(first["test_r2"]) - 0.3) < 1e-12
+    assert abs(float(first["test_r2_std"]) - 0.1) < 1e-12
+    assert first["test_mae"] == 1.5
+
+    assert second["scientific_config_id"] == "cfg-b"
+    assert second["state"] == "FAILED"
+    assert second["completed_slices"] == 0
+    assert second["failure_reason"] == "timeout=1"
+    assert second["test_r2"] == ""
+
+
+def test_aggregate_generalization_records_marks_partial_configs():
+    records = [
+        GeneralizationRecord(
+            case_name="case_0001",
+            model_type="random_forest",
+            split_mode="cv",
+            split_strategy="random",
+            feature_input="featurize.morgan",
+            metric_name="r2",
+            train_value=0.8,
+            test_value=0.5,
+            val_value=0.55,
+            gap_train_minus_test=0.3,
+            gap_train_minus_test_std=None,
+            overfit_flag=True,
+            underfit_flag=False,
+            config_path="/tmp/case_0001.yaml",
+            run_dir="/tmp/run1",
+            scientific_config_id="cfg-a",
+            execution_label="rep0_fold0",
+            state="COMPLETED",
+            failure_reason=None,
+            slice_count=1,
+            completed_slices=1,
+            failed_slices=0,
+            config_paths=("/tmp/case_0001.yaml",),
+            run_dirs=("/tmp/run1",),
+        ),
+        GeneralizationRecord(
+            case_name="case_0002",
+            model_type="random_forest",
+            split_mode="cv",
+            split_strategy="random",
+            feature_input="featurize.morgan",
+            metric_name="r2",
+            train_value=0.9,
+            test_value=0.7,
+            val_value=0.72,
+            gap_train_minus_test=0.2,
+            gap_train_minus_test_std=None,
+            overfit_flag=True,
+            underfit_flag=False,
+            config_path="/tmp/case_0002.yaml",
+            run_dir="/tmp/run2",
+            scientific_config_id="cfg-a",
+            execution_label="rep0_fold1",
+            state="COMPLETED",
+            failure_reason=None,
+            slice_count=1,
+            completed_slices=1,
+            failed_slices=0,
+            config_paths=("/tmp/case_0002.yaml",),
+            run_dirs=("/tmp/run2",),
+        ),
+    ]
+
+    aggregated = _aggregate_generalization_records(
+        records=records,
+        overfit_threshold=0.2,
+        underfit_threshold_r2=0.2,
+        underfit_threshold_auc=0.65,
+        config_summary={
+            "cfg-a": {
+                "state": "PARTIAL",
+                "failure_reason": "timeout=1",
+                "slice_count": 3,
+                "completed_slices": 2,
+                "failed_slices": 1,
+            }
+        },
+    )
+
+    assert len(aggregated) == 1
+    record = aggregated[0]
+    assert record.scientific_config_id == "cfg-a"
+    assert record.slice_count == 3
+    assert record.completed_slices == 2
+    assert record.failed_slices == 1
+    assert record.state == "PARTIAL"
+    assert record.failure_reason == "timeout=1"
+    assert abs(record.train_value - 0.85) < 1e-12
+    assert record.test_value == 0.6
+    assert record.gap_train_minus_test == 0.25
+    assert abs((record.gap_train_minus_test_std or 0.0) - 0.05) < 1e-12
+    assert record.overfit_flag is True
+    assert record.execution_label == "aggregated"
 
 
 def test_classification_split_plot_artifacts(tmp_path):

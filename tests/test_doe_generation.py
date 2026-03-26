@@ -250,6 +250,63 @@ def test_generate_doe_enforces_split_mode_strategy_compatibility(tmp_path: Path)
     assert summary["issue_counts"].get("DOE_SPLIT_STRATEGY_MODE_INVALID", 0) == 1
 
 
+def test_generate_doe_auto_expands_cv_execution_axes_when_omitted(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["split.mode"] = ["cv"]
+    spec["search_space"]["split.strategy"] = ["random", "scaffold"]
+    spec["defaults"]["split.cv.n_splits"] = 3
+    spec["defaults"]["split.cv.repeats"] = 2
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["total_cases"] == 12
+    assert summary["valid_cases"] == 12
+    assert summary["skipped_cases"] == 0
+
+    first = result["valid_cases"][0]
+    assert "split.cv.fold_index" not in first["factors"]
+    assert "split.cv.repeat_index" not in first["factors"]
+    assert set(first["execution_factors"]) == {"split.cv.fold_index", "split.cv.repeat_index"}
+
+    seen_execution = {
+        (
+            int(case["execution_factors"]["split.cv.repeat_index"]),
+            int(case["execution_factors"]["split.cv.fold_index"]),
+        )
+        for case in result["valid_cases"]
+        if case["factors"]["split.strategy"] == "random"
+    }
+    assert seen_execution == {
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+    }
+
+
+def test_generate_doe_respects_explicit_cv_execution_axes_in_defaults(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["split.mode"] = ["cv"]
+    spec["defaults"]["split.cv.n_splits"] = 3
+    spec["defaults"]["split.cv.repeats"] = 2
+    spec["defaults"]["split.cv.fold_index"] = 1
+    spec["defaults"]["split.cv.repeat_index"] = 0
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["total_cases"] == 1
+    assert summary["valid_cases"] == 1
+
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["split"]["cv"]["fold_index"] == 1
+    assert config["split"]["cv"]["repeat_index"] == 0
+
+
 def test_generate_doe_validates_cv_fold_index_bounds(tmp_path: Path) -> None:
     spec = _base_clf_doe(tmp_path)
     spec["search_space"]["split.mode"] = ["cv"]

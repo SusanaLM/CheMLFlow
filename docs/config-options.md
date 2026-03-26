@@ -274,7 +274,7 @@ Standard single train/val/test split. Best for quick experiments.
 
 ### `mode: cv`
 
-K-fold cross-validation. Run the pipeline once per fold (varying `fold_index`) to get robust metrics.
+K-fold cross-validation. The runtime config executes one fold at a time; DOE generation can auto-expand all fold/repeat runs when those execution indices are omitted from the DOE spec.
 
 **Additional keys:**
 
@@ -282,8 +282,8 @@ K-fold cross-validation. Run the pipeline once per fold (varying `fold_index`) t
 |-----|---------|-------------|
 | `cv.n_splits` | `5` | Number of folds. |
 | `cv.repeats` | `1` | Number of times to repeat the k-fold (with different random shuffles). |
-| `cv.fold_index` | `0` | Which fold to use as test (0 to n_splits-1). |
-| `cv.repeat_index` | `0` | Which repeat to use (0 to repeats-1). |
+| `cv.fold_index` | `0` | Which fold to use as test (0 to n_splits-1). Runtime/execution axis, not usually a scientific DOE axis. |
+| `cv.repeat_index` | `0` | Which repeat to use (0 to repeats-1). Runtime/execution axis, not usually a scientific DOE axis. |
 | `cv.random_state` | (from split) | Seed for fold assignment. |
 | `val_from_train.val_size` | (from split) | Fraction of train_pool to hold out as validation. |
 | `val_from_train.stratify` | (from split) | Whether to stratify the val split. |
@@ -294,6 +294,7 @@ K-fold cross-validation. Run the pipeline once per fold (varying `fold_index`) t
 2. Fold at `fold_index` becomes the test set.
 3. Remaining rows form `train_pool`.
 4. Validation is sampled from `train_pool` using `val_from_train` settings.
+5. In DOE mode, if `fold_index` / `repeat_index` are not declared in the spec, the generator fans out all folds/repeats automatically.
 
 ### `mode: nested_holdout_cv`
 
@@ -308,8 +309,8 @@ Two-level splitting: an outer holdout test set (never touched during model selec
 | `outer.random_state` | (from split) | Seed for outer split. |
 | `inner.n_splits` | `5` | Number of inner CV folds. |
 | `inner.repeats` | `1` | Number of inner CV repeats. |
-| `inner.fold_index` | `0` | Which inner fold to run. |
-| `inner.repeat_index` | `0` | Which inner repeat to run. |
+| `inner.fold_index` | `0` | Which inner fold to run. Runtime/execution axis, not usually a scientific DOE axis. |
+| `inner.repeat_index` | `0` | Which inner repeat to run. Runtime/execution axis, not usually a scientific DOE axis. |
 | `inner.random_state` | (from split) | Seed for inner CV. |
 
 **Behavior:**

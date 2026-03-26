@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -43,16 +44,90 @@ class ChildJob:
 class GeneralizationRecord:
     case_name: str
     model_type: str | None
+    split_mode: str | None
     split_strategy: str | None
+    feature_input: str | None
     metric_name: str
     train_value: float
     test_value: float
     val_value: float | None
     gap_train_minus_test: float
+    gap_train_minus_test_std: float | None
     overfit_flag: bool
     underfit_flag: bool
     config_path: str | None
     run_dir: str | None
+    scientific_config_id: str | None = None
+    execution_label: str | None = None
+    state: str | None = None
+    failure_reason: str | None = None
+    slice_count: int = 1
+    completed_slices: int = 1
+    failed_slices: int = 0
+    config_paths: tuple[str, ...] = ()
+    run_dirs: tuple[str, ...] = ()
+
+
+METRIC_FIELDS = [
+    "r2",
+    "mae",
+    "rmse",
+    "mse",
+    "auc",
+    "auprc",
+    "accuracy",
+    "f1",
+    "train_r2",
+    "test_r2",
+    "val_r2",
+    "train_mae",
+    "test_mae",
+    "val_mae",
+    "train_rmse",
+    "test_rmse",
+    "val_rmse",
+    "train_mse",
+    "test_mse",
+    "val_mse",
+    "train_auc",
+    "test_auc",
+    "val_auc",
+    "train_auprc",
+    "test_auprc",
+    "val_auprc",
+    "train_accuracy",
+    "test_accuracy",
+    "val_accuracy",
+    "train_f1",
+    "test_f1",
+    "val_f1",
+]
+
+
+RUN_METRIC_CSV_FIELDS = [
+    "case_name",
+    "group_index",
+    "scientific_config_id",
+    "job_id",
+    "state",
+    "failure_reason",
+    "profile",
+    "model_type",
+    "feature_input",
+    "split_mode",
+    "split_strategy",
+    "execution_label",
+    "slice_count",
+    "completed_slices",
+    "failed_slices",
+    "elapsed",
+    "config_path",
+    "config_paths",
+    "run_dir",
+    "run_dirs",
+    "metrics_path",
+    "metrics_paths",
+] + METRIC_FIELDS + [f"{field}_std" for field in METRIC_FIELDS]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -233,6 +308,13 @@ def _derive_failure_reason(job_state: str, step_states: list[str]) -> str | None
 def _safe_float(value: Any) -> float | None:
     if value is None:
         return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_case_index(case_name: str) -> int | None:
@@ -254,10 +336,128 @@ def _load_all_runs_metrics_csv(path: Path) -> list[dict[str, str]]:
         for row in reader:
             rows.append({k: (v if v is not None else "") for k, v in row.items()})
     return rows
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+
+
+def _stable_hash(payload: Any) -> str:
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _get_dotted(container: dict[str, Any], dotted: str, default: Any = None) -> Any:
+    current: Any = container
+    for part in [p for p in dotted.split(".") if p]:
+        if not isinstance(current, dict) or part not in current:
+            return default
+        current = current[part]
+    return current
+
+
+def _pop_dotted(container: dict[str, Any], dotted: str) -> None:
+    parts = [p for p in dotted.split(".") if p]
+    if not parts:
+        return
+    parents: list[tuple[dict[str, Any], str]] = []
+    current: Any = container
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or part not in current:
+            return
+        parents.append((current, part))
+        current = current[part]
+    if not isinstance(current, dict):
+        return
+    current.pop(parts[-1], None)
+    while parents:
+        parent, key = parents.pop()
+        child = parent.get(key)
+        if isinstance(child, dict) and not child:
+            parent.pop(key, None)
+        else:
+            break
+
+
+def _infer_feature_input(config: dict[str, Any]) -> str | None:
+    nodes = ((config.get("pipeline") or {}).get("nodes") if isinstance(config.get("pipeline"), dict) else None) or []
+    if "featurize.morgan" in nodes:
+        return "featurize.morgan"
+    if "featurize.rdkit_labeled" in nodes:
+        return "featurize.rdkit_labeled"
+    if "featurize.rdkit" in nodes:
+        return "featurize.rdkit"
+    if "featurize.lipinski" in nodes:
+        return "featurize.lipinski"
+    if "featurize.none" in nodes:
+        return "featurize.none"
+    return "none" if "train" in nodes else None
+
+
+def _scientific_config_payload(config: dict[str, Any]) -> dict[str, Any]:
+    payload = json.loads(json.dumps(config))
+    global_cfg = payload.get("global")
+    if isinstance(global_cfg, dict):
+        global_cfg.pop("base_dir", None)
+        global_cfg.pop("run_dir", None)
+        runs_cfg = global_cfg.get("runs")
+        if isinstance(runs_cfg, dict):
+            runs_cfg.pop("id", None)
+    split_mode = str(_get_dotted(payload, "split.mode", "")).strip().lower()
+    if split_mode == "cv":
+        _pop_dotted(payload, "split.cv.fold_index")
+        _pop_dotted(payload, "split.cv.repeat_index")
+    elif split_mode == "nested_holdout_cv":
+        _pop_dotted(payload, "split.inner.fold_index")
+        _pop_dotted(payload, "split.inner.repeat_index")
+    return payload
+
+
+def _scientific_config_id(config: dict[str, Any]) -> str:
+    return _stable_hash(_scientific_config_payload(config))
+
+
+def _execution_label(config: dict[str, Any]) -> str:
+    split_mode = str(_get_dotted(config, "split.mode", "holdout")).strip().lower() or "holdout"
+    if split_mode == "cv":
+        fold_index = int(_get_dotted(config, "split.cv.fold_index", 0))
+        repeat_index = int(_get_dotted(config, "split.cv.repeat_index", 0))
+        return f"rep{repeat_index}_fold{fold_index}"
+    if split_mode == "nested_holdout_cv":
+        stage = str(_get_dotted(config, "split.stage", "inner")).strip().lower() or "inner"
+        if stage == "inner":
+            fold_index = int(_get_dotted(config, "split.inner.fold_index", 0))
+            repeat_index = int(_get_dotted(config, "split.inner.repeat_index", 0))
+            return f"{stage}_rep{repeat_index}_fold{fold_index}"
+        return stage
+    return split_mode
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _std(values: list[float]) -> float:
+    if len(values) <= 1:
+        return 0.0
+    mu = _mean(values)
+    variance = sum((v - mu) ** 2 for v in values) / len(values)
+    return math.sqrt(variance)
+
+
+def _join_unique(values: list[str]) -> str:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return ";".join(out)
+
+
+def _failure_summary(rows: list[dict[str, Any]]) -> str:
+    counts = Counter(str(r.get("failure_reason", "")).strip() for r in rows if str(r.get("failure_reason", "")).strip())
+    if not counts:
+        return ""
+    return ",".join(f"{reason}={count}" for reason, count in sorted(counts.items()))
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -343,6 +543,11 @@ def _build_generalization_records(
         metric_name = _extract_primary_metric(split_metrics)
         if not metric_name:
             continue
+        split_mode = str(_get_dotted(cfg, "split.mode", job.split_mode or "")).strip() or None
+        split_strategy = str(_get_dotted(cfg, "split.strategy", job.split_strategy or "")).strip() or None
+        feature_input = _infer_feature_input(cfg)
+        scientific_config_id = _scientific_config_id(cfg)
+        execution_label = _execution_label(cfg)
         train = split_metrics.get("train") or {}
         test = split_metrics.get("test") or {}
         val = split_metrics.get("val") or {}
@@ -362,19 +567,102 @@ def _build_generalization_records(
             GeneralizationRecord(
                 case_name=job.case_name or cfg_path.stem,
                 model_type=job.model_type or (model_type or None),
-                split_strategy=job.split_strategy,
+                split_mode=split_mode,
+                split_strategy=split_strategy,
+                feature_input=feature_input,
                 metric_name=metric_name,
                 train_value=train_v,
                 test_value=test_v,
                 val_value=val_v,
                 gap_train_minus_test=gap,
+                gap_train_minus_test_std=None,
                 overfit_flag=overfit_flag,
                 underfit_flag=underfit_flag,
                 config_path=str(cfg_path),
                 run_dir=str(run_dir),
+                scientific_config_id=scientific_config_id,
+                execution_label=execution_label,
+                state="COMPLETED",
+                failure_reason=None,
+                slice_count=1,
+                completed_slices=1,
+                failed_slices=0,
+                config_paths=(str(cfg_path),),
+                run_dirs=(str(run_dir),),
             )
         )
     return records
+
+
+def _aggregate_generalization_records(
+    records: list[GeneralizationRecord],
+    overfit_threshold: float,
+    underfit_threshold_r2: float,
+    underfit_threshold_auc: float,
+    config_summary: dict[str, dict[str, Any]] | None = None,
+) -> list[GeneralizationRecord]:
+    grouped: dict[tuple[str, str], list[GeneralizationRecord]] = defaultdict(list)
+    for record in records:
+        group_key = (record.scientific_config_id or record.case_name, record.metric_name)
+        grouped[group_key].append(record)
+
+    def _sort_key(item: tuple[tuple[str, str], list[GeneralizationRecord]]) -> tuple[int, str]:
+        recs = item[1]
+        indices = [_parse_case_index(r.case_name) for r in recs]
+        numeric = [idx for idx in indices if idx is not None]
+        return (min(numeric) if numeric else 10**9, item[0][0])
+
+    aggregated: list[GeneralizationRecord] = []
+    for (scientific_config_id, metric_name), recs in sorted(grouped.items(), key=_sort_key):
+        representative = sorted(recs, key=lambda r: (_parse_case_index(r.case_name) or 10**9, r.case_name))[0]
+        train_values = [r.train_value for r in recs]
+        test_values = [r.test_value for r in recs]
+        val_values = [r.val_value for r in recs if r.val_value is not None]
+        gaps = [r.gap_train_minus_test for r in recs]
+        train_mean = _mean(train_values)
+        test_mean = _mean(test_values)
+        val_mean = _mean(val_values) if val_values else None
+        gap_mean = _mean(gaps)
+        gap_std = _std(gaps)
+        if metric_name == "r2":
+            underfit_flag = train_mean < underfit_threshold_r2 and test_mean < underfit_threshold_r2
+        else:
+            underfit_flag = train_mean < underfit_threshold_auc and test_mean < underfit_threshold_auc
+        summary = (config_summary or {}).get(scientific_config_id, {})
+        slice_count = int(summary.get("slice_count", len(recs)))
+        completed_slices = int(summary.get("completed_slices", len(recs)))
+        failed_slices = int(summary.get("failed_slices", max(slice_count - completed_slices, 0)))
+        state = str(summary.get("state", "COMPLETED" if completed_slices == slice_count else "PARTIAL"))
+        failure_reason = str(summary.get("failure_reason", "")).strip() or None
+        aggregated.append(
+            GeneralizationRecord(
+                case_name=representative.case_name,
+                model_type=representative.model_type,
+                split_mode=representative.split_mode,
+                split_strategy=representative.split_strategy,
+                feature_input=representative.feature_input,
+                metric_name=metric_name,
+                train_value=train_mean,
+                test_value=test_mean,
+                val_value=val_mean,
+                gap_train_minus_test=gap_mean,
+                gap_train_minus_test_std=gap_std,
+                overfit_flag=gap_mean >= overfit_threshold,
+                underfit_flag=underfit_flag,
+                config_path=representative.config_path,
+                run_dir=representative.run_dir,
+                scientific_config_id=scientific_config_id,
+                execution_label="aggregated",
+                state=state,
+                failure_reason=failure_reason,
+                slice_count=slice_count,
+                completed_slices=completed_slices,
+                failed_slices=failed_slices,
+                config_paths=tuple(sorted({p for r in recs for p in r.config_paths if p})),
+                run_dirs=tuple(sorted({p for r in recs for p in r.run_dirs if p})),
+            )
+        )
+    return aggregated
 
 
 def _write_generalization_csv(path: Path, records: list[GeneralizationRecord]) -> None:
@@ -383,17 +671,29 @@ def _write_generalization_csv(path: Path, records: list[GeneralizationRecord]) -
             fh,
             fieldnames=[
                 "case_name",
+                "scientific_config_id",
                 "model_type",
+                "feature_input",
+                "split_mode",
                 "split_strategy",
+                "execution_label",
+                "state",
+                "failure_reason",
+                "slice_count",
+                "completed_slices",
+                "failed_slices",
                 "metric_name",
                 "train_value",
                 "test_value",
                 "val_value",
                 "gap_train_minus_test",
+                "gap_train_minus_test_std",
                 "overfit_flag",
                 "underfit_flag",
                 "config_path",
+                "config_paths",
                 "run_dir",
+                "run_dirs",
             ],
         )
         writer.writeheader()
@@ -401,17 +701,29 @@ def _write_generalization_csv(path: Path, records: list[GeneralizationRecord]) -
             writer.writerow(
                 {
                     "case_name": r.case_name,
+                    "scientific_config_id": r.scientific_config_id or "",
                     "model_type": r.model_type or "",
+                    "feature_input": r.feature_input or "",
+                    "split_mode": r.split_mode or "",
                     "split_strategy": r.split_strategy or "",
+                    "execution_label": r.execution_label or "",
+                    "state": r.state or "",
+                    "failure_reason": r.failure_reason or "",
+                    "slice_count": r.slice_count,
+                    "completed_slices": r.completed_slices,
+                    "failed_slices": r.failed_slices,
                     "metric_name": r.metric_name,
                     "train_value": r.train_value,
                     "test_value": r.test_value,
                     "val_value": "" if r.val_value is None else r.val_value,
                     "gap_train_minus_test": r.gap_train_minus_test,
+                    "gap_train_minus_test_std": "" if r.gap_train_minus_test_std is None else r.gap_train_minus_test_std,
                     "overfit_flag": int(r.overfit_flag),
                     "underfit_flag": int(r.underfit_flag),
                     "config_path": r.config_path or "",
+                    "config_paths": ";".join(r.config_paths),
                     "run_dir": r.run_dir or "",
+                    "run_dirs": ";".join(r.run_dirs),
                 }
             )
 
@@ -427,13 +739,18 @@ def _write_generalization_plot(path: Path, records: list[GeneralizationRecord], 
     x = list(range(1, len(ranked) + 1))
     y = [r.gap_train_minus_test for r in ranked]
     colors = ["#d62728" if r.overfit_flag else "#1f77b4" for r in ranked]
+    aggregated = any(r.slice_count > 1 for r in ranked)
     plt.figure(figsize=(13, 5.5))
     plt.bar(x, y, color=colors, alpha=0.9)
     plt.axhline(threshold, color="#d62728", linestyle="--", linewidth=1.4, label=f"Overfit threshold ({threshold:.2f})")
     plt.axhline(0.0, color="black", linestyle="-", linewidth=1.0)
-    plt.xlabel("Case Rank (sorted by train-test gap)")
+    plt.xlabel("Scientific Config Rank" if aggregated else "Case Rank (sorted by train-test gap)")
     plt.ylabel("Generalization gap (train - test)")
-    plt.title("Per-case Generalization Gap (higher => more overfitting risk)")
+    plt.title(
+        "Per-configuration Generalization Gap (higher => more overfitting risk)"
+        if aggregated
+        else "Per-case Generalization Gap (higher => more overfitting risk)"
+    )
     plt.legend(loc="upper right")
     plt.tight_layout()
     plt.savefig(path)
@@ -496,6 +813,12 @@ def _build_all_runs_metric_rows(jobs: list[ChildJob]) -> list[dict[str, Any]]:
         cfg: dict[str, Any] = {}
         run_dir: str | None = None
         model_type = job.model_type or ""
+        profile = job.profile or ""
+        split_mode = job.split_mode or ""
+        split_strategy = job.split_strategy or ""
+        feature_input = ""
+        scientific_config_id = ""
+        execution_label = ""
         metrics_payload: dict[str, Any] | None = None
         metrics_path: str | None = None
         split_metrics: dict[str, Any] | None = None
@@ -510,6 +833,13 @@ def _build_all_runs_metric_rows(jobs: list[ChildJob]) -> list[dict[str, Any]]:
                             cfg = loaded
                     except Exception:
                         cfg = {}
+
+        if cfg:
+            split_mode = str(_get_dotted(cfg, "split.mode", split_mode)).strip() or split_mode
+            split_strategy = str(_get_dotted(cfg, "split.strategy", split_strategy)).strip() or split_strategy
+            feature_input = _infer_feature_input(cfg) or ""
+            scientific_config_id = _scientific_config_id(cfg)
+            execution_label = _execution_label(cfg)
 
         global_cfg = cfg.get("global") if isinstance(cfg.get("global"), dict) else {}
         train_cfg = cfg.get("train") if isinstance(cfg.get("train"), dict) else {}
@@ -535,17 +865,27 @@ def _build_all_runs_metric_rows(jobs: list[ChildJob]) -> list[dict[str, Any]]:
         rows.append(
             {
                 "case_name": job.case_name or "",
+                "group_index": "",
+                "scientific_config_id": scientific_config_id,
                 "job_id": job.job_id,
                 "state": job.state,
                 "failure_reason": job.failure_reason or "",
-                "profile": job.profile or "",
+                "profile": profile,
                 "model_type": model_type,
-                "split_mode": job.split_mode or "",
-                "split_strategy": job.split_strategy or "",
+                "feature_input": feature_input,
+                "split_mode": split_mode,
+                "split_strategy": split_strategy,
+                "execution_label": execution_label,
+                "slice_count": 1,
+                "completed_slices": 1 if str(job.state).upper() == "COMPLETED" else 0,
+                "failed_slices": 0 if str(job.state).upper() == "COMPLETED" else 1,
                 "elapsed": job.elapsed,
                 "config_path": job.config_path or "",
+                "config_paths": job.config_path or "",
                 "run_dir": run_dir or "",
+                "run_dirs": run_dir or "",
                 "metrics_path": metrics_path or "",
+                "metrics_paths": metrics_path or "",
                 "r2": _pick_metric("r2", top_metrics, test_split, val_split, train_split),
                 "mae": _pick_metric("mae", top_metrics, test_split, val_split, train_split),
                 "rmse": _pick_metric("rmse", top_metrics, test_split, val_split, train_split),
@@ -580,64 +920,105 @@ def _build_all_runs_metric_rows(jobs: list[ChildJob]) -> list[dict[str, Any]]:
                 "val_f1": val_split.get("f1", ""),
             }
         )
+        for metric_field in METRIC_FIELDS:
+            rows[-1][f"{metric_field}_std"] = ""
 
     return rows
+
+
+def _aggregate_all_runs_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        scientific_id = str(row.get("scientific_config_id", "")).strip()
+        key = scientific_id or str(row.get("config_path", "")).strip() or str(row.get("case_name", "")).strip()
+        grouped[key].append(row)
+
+    def _sort_key(item: tuple[str, list[dict[str, Any]]]) -> tuple[int, str]:
+        recs = item[1]
+        indices = [_parse_case_index(str(r.get("case_name", ""))) for r in recs]
+        numeric = [idx for idx in indices if idx is not None]
+        return (min(numeric) if numeric else 10**9, item[0])
+
+    aggregated_rows: list[dict[str, Any]] = []
+    for group_index, (_, recs) in enumerate(sorted(grouped.items(), key=_sort_key), start=1):
+        representative = sorted(
+            recs,
+            key=lambda r: (_parse_case_index(str(r.get("case_name", ""))) or 10**9, str(r.get("case_name", ""))),
+        )[0]
+        completed = [r for r in recs if str(r.get("state", "")).upper() == "COMPLETED"]
+        completed_count = len(completed)
+        slice_count = len(recs)
+        if completed_count == slice_count and slice_count > 0:
+            state = "COMPLETED"
+            failure_reason = ""
+        elif completed_count > 0:
+            state = "PARTIAL"
+            failure_reason = _failure_summary([r for r in recs if str(r.get("state", "")).upper() != "COMPLETED"])
+        else:
+            state_counts = Counter(str(r.get("state", "")).strip() for r in recs if str(r.get("state", "")).strip())
+            state = state_counts.most_common(1)[0][0] if state_counts else "UNKNOWN"
+            failure_reason = _failure_summary(recs)
+
+        aggregate: dict[str, Any] = {
+            "case_name": representative.get("case_name", ""),
+            "group_index": group_index,
+            "scientific_config_id": representative.get("scientific_config_id", ""),
+            "job_id": _join_unique([str(r.get("job_id", "")) for r in recs]),
+            "state": state,
+            "failure_reason": failure_reason,
+            "profile": representative.get("profile", ""),
+            "model_type": representative.get("model_type", ""),
+            "feature_input": representative.get("feature_input", ""),
+            "split_mode": representative.get("split_mode", ""),
+            "split_strategy": representative.get("split_strategy", ""),
+            "execution_label": "aggregated",
+            "slice_count": slice_count,
+            "completed_slices": completed_count,
+            "failed_slices": slice_count - completed_count,
+            "elapsed": "",
+            "config_path": representative.get("config_path", ""),
+            "config_paths": _join_unique([str(r.get("config_path", "")) for r in recs]),
+            "run_dir": representative.get("run_dir", ""),
+            "run_dirs": _join_unique([str(r.get("run_dir", "")) for r in recs]),
+            "metrics_path": representative.get("metrics_path", ""),
+            "metrics_paths": _join_unique([str(r.get("metrics_path", "")) for r in recs]),
+        }
+        for metric_field in METRIC_FIELDS:
+            values = [
+                v
+                for v in (_safe_float(r.get(metric_field)) for r in completed)
+                if v is not None
+            ]
+            aggregate[metric_field] = _mean(values) if values else ""
+            aggregate[f"{metric_field}_std"] = _std(values) if values else ""
+        aggregated_rows.append(aggregate)
+    return aggregated_rows
+
+
+def _summarize_scientific_configs(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    summary: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        scientific_id = str(row.get("scientific_config_id", "")).strip()
+        if not scientific_id:
+            continue
+        summary[scientific_id] = {
+            "state": str(row.get("state", "")).strip() or "UNKNOWN",
+            "failure_reason": str(row.get("failure_reason", "")).strip(),
+            "slice_count": int(_safe_float(row.get("slice_count")) or 0),
+            "completed_slices": int(_safe_float(row.get("completed_slices")) or 0),
+            "failed_slices": int(_safe_float(row.get("failed_slices")) or 0),
+        }
+    return summary
 
 
 def _write_all_runs_metrics_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         path.write_text("", encoding="utf-8")
         return
-    fieldnames = [
-        "case_name",
-        "job_id",
-        "state",
-        "failure_reason",
-        "profile",
-        "model_type",
-        "split_mode",
-        "split_strategy",
-        "elapsed",
-        "config_path",
-        "run_dir",
-        "metrics_path",
-        "r2",
-        "mae",
-        "rmse",
-        "mse",
-        "auc",
-        "auprc",
-        "accuracy",
-        "f1",
-        "train_r2",
-        "test_r2",
-        "val_r2",
-        "train_mae",
-        "test_mae",
-        "val_mae",
-        "train_rmse",
-        "test_rmse",
-        "val_rmse",
-        "train_mse",
-        "test_mse",
-        "val_mse",
-        "train_auc",
-        "test_auc",
-        "val_auc",
-        "train_auprc",
-        "test_auprc",
-        "val_auprc",
-        "train_accuracy",
-        "test_accuracy",
-        "val_accuracy",
-        "train_f1",
-        "test_f1",
-        "val_f1",
-    ]
     with path.open("w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer = csv.DictWriter(fh, fieldnames=RUN_METRIC_CSV_FIELDS)
         writer.writeheader()
-        for row in sorted(rows, key=lambda r: (str(r.get("case_name", "")), str(r.get("job_id", "")))):
+        for row in sorted(rows, key=lambda r: (str(r.get("group_index", "")), str(r.get("case_name", "")), str(r.get("job_id", "")))):
             writer.writerow(row)
 
 
@@ -651,9 +1032,13 @@ def _write_all_runs_plots(output_dir: Path, rows: list[dict[str, Any]]) -> list[
     if not completed:
         return []
 
+    has_group_index = any(_safe_float(r.get("group_index")) is not None for r in completed)
     for r in completed:
-        case_name = str(r.get("case_name", ""))
-        r["_case_index"] = _parse_case_index(case_name)
+        if has_group_index:
+            r["_plot_index"] = int(_safe_float(r.get("group_index")) or 0)
+        else:
+            case_name = str(r.get("case_name", ""))
+            r["_plot_index"] = _parse_case_index(case_name)
 
     plotted_paths: list[str] = []
 
@@ -678,7 +1063,7 @@ def _write_all_runs_plots(output_dir: Path, rows: list[dict[str, Any]]) -> list[
         for ax, (key, label) in zip(axes, available):
             points = []
             for r in completed:
-                x = r.get("_case_index")
+                x = r.get("_plot_index")
                 y = _safe_float(r.get(key))
                 if x is None or y is None:
                     continue
@@ -690,13 +1075,13 @@ def _write_all_runs_plots(output_dir: Path, rows: list[dict[str, Any]]) -> list[
                 ax.plot([p[0] for p in points], [p[1] for p in points], color="#b0b0b0", linewidth=0.8, alpha=0.5)
             ax.set_ylabel(label)
             ax.grid(alpha=0.25)
-        axes[-1].set_xlabel("Case Number")
+        axes[-1].set_xlabel("Scientific Config Index" if has_group_index else "Case Number")
         handles = [
             plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="#1f77b4", markersize=7, label="random"),
             plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="#ff7f0e", markersize=7, label="scaffold"),
         ]
         axes[0].legend(handles=handles, title="split_strategy", loc="best")
-        plt.suptitle("Test Metrics by Case Number", y=0.995)
+        plt.suptitle("Test Metrics by Scientific Config" if has_group_index else "Test Metrics by Case Number", y=0.995)
         plt.tight_layout()
         out = output_dir / "test_metrics_by_case.png"
         plt.savefig(out, dpi=160)
@@ -957,23 +1342,37 @@ def main() -> int:
     csv_path = output_dir / "jobs.csv"
     failed_cfg_path = output_dir / "failed_case_configs.txt"
     failed_job_path = output_dir / "failed_job_ids.txt"
+    raw_gap_csv_path = output_dir / "generalization_gaps_by_execution.csv"
     gap_csv_path = output_dir / "generalization_gaps.csv"
     model_gap_csv_path = output_dir / "generalization_gap_by_model.csv"
     overfit_plot_path = output_dir / "generalization_gap_plot.png"
     overfit_cfg_path = output_dir / "overfit_case_configs.txt"
     underfit_cfg_path = output_dir / "underfit_case_configs.txt"
+    raw_all_runs_metrics_path = output_dir / "all_runs_metrics_by_execution.csv"
     all_runs_metrics_path = output_dir / "all_runs_metrics.csv"
 
-    overfit_records = _build_generalization_records(
+    raw_all_runs_metric_rows = _build_all_runs_metric_rows(jobs)
+    all_runs_metric_rows = _aggregate_all_runs_metric_rows(raw_all_runs_metric_rows)
+    config_summary = _summarize_scientific_configs(all_runs_metric_rows)
+    raw_overfit_records = _build_generalization_records(
         jobs=jobs,
         overfit_threshold=float(args.overfit_threshold),
         underfit_threshold_r2=float(args.underfit_threshold_r2),
         underfit_threshold_auc=float(args.underfit_threshold_auc),
     )
+    overfit_records = _aggregate_generalization_records(
+        records=raw_overfit_records,
+        overfit_threshold=float(args.overfit_threshold),
+        underfit_threshold_r2=float(args.underfit_threshold_r2),
+        underfit_threshold_auc=float(args.underfit_threshold_auc),
+        config_summary=config_summary,
+    )
+    complete_overfit_records = [r for r in overfit_records if r.slice_count > 0 and r.completed_slices == r.slice_count]
+    _write_generalization_csv(raw_gap_csv_path, raw_overfit_records)
     _write_generalization_csv(gap_csv_path, overfit_records)
-    _write_model_gap_summary(model_gap_csv_path, overfit_records)
-    _write_generalization_plot(overfit_plot_path, overfit_records, float(args.overfit_threshold))
-    all_runs_metric_rows = _build_all_runs_metric_rows(jobs)
+    _write_model_gap_summary(model_gap_csv_path, complete_overfit_records)
+    _write_generalization_plot(overfit_plot_path, complete_overfit_records, float(args.overfit_threshold))
+    _write_all_runs_metrics_csv(raw_all_runs_metrics_path, raw_all_runs_metric_rows)
     _write_all_runs_metrics_csv(all_runs_metrics_path, all_runs_metric_rows)
     all_runs_plot_paths = _write_all_runs_plots(output_dir=output_dir, rows=all_runs_metric_rows)
 
@@ -981,18 +1380,23 @@ def main() -> int:
         "overfit_threshold": float(args.overfit_threshold),
         "underfit_threshold_r2": float(args.underfit_threshold_r2),
         "underfit_threshold_auc": float(args.underfit_threshold_auc),
+        "records_by_execution": len(raw_overfit_records),
         "records_analyzed": len(overfit_records),
-        "overfit_count": sum(1 for r in overfit_records if r.overfit_flag),
-        "underfit_count": sum(1 for r in overfit_records if r.underfit_flag),
+        "records_complete": len(complete_overfit_records),
+        "records_partial_or_incomplete": len(overfit_records) - len(complete_overfit_records),
+        "overfit_count": sum(1 for r in complete_overfit_records if r.overfit_flag),
+        "underfit_count": sum(1 for r in complete_overfit_records if r.underfit_flag),
+        "generalization_gaps_by_execution_csv": str(raw_gap_csv_path),
         "generalization_gaps_csv": str(gap_csv_path),
         "generalization_gap_by_model_csv": str(model_gap_csv_path),
         "generalization_gap_plot": str(overfit_plot_path),
     }
+    report["all_runs_metrics_by_execution_csv"] = str(raw_all_runs_metrics_path)
     report["all_runs_metrics_csv"] = str(all_runs_metrics_path)
     report["all_runs_plot_paths"] = all_runs_plot_paths
 
-    overfit_cfg_lines = [r.config_path for r in overfit_records if r.overfit_flag and r.config_path]
-    underfit_cfg_lines = [r.config_path for r in overfit_records if r.underfit_flag and r.config_path]
+    overfit_cfg_lines = sorted({path for r in complete_overfit_records if r.overfit_flag for path in (r.config_paths or ((r.config_path,) if r.config_path else ())) if path})
+    underfit_cfg_lines = sorted({path for r in complete_overfit_records if r.underfit_flag for path in (r.config_paths or ((r.config_path,) if r.config_path else ())) if path})
     overfit_cfg_path.write_text("\n".join(overfit_cfg_lines) + ("\n" if overfit_cfg_lines else ""), encoding="utf-8")
     underfit_cfg_path.write_text("\n".join(underfit_cfg_lines) + ("\n" if underfit_cfg_lines else ""), encoding="utf-8")
 
@@ -1005,7 +1409,7 @@ def main() -> int:
     failed_cfg_path.write_text("\n".join(failed_cfg_lines) + ("\n" if failed_cfg_lines else ""), encoding="utf-8")
     failed_job_path.write_text("\n".join(failed_job_lines) + ("\n" if failed_job_lines else ""), encoding="utf-8")
 
-    _print_summary(orch_id, jobs, mapping_mismatch, output_dir, overfit_records)
+    _print_summary(orch_id, jobs, mapping_mismatch, output_dir, complete_overfit_records)
     return 0
 
 

@@ -50,8 +50,9 @@ Important conventions:
 - `search_space` keys use dotted paths (for example `split.mode`, `train.model.type`).
 - Values can be a scalar or list; scalar is treated as a single-value axis.
 - `defaults` uses the same dotted-path style and is applied before `search_space` factors.
-- For `split.mode: cv` or `nested_holdout_cv`, include fold axes in `search_space`
-  (`split.cv.fold_index` / `split.cv.repeat_index` or nested equivalents) when you want multi-fold evaluation.
+- For `split.mode: cv` or `nested_holdout_cv`, keep `n_splits` / `repeats` in `defaults`.
+- If fold/repeat indices are omitted from both `defaults` and `search_space`, DOE generation expands all folds/repeats automatically.
+- Set fold/repeat indices explicitly only when you intentionally want a single execution slice (for example debugging or retrying one failed fold).
 - By default, generated cases are isolated per DOE spec hash + case id:
   - `global.base_dir` becomes `<base_dir>/<doe_spec_hash[:8]>/<case_id>`
   - `global.run_dir` becomes `<run_dir>/<doe_spec_hash[:8]>/<case_id>` (or `<output.dir>/runs/<doe_spec_hash[:8]>/<case_id>`)
@@ -123,3 +124,70 @@ You can override in `selection.primary_metric`.
 - Avoid selecting the "best" config by comparing many configs on one fixed test split.
 - Prefer `split.mode: nested_holdout_cv` (or repeated CV) and aggregate metrics across folds/repeats.
 - Use the final untouched holdout only once for final reporting.
+
+## DOE best practices
+
+Use these rules when building DOE files for cluster runs.
+
+### 1) Use one DOE file per split mode
+
+- Keep `holdout`, `cv`, and `nested_holdout_cv` in separate DOE specs.
+- Reason: DOE uses a cartesian grid and does not support conditional axes.
+- If you mix modes in one grid, some execution settings become meaningless for some rows (for example CV fold settings in holdout mode).
+
+### 2) Keep only meaningful search axes
+
+- Put fixed choices in `defaults`.
+- Put only true experiment axes in `search_space`.
+- Good: vary `train.model.type`, `split.strategy`, and maybe one featurizer.
+- Avoid large mixed grids unless you need them; they grow very quickly.
+
+### 3) For chemistry model comparison, prefer scaffold CV
+
+- Use `split.mode: cv` with `split.strategy: scaffold` for generalization-focused comparison.
+- Set at least:
+  - `split.cv.n_splits: 5`
+  - `split.cv.repeats: 1` (increase if budget allows)
+- Let DOE auto-expand folds/repeats unless you are debugging a specific failed fold.
+- Requirement: scaffold CV needs `canonical_smiles` in curated data.
+
+### 4) Separate hyperparameter search from evaluation design
+
+- `train.tuning.method: train_cv` is inner model tuning.
+- `split.mode: cv` or `nested_holdout_cv` is outer evaluation design.
+- Do not treat inner tuning CV alone as final performance evidence.
+
+### 5) Run a small pilot before full DOE
+
+- First run with:
+  - one model family
+  - one feature mode
+  - a few cases only
+- Confirm:
+  - metrics files are written
+  - split metadata is produced
+  - runtime is acceptable
+  - no recurring OOM/timeouts
+
+### 6) Make failure handling explicit
+
+- Always inspect:
+  - `summary.json`
+  - `manifest.jsonl`
+  - case `run_status.json` and cluster logs
+- Treat obvious pathological runs (for example extreme MAE / huge negative R2) as failed for selection.
+- Re-run only failed/stuck cases with adjusted resources or safer model params.
+
+### 7) Report robustly, not by single best point
+
+- Aggregate by fold/repeat:
+  - mean/median
+  - spread (`std` or IQR)
+- Compare models on matched splits where possible.
+- Keep holdout-only sweeps for debugging or preliminary screening, not final claims.
+
+### 8) Use deterministic, auditable settings
+
+- Set `global.random_state` explicitly.
+- Keep `constraints.isolate_case_artifacts: true`.
+- Preserve generated configs + manifests with results bundles for reproducibility.
