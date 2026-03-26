@@ -29,11 +29,14 @@ CHILD_ID_PATTERN = re.compile(r"Submitted batch job (\d+)")
 class ChildJob:
     job_id: str
     case_name: str | None
+    parent_case_id: str | None
     config_path: str | None
     profile: str | None
     model_type: str | None
     split_mode: str | None
     split_strategy: str | None
+    scientific_config_id: str | None
+    execution_label: str | None
     state: str
     exit_code: str
     elapsed: str
@@ -57,11 +60,13 @@ class GeneralizationRecord:
     underfit_flag: bool
     config_path: str | None
     run_dir: str | None
+    parent_case_id: str | None = None
     scientific_config_id: str | None = None
     execution_label: str | None = None
     state: str | None = None
     failure_reason: str | None = None
     slice_count: int = 1
+    metric_slices_used: int = 1
     completed_slices: int = 1
     failed_slices: int = 0
     config_paths: tuple[str, ...] = ()
@@ -107,6 +112,7 @@ METRIC_FIELDS = [
 RUN_METRIC_CSV_FIELDS = [
     "case_name",
     "group_index",
+    "parent_case_id",
     "scientific_config_id",
     "job_id",
     "state",
@@ -220,8 +226,8 @@ def _parse_child_job_ids(orchestrator_out: Path) -> list[str]:
     return deduped
 
 
-def _load_valid_config_paths(manifest_path: Path) -> list[str]:
-    valid: list[str] = []
+def _load_valid_manifest_records(manifest_path: Path) -> list[dict[str, Any]]:
+    valid: list[dict[str, Any]] = []
     for line in _read_text(manifest_path).splitlines():
         line = line.strip()
         if not line:
@@ -229,9 +235,12 @@ def _load_valid_config_paths(manifest_path: Path) -> list[str]:
         rec = json.loads(line)
         if str(rec.get("status", "")).lower() != "valid":
             continue
+        record_type = str(rec.get("record_type", "execution_child")).strip().lower()
+        if record_type == "parent":
+            continue
         cfg = rec.get("config_path")
         if cfg:
-            valid.append(str(cfg))
+            valid.append(rec)
     return valid
 
 
@@ -546,8 +555,8 @@ def _build_generalization_records(
         split_mode = str(_get_dotted(cfg, "split.mode", job.split_mode or "")).strip() or None
         split_strategy = str(_get_dotted(cfg, "split.strategy", job.split_strategy or "")).strip() or None
         feature_input = _infer_feature_input(cfg)
-        scientific_config_id = _scientific_config_id(cfg)
-        execution_label = _execution_label(cfg)
+        scientific_config_id = job.scientific_config_id or _scientific_config_id(cfg)
+        execution_label = job.execution_label or _execution_label(cfg)
         train = split_metrics.get("train") or {}
         test = split_metrics.get("test") or {}
         val = split_metrics.get("val") or {}
@@ -580,11 +589,13 @@ def _build_generalization_records(
                 underfit_flag=underfit_flag,
                 config_path=str(cfg_path),
                 run_dir=str(run_dir),
+                parent_case_id=job.parent_case_id,
                 scientific_config_id=scientific_config_id,
                 execution_label=execution_label,
                 state="COMPLETED",
                 failure_reason=None,
                 slice_count=1,
+                metric_slices_used=1,
                 completed_slices=1,
                 failed_slices=0,
                 config_paths=(str(cfg_path),),
@@ -603,7 +614,7 @@ def _aggregate_generalization_records(
 ) -> list[GeneralizationRecord]:
     grouped: dict[tuple[str, str], list[GeneralizationRecord]] = defaultdict(list)
     for record in records:
-        group_key = (record.scientific_config_id or record.case_name, record.metric_name)
+        group_key = (record.parent_case_id or record.scientific_config_id or record.case_name, record.metric_name)
         grouped[group_key].append(record)
 
     def _sort_key(item: tuple[tuple[str, str], list[GeneralizationRecord]]) -> tuple[int, str]:
@@ -613,7 +624,7 @@ def _aggregate_generalization_records(
         return (min(numeric) if numeric else 10**9, item[0][0])
 
     aggregated: list[GeneralizationRecord] = []
-    for (scientific_config_id, metric_name), recs in sorted(grouped.items(), key=_sort_key):
+    for (aggregate_key, metric_name), recs in sorted(grouped.items(), key=_sort_key):
         representative = sorted(recs, key=lambda r: (_parse_case_index(r.case_name) or 10**9, r.case_name))[0]
         train_values = [r.train_value for r in recs]
         test_values = [r.test_value for r in recs]
@@ -628,12 +639,25 @@ def _aggregate_generalization_records(
             underfit_flag = train_mean < underfit_threshold_r2 and test_mean < underfit_threshold_r2
         else:
             underfit_flag = train_mean < underfit_threshold_auc and test_mean < underfit_threshold_auc
-        summary = (config_summary or {}).get(scientific_config_id, {})
-        slice_count = int(summary.get("slice_count", len(recs)))
-        completed_slices = int(summary.get("completed_slices", len(recs)))
-        failed_slices = int(summary.get("failed_slices", max(slice_count - completed_slices, 0)))
+        summary = (config_summary or {}).get(aggregate_key, {})
+        slice_count = max(int(summary.get("slice_count", len(recs))), len(recs))
+        completed_job_slices = max(int(summary.get("completed_slices", len(recs))), len(recs))
+        metric_slices_used = len(recs)
+        completed_slices = metric_slices_used
+        failed_slices = max(slice_count - metric_slices_used, 0)
         state = str(summary.get("state", "COMPLETED" if completed_slices == slice_count else "PARTIAL"))
         failure_reason = str(summary.get("failure_reason", "")).strip() or None
+        missing_metric_slices = max(completed_job_slices - metric_slices_used, 0)
+        if missing_metric_slices > 0:
+            state = "PARTIAL"
+            missing_reason = f"missing_generalization_metrics={missing_metric_slices}"
+            failure_reason = (
+                f"{failure_reason}; {missing_reason}"
+                if failure_reason and missing_reason not in failure_reason
+                else failure_reason or missing_reason
+            )
+        elif completed_slices < slice_count and state == "COMPLETED":
+            state = "PARTIAL"
         aggregated.append(
             GeneralizationRecord(
                 case_name=representative.case_name,
@@ -651,11 +675,13 @@ def _aggregate_generalization_records(
                 underfit_flag=underfit_flag,
                 config_path=representative.config_path,
                 run_dir=representative.run_dir,
-                scientific_config_id=scientific_config_id,
+                parent_case_id=representative.parent_case_id,
+                scientific_config_id=representative.scientific_config_id,
                 execution_label="aggregated",
                 state=state,
                 failure_reason=failure_reason,
                 slice_count=slice_count,
+                metric_slices_used=metric_slices_used,
                 completed_slices=completed_slices,
                 failed_slices=failed_slices,
                 config_paths=tuple(sorted({p for r in recs for p in r.config_paths if p})),
@@ -671,6 +697,7 @@ def _write_generalization_csv(path: Path, records: list[GeneralizationRecord]) -
             fh,
             fieldnames=[
                 "case_name",
+                "parent_case_id",
                 "scientific_config_id",
                 "model_type",
                 "feature_input",
@@ -680,6 +707,7 @@ def _write_generalization_csv(path: Path, records: list[GeneralizationRecord]) -
                 "state",
                 "failure_reason",
                 "slice_count",
+                "metric_slices_used",
                 "completed_slices",
                 "failed_slices",
                 "metric_name",
@@ -701,6 +729,7 @@ def _write_generalization_csv(path: Path, records: list[GeneralizationRecord]) -
             writer.writerow(
                 {
                     "case_name": r.case_name,
+                    "parent_case_id": r.parent_case_id or "",
                     "scientific_config_id": r.scientific_config_id or "",
                     "model_type": r.model_type or "",
                     "feature_input": r.feature_input or "",
@@ -710,6 +739,7 @@ def _write_generalization_csv(path: Path, records: list[GeneralizationRecord]) -
                     "state": r.state or "",
                     "failure_reason": r.failure_reason or "",
                     "slice_count": r.slice_count,
+                    "metric_slices_used": r.metric_slices_used,
                     "completed_slices": r.completed_slices,
                     "failed_slices": r.failed_slices,
                     "metric_name": r.metric_name,
@@ -817,8 +847,9 @@ def _build_all_runs_metric_rows(jobs: list[ChildJob]) -> list[dict[str, Any]]:
         split_mode = job.split_mode or ""
         split_strategy = job.split_strategy or ""
         feature_input = ""
-        scientific_config_id = ""
-        execution_label = ""
+        parent_case_id = job.parent_case_id or ""
+        scientific_config_id = job.scientific_config_id or ""
+        execution_label = job.execution_label or ""
         metrics_payload: dict[str, Any] | None = None
         metrics_path: str | None = None
         split_metrics: dict[str, Any] | None = None
@@ -838,8 +869,10 @@ def _build_all_runs_metric_rows(jobs: list[ChildJob]) -> list[dict[str, Any]]:
             split_mode = str(_get_dotted(cfg, "split.mode", split_mode)).strip() or split_mode
             split_strategy = str(_get_dotted(cfg, "split.strategy", split_strategy)).strip() or split_strategy
             feature_input = _infer_feature_input(cfg) or ""
-            scientific_config_id = _scientific_config_id(cfg)
-            execution_label = _execution_label(cfg)
+            if not scientific_config_id:
+                scientific_config_id = _scientific_config_id(cfg)
+            if not execution_label:
+                execution_label = _execution_label(cfg)
 
         global_cfg = cfg.get("global") if isinstance(cfg.get("global"), dict) else {}
         train_cfg = cfg.get("train") if isinstance(cfg.get("train"), dict) else {}
@@ -866,6 +899,7 @@ def _build_all_runs_metric_rows(jobs: list[ChildJob]) -> list[dict[str, Any]]:
             {
                 "case_name": job.case_name or "",
                 "group_index": "",
+                "parent_case_id": parent_case_id,
                 "scientific_config_id": scientific_config_id,
                 "job_id": job.job_id,
                 "state": job.state,
@@ -929,8 +963,14 @@ def _build_all_runs_metric_rows(jobs: list[ChildJob]) -> list[dict[str, Any]]:
 def _aggregate_all_runs_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
+        parent_case_id = str(row.get("parent_case_id", "")).strip()
         scientific_id = str(row.get("scientific_config_id", "")).strip()
-        key = scientific_id or str(row.get("config_path", "")).strip() or str(row.get("case_name", "")).strip()
+        key = (
+            parent_case_id
+            or scientific_id
+            or str(row.get("config_path", "")).strip()
+            or str(row.get("case_name", "")).strip()
+        )
         grouped[key].append(row)
 
     def _sort_key(item: tuple[str, list[dict[str, Any]]]) -> tuple[int, str]:
@@ -962,6 +1002,7 @@ def _aggregate_all_runs_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str
         aggregate: dict[str, Any] = {
             "case_name": representative.get("case_name", ""),
             "group_index": group_index,
+            "parent_case_id": representative.get("parent_case_id", ""),
             "scientific_config_id": representative.get("scientific_config_id", ""),
             "job_id": _join_unique([str(r.get("job_id", "")) for r in recs]),
             "state": state,
@@ -998,10 +1039,12 @@ def _aggregate_all_runs_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str
 def _summarize_scientific_configs(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     summary: dict[str, dict[str, Any]] = {}
     for row in rows:
+        parent_case_id = str(row.get("parent_case_id", "")).strip()
         scientific_id = str(row.get("scientific_config_id", "")).strip()
-        if not scientific_id:
+        key = parent_case_id or scientific_id
+        if not key:
             continue
-        summary[scientific_id] = {
+        summary[key] = {
             "state": str(row.get("state", "")).strip() or "UNKNOWN",
             "failure_reason": str(row.get("failure_reason", "")).strip(),
             "slice_count": int(_safe_float(row.get("slice_count")) or 0),
@@ -1149,10 +1192,13 @@ def _write_csv(path: Path, jobs: list[ChildJob]) -> None:
             fieldnames=[
                 "job_id",
                 "case_name",
+                "parent_case_id",
                 "profile",
                 "model_type",
                 "split_mode",
                 "split_strategy",
+                "scientific_config_id",
+                "execution_label",
                 "state",
                 "exit_code",
                 "elapsed",
@@ -1166,10 +1212,13 @@ def _write_csv(path: Path, jobs: list[ChildJob]) -> None:
                 {
                     "job_id": j.job_id,
                     "case_name": j.case_name or "",
+                    "parent_case_id": j.parent_case_id or "",
                     "profile": j.profile or "",
                     "model_type": j.model_type or "",
                     "split_mode": j.split_mode or "",
                     "split_strategy": j.split_strategy or "",
+                    "scientific_config_id": j.scientific_config_id or "",
+                    "execution_label": j.execution_label or "",
                     "state": j.state,
                     "exit_code": j.exit_code,
                     "elapsed": j.elapsed,
@@ -1259,13 +1308,13 @@ def main() -> int:
         print("No child job IDs found in orchestrator out log.", file=sys.stderr)
         return 3
 
-    valid_configs = _load_valid_config_paths(manifest_path)
-    mapping_mismatch = len(valid_configs) != len(child_ids)
+    valid_manifest_records = _load_valid_manifest_records(manifest_path)
+    mapping_mismatch = len(valid_manifest_records) != len(child_ids)
 
-    config_by_job_id: dict[str, str] = {}
+    manifest_by_job_id: dict[str, dict[str, Any]] = {}
     for idx, job_id in enumerate(child_ids):
-        if idx < len(valid_configs):
-            config_by_job_id[job_id] = valid_configs[idx]
+        if idx < len(valid_manifest_records):
+            manifest_by_job_id[job_id] = valid_manifest_records[idx]
 
     sacct_rows = _run_sacct(args.sacct_bin, child_ids)
     # Capture step states so we can detect OOM even when the parent state is only FAILED.
@@ -1289,12 +1338,15 @@ def main() -> int:
             jobs.append(
                 ChildJob(
                     job_id=job_id,
-                    case_name=_parse_case_name(config_by_job_id.get(job_id)),
-                    config_path=config_by_job_id.get(job_id),
+                    case_name=_parse_case_name((manifest_by_job_id.get(job_id) or {}).get("config_path")),
+                    parent_case_id=str((manifest_by_job_id.get(job_id) or {}).get("parent_case_id", "")).strip() or None,
+                    config_path=(manifest_by_job_id.get(job_id) or {}).get("config_path"),
                     profile=None,
                     model_type=None,
                     split_mode=None,
                     split_strategy=None,
+                    scientific_config_id=str((manifest_by_job_id.get(job_id) or {}).get("scientific_config_id", "")).strip() or None,
+                    execution_label=str((manifest_by_job_id.get(job_id) or {}).get("execution_label", "")).strip() or None,
                     state="UNKNOWN",
                     exit_code="",
                     elapsed="",
@@ -1302,7 +1354,8 @@ def main() -> int:
                 )
             )
             continue
-        cfg = config_by_job_id.get(job_id)
+        manifest_record = manifest_by_job_id.get(job_id) or {}
+        cfg = manifest_record.get("config_path")
         case_name = _parse_case_name(cfg)
         profile, model_type, split_mode, split_strategy = _extract_case_fields(case_name)
         state = row["state"]
@@ -1311,11 +1364,14 @@ def main() -> int:
             ChildJob(
                 job_id=job_id,
                 case_name=case_name,
+                parent_case_id=str(manifest_record.get("parent_case_id", "")).strip() or None,
                 config_path=cfg,
                 profile=profile,
                 model_type=model_type,
                 split_mode=split_mode,
                 split_strategy=split_strategy,
+                scientific_config_id=str(manifest_record.get("scientific_config_id", "")).strip() or None,
+                execution_label=str(manifest_record.get("execution_label", "")).strip() or None,
                 state=state,
                 exit_code=row["exit_code"],
                 elapsed=row["elapsed"],
@@ -1329,9 +1385,10 @@ def main() -> int:
         "logs_dir": str(logs_dir),
         "doe_dir": str(doe_dir),
         "manifest_path": str(manifest_path),
+        "parent_manifest_path": str(doe_dir / "parent_manifest.jsonl"),
         "orchestrator_out_path": str(orchestrator_out),
         "child_job_count_from_log": len(child_ids),
-        "valid_config_count_from_manifest": len(valid_configs),
+        "valid_config_count_from_manifest": len(valid_manifest_records),
         "mapping_mismatch": mapping_mismatch,
         "state_counts": dict(Counter(j.state for j in jobs)),
         "failure_reason_counts": dict(Counter(j.failure_reason for j in jobs if j.failure_reason)),

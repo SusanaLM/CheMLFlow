@@ -3,6 +3,7 @@ import types
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from MLModels import train_models
 
@@ -220,3 +221,277 @@ def test_train_model_dl_fixed_respects_model_params(monkeypatch, tmp_path) -> No
     assert captured["batch_size"] == 7
     assert captured["learning_rate"] == 0.02
     assert captured["model_params"]["hidden_dim"] == 17
+
+
+def test_run_optuna_prunes_non_finite_regression_predictions(monkeypatch) -> None:
+    class _FakeTrialPruned(RuntimeError):
+        pass
+
+    class _AllPrunedStudy:
+        def optimize(self, objective, n_trials: int, show_progress_bar: bool = False) -> None:
+            _ = show_progress_bar
+            for trial_num in range(int(n_trials)):
+                trial = _FakeTrial(trial_num)
+                try:
+                    objective(trial)
+                except _FakeTrialPruned:
+                    continue
+
+        @property
+        def best_params(self) -> dict[str, object]:
+            raise ValueError("No trials are completed yet.")
+
+    fake_optuna = types.SimpleNamespace(
+        Trial=_FakeTrial,
+        samplers=types.SimpleNamespace(TPESampler=lambda seed: ("sampler", seed)),
+        exceptions=types.SimpleNamespace(TrialPruned=_FakeTrialPruned),
+        create_study=lambda direction, sampler: _AllPrunedStudy(),
+    )
+    monkeypatch.setitem(sys.modules, "optuna", fake_optuna)
+    monkeypatch.setattr(train_models, "_seed_dl_runtime", lambda _seed: None)
+    monkeypatch.setattr(
+        train_models,
+        "_train_dl",
+        lambda **kwargs: {"model": kwargs["model"], "best_params": {}},
+    )
+    monkeypatch.setattr(
+        train_models,
+        "_predict_dl",
+        lambda model, X: np.array([0.1, np.nan, 0.3], dtype=float),
+    )
+
+    cfg = train_models.DLSearchConfig(
+        model_class=lambda params: {"params": dict(params)},
+        search_space={
+            "epochs": {"type": "categorical", "choices": [10]},
+            "batch_size": {"type": "categorical", "choices": [16]},
+            "learning_rate": {"type": "categorical", "choices": [1e-3]},
+        },
+        default_params={},
+    )
+
+    x_train = np.ones((6, 3), dtype=float)
+    y_train = np.arange(6, dtype=float)
+    x_val = np.ones((3, 3), dtype=float)
+    y_val = np.array([0.0, 1.0, 2.0], dtype=float)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "DL hyperparameter search completed no valid trials; "
+            "last prune reason: optuna validation scoring: non-finite values in regression predictions"
+        ),
+    ):
+        train_models._run_optuna(
+            cfg,
+            x_train,
+            y_train,
+            x_val,
+            y_val,
+            max_evals=1,
+            random_state=123,
+            patience=3,
+            task_type="regression",
+        )
+
+
+def test_run_optuna_prunes_non_finite_classification_predictions(monkeypatch) -> None:
+    class _FakeTrialPruned(RuntimeError):
+        pass
+
+    class _AllPrunedStudy:
+        def optimize(self, objective, n_trials: int, show_progress_bar: bool = False) -> None:
+            _ = show_progress_bar
+            for trial_num in range(int(n_trials)):
+                trial = _FakeTrial(trial_num)
+                try:
+                    objective(trial)
+                except _FakeTrialPruned:
+                    continue
+
+        @property
+        def best_params(self) -> dict[str, object]:
+            raise ValueError("No trials are completed yet.")
+
+    fake_optuna = types.SimpleNamespace(
+        Trial=_FakeTrial,
+        samplers=types.SimpleNamespace(TPESampler=lambda seed: ("sampler", seed)),
+        exceptions=types.SimpleNamespace(TrialPruned=_FakeTrialPruned),
+        create_study=lambda direction, sampler: _AllPrunedStudy(),
+    )
+    monkeypatch.setitem(sys.modules, "optuna", fake_optuna)
+    monkeypatch.setattr(train_models, "_seed_dl_runtime", lambda _seed: None)
+    monkeypatch.setattr(
+        train_models,
+        "_train_dl",
+        lambda **kwargs: {"model": kwargs["model"], "best_params": {}},
+    )
+    monkeypatch.setattr(
+        train_models,
+        "_predict_dl",
+        lambda model, X: np.array([0.0, np.nan, 1.0], dtype=float),
+    )
+
+    cfg = train_models.DLSearchConfig(
+        model_class=lambda params: {"params": dict(params)},
+        search_space={
+            "epochs": {"type": "categorical", "choices": [10]},
+            "batch_size": {"type": "categorical", "choices": [16]},
+            "learning_rate": {"type": "categorical", "choices": [1e-3]},
+        },
+        default_params={},
+    )
+
+    x_train = np.ones((6, 3), dtype=float)
+    y_train = np.array([0, 1, 0, 1, 0, 1], dtype=int)
+    x_val = np.ones((3, 3), dtype=float)
+    y_val = np.array([0, 1, 0], dtype=int)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "DL hyperparameter search completed no valid trials; "
+            "last prune reason: optuna validation scoring: non-finite values in classification scores"
+        ),
+    ):
+        train_models._run_optuna(
+            cfg,
+            x_train,
+            y_train,
+            x_val,
+            y_val,
+            max_evals=1,
+            random_state=123,
+            patience=3,
+            task_type="classification",
+        )
+
+
+def test_run_optuna_prunes_infinite_classification_logits(monkeypatch) -> None:
+    class _FakeTrialPruned(RuntimeError):
+        pass
+
+    class _AllPrunedStudy:
+        def optimize(self, objective, n_trials: int, show_progress_bar: bool = False) -> None:
+            _ = show_progress_bar
+            for trial_num in range(int(n_trials)):
+                trial = _FakeTrial(trial_num)
+                try:
+                    objective(trial)
+                except _FakeTrialPruned:
+                    continue
+
+        @property
+        def best_params(self) -> dict[str, object]:
+            raise ValueError("No trials are completed yet.")
+
+    fake_optuna = types.SimpleNamespace(
+        Trial=_FakeTrial,
+        samplers=types.SimpleNamespace(TPESampler=lambda seed: ("sampler", seed)),
+        exceptions=types.SimpleNamespace(TrialPruned=_FakeTrialPruned),
+        create_study=lambda direction, sampler: _AllPrunedStudy(),
+    )
+    monkeypatch.setitem(sys.modules, "optuna", fake_optuna)
+    monkeypatch.setattr(train_models, "_seed_dl_runtime", lambda _seed: None)
+    monkeypatch.setattr(
+        train_models,
+        "_train_dl",
+        lambda **kwargs: {"model": kwargs["model"], "best_params": {}},
+    )
+    monkeypatch.setattr(
+        train_models,
+        "_predict_dl",
+        lambda model, X: np.array([0.0, np.inf, 1.0], dtype=float),
+    )
+
+    cfg = train_models.DLSearchConfig(
+        model_class=lambda params: {"params": dict(params)},
+        search_space={
+            "epochs": {"type": "categorical", "choices": [10]},
+            "batch_size": {"type": "categorical", "choices": [16]},
+            "learning_rate": {"type": "categorical", "choices": [1e-3]},
+        },
+        default_params={},
+    )
+
+    x_train = np.ones((6, 3), dtype=float)
+    y_train = np.array([0, 1, 0, 1, 0, 1], dtype=int)
+    x_val = np.ones((3, 3), dtype=float)
+    y_val = np.array([0, 1, 0], dtype=int)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "DL hyperparameter search completed no valid trials; "
+            "last prune reason: optuna validation scoring: non-finite values in classification scores"
+        ),
+    ):
+        train_models._run_optuna(
+            cfg,
+            x_train,
+            y_train,
+            x_val,
+            y_val,
+            max_evals=1,
+            random_state=123,
+            patience=3,
+            task_type="classification",
+        )
+
+
+def test_train_model_dl_fixed_raises_clear_error_for_non_finite_predictions(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class _FakeDlModel:
+        def __init__(self, params: dict[str, object]) -> None:
+            self.params = dict(params)
+
+        def state_dict(self) -> dict[str, object]:
+            return {}
+
+    cfg = train_models.DLSearchConfig(
+        model_class=_FakeDlModel,
+        search_space={},
+        default_params={
+            "epochs": 5,
+            "batch_size": 8,
+            "learning_rate": 1e-3,
+            "hidden_dim": 16,
+        },
+    )
+
+    monkeypatch.setattr(train_models, "_initialize_model", lambda *args, **kwargs: cfg)
+    monkeypatch.setattr(train_models, "_seed_dl_runtime", lambda _seed: None)
+    monkeypatch.setattr(
+        train_models,
+        "_train_dl",
+        lambda *args, **kwargs: {"model": args[0], "best_params": {"epochs": 5}},
+    )
+    monkeypatch.setattr(
+        train_models,
+        "_predict_dl",
+        lambda model, X: np.array([0.0, np.nan, 1.0, 1.5], dtype=float),
+    )
+
+    X = pd.DataFrame(np.ones((16, 4), dtype=float), columns=["f0", "f1", "f2", "f3"])
+    y = pd.Series(np.linspace(0.0, 1.0, num=16))
+    X_train, X_val, X_test = X.iloc[:8], X.iloc[8:12], X.iloc[12:]
+    y_train, y_val, y_test = y.iloc[:8], y.iloc[8:12], y.iloc[12:]
+
+    with pytest.raises(
+        ValueError,
+        match="dl_simple test scoring: non-finite values in regression predictions",
+    ):
+        train_models.train_model(
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            y_test=y_test,
+            model_type="dl_simple",
+            output_dir=str(tmp_path),
+            task_type="regression",
+            model_config={"params": {"epochs": 5, "batch_size": 8, "learning_rate": 1e-3}},
+            X_val=X_val,
+            y_val=y_val,
+        )

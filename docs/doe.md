@@ -3,7 +3,8 @@
 CheMLFlow supports generating many **runtime-valid** configs from one DOE YAML file.
 The generator expands your search space, filters invalid combinations, and writes:
 
-- `manifest.jsonl` (one row per attempted case, including skipped reasons)
+- `manifest.jsonl` (one row per attempted execution child, including skipped reasons)
+- `parent_manifest.jsonl` (one row per scientific parent config)
 - `summary.json` (counts, profile/task, selection metadata, DOE spec hash/snapshot path)
 - one config YAML per valid case
 
@@ -53,6 +54,10 @@ Important conventions:
 - For `split.mode: cv` or `nested_holdout_cv`, keep `n_splits` / `repeats` in `defaults`.
 - If fold/repeat indices are omitted from both `defaults` and `search_space`, DOE generation expands all folds/repeats automatically.
 - Set fold/repeat indices explicitly only when you intentionally want a single execution slice (for example debugging or retrying one failed fold).
+- DOE uses a parent/child shape:
+  - one scientific parent per logical config
+  - one execution child per concrete split slice
+  - holdout is a trivial one-child parent
 - By default, generated cases are isolated per DOE spec hash + case id:
   - `global.base_dir` becomes `<base_dir>/<doe_spec_hash[:8]>/<case_id>`
   - `global.run_dir` becomes `<run_dir>/<doe_spec_hash[:8]>/<case_id>` (or `<output.dir>/runs/<doe_spec_hash[:8]>/<case_id>`)
@@ -102,7 +107,7 @@ Examples:
 - `DOE_CURATE_TARGET_DROPPED`
 - `DOE_RUNTIME_SCHEMA_INVALID`
 
-`manifest.jsonl` contains these codes per skipped case.
+`manifest.jsonl` contains these codes per skipped execution child.
 
 ## Selection metric defaults
 
@@ -180,7 +185,7 @@ Use these rules when building DOE files for cluster runs.
 
 ### 7) Report robustly, not by single best point
 
-- Aggregate by fold/repeat:
+- Aggregate execution children back to the parent:
   - mean/median
   - spread (`std` or IQR)
 - Compare models on matched splits where possible.

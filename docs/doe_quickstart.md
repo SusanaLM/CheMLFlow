@@ -34,13 +34,15 @@ python scripts/generate_doe.py --doe config/doe.example.yaml
 ```bash
 cat config/generated/flash_doe/summary.json
 head -n 20 config/generated/flash_doe/manifest.jsonl
+head -n 20 config/generated/flash_doe/parent_manifest.jsonl
 ls config/generated/flash_doe/*.yaml
 ```
 
 What these mean:
 
 - `summary.json`: total cases, valid cases, skipped cases
-- `manifest.jsonl`: per-case reason codes for skipped combos
+- `manifest.jsonl`: one row per attempted execution child, including skipped reasons
+- `parent_manifest.jsonl`: one row per scientific parent config
 - `*.yaml`: runnable configs for valid cases
 
 ## 5) Run one generated config
@@ -59,7 +61,7 @@ CHEMLFLOW_CONFIG=config/generated/flash_doe/case_0001__reg_local_csv__random_for
 
 - Working/intermediate files: `global.base_dir` (case-isolated by default in DOE)
 - Run artifacts/logs/metrics: `global.run_dir`
-- DOE generation artifacts: `output.dir` (`summary.json`, `manifest.jsonl`, generated YAML files)
+- DOE generation artifacts: `output.dir` (`summary.json`, `manifest.jsonl`, `parent_manifest.jsonl`, generated YAML files)
 
 ## 7) Common quick checks
 

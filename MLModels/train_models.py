@@ -222,18 +222,45 @@ def _resolve_n_jobs(model_config: Dict[str, Any] | None = None) -> int:
     return value_int
 
 
+def _validate_classification_score_values(
+    y_score: Any,
+    *,
+    context: str,
+) -> np.ndarray:
+    y_score_arr = np.asarray(y_score, dtype=float).reshape(-1)
+    if not np.isfinite(y_score_arr).all():
+        raise ValueError(f"{context}: non-finite values in classification scores")
+    return y_score_arr
+
+
 def _safe_auc(y_true, y_score) -> float | None:
-    if len(np.unique(y_true)) < 2:
+    try:
+        y_true_arr, y_score_arr = _validate_classification_metric_inputs(
+            y_true,
+            y_score,
+            context="classification metric",
+        )
+    except ValueError:
+        return None
+    if len(np.unique(y_true_arr)) < 2:
         logging.warning("AUROC undefined for single-class test set.")
         return None
-    return float(roc_auc_score(y_true, y_score))
+    return float(roc_auc_score(y_true_arr, y_score_arr))
 
 
 def _safe_auprc(y_true, y_score) -> float | None:
-    if len(np.unique(y_true)) < 2:
+    try:
+        y_true_arr, y_score_arr = _validate_classification_metric_inputs(
+            y_true,
+            y_score,
+            context="classification metric",
+        )
+    except ValueError:
+        return None
+    if len(np.unique(y_true_arr)) < 2:
         logging.warning("AUPRC undefined for single-class test set.")
         return None
-    return float(average_precision_score(y_true, y_score))
+    return float(average_precision_score(y_true_arr, y_score_arr))
 
 
 def _save_roc_curve(output_dir: str, model_type: str, y_true, y_score) -> str | None:
@@ -264,7 +291,10 @@ def _predict_classification_outputs(
     X: pd.DataFrame,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if model_type.startswith("dl_"):
-        logits = np.asarray(_predict_dl(estimator, X.values)).reshape(-1)
+        logits = _validate_classification_score_values(
+            _predict_dl(estimator, X.values),
+            context=f"{model_type} classification raw scores",
+        )
         y_proba = _sigmoid(logits)
         y_pred = (y_proba >= 0.5).astype(int)
         return y_proba, y_pred, logits
@@ -282,6 +312,10 @@ def _predict_classification_outputs(
                 y_proba = proba_raw[:, 1].reshape(-1).astype(float)
         else:
             y_proba = proba_raw.reshape(-1).astype(float)
+        y_proba = _validate_classification_score_values(
+            y_proba,
+            context=f"{model_type} classification probabilities",
+        )
         y_pred = _ensure_binary_labels(pd.Series(estimator.predict(X))).to_numpy(dtype=int)
         return y_proba, y_pred, y_proba
 
@@ -291,6 +325,10 @@ def _predict_classification_outputs(
             scores = scores_raw[:, 1].reshape(-1).astype(float)
         else:
             scores = scores_raw.reshape(-1).astype(float)
+        scores = _validate_classification_score_values(
+            scores,
+            context=f"{model_type} classification raw scores",
+        )
         y_proba = _sigmoid(scores)
         y_pred = _ensure_binary_labels(pd.Series(estimator.predict(X))).to_numpy(dtype=int)
         return y_proba, y_pred, scores
@@ -476,16 +514,90 @@ def _as_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _validate_regression_metric_inputs(
+    y_true: Any,
+    y_pred: Any,
+    *,
+    context: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    y_true_arr = np.asarray(y_true, dtype=float).reshape(-1)
+    y_pred_arr = np.asarray(y_pred, dtype=float).reshape(-1)
+
+    if y_true_arr.shape[0] != y_pred_arr.shape[0]:
+        raise ValueError(
+            f"{context}: shape mismatch y_true={y_true_arr.shape} y_pred={y_pred_arr.shape}"
+        )
+    if not np.isfinite(y_true_arr).all():
+        raise ValueError(f"{context}: non-finite values in regression targets")
+    if not np.isfinite(y_pred_arr).all():
+        raise ValueError(f"{context}: non-finite values in regression predictions")
+    return y_true_arr, y_pred_arr
+
+
+def _validate_classification_metric_inputs(
+    y_true: Any,
+    y_score: Any,
+    *,
+    context: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    y_true_arr = np.asarray(y_true).reshape(-1)
+    y_score_arr = _validate_classification_score_values(y_score, context=context)
+
+    if y_true_arr.shape[0] != y_score_arr.shape[0]:
+        raise ValueError(
+            f"{context}: shape mismatch y_true={y_true_arr.shape} y_score={y_score_arr.shape}"
+        )
+    if not np.isfinite(y_true_arr.astype(float)).all():
+        raise ValueError(f"{context}: non-finite values in classification targets")
+    return y_true_arr.astype(int), y_score_arr
+
+
+def _classification_metrics_from_outputs(
+    y_true: Any,
+    y_score: Any,
+    y_pred: Any,
+    *,
+    context: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float | None]]:
+    y_true_arr, y_score_arr = _validate_classification_metric_inputs(
+        y_true,
+        y_score,
+        context=context,
+    )
+    y_pred_arr = _ensure_binary_labels(pd.Series(np.asarray(y_pred).reshape(-1))).to_numpy(dtype=int)
+    if y_pred_arr.shape[0] != y_true_arr.shape[0]:
+        raise ValueError(
+            f"{context}: shape mismatch y_true={y_true_arr.shape} y_pred={y_pred_arr.shape}"
+        )
+    metrics = {
+        "auc": _safe_auc(y_true_arr, y_score_arr),
+        "auprc": _safe_auprc(y_true_arr, y_score_arr),
+        "accuracy": float(accuracy_score(y_true_arr, y_pred_arr)),
+        "f1": float(f1_score(y_true_arr, y_pred_arr)),
+    }
+    return y_true_arr, y_score_arr, y_pred_arr, metrics
+
+
 def _safe_r2(y_true, y_pred) -> float | None:
     try:
-        return float(r2_score(y_true, y_pred))
+        y_true_arr, y_pred_arr = _validate_regression_metric_inputs(
+            y_true,
+            y_pred,
+            context="regression metric",
+        )
+        return float(r2_score(y_true_arr, y_pred_arr))
     except ValueError:
         return None
 
 
 def _safe_mae(y_true, y_pred) -> float | None:
     try:
-        return float(mean_absolute_error(y_true, y_pred))
+        y_true_arr, y_pred_arr = _validate_regression_metric_inputs(
+            y_true,
+            y_pred,
+            context="regression metric",
+        )
+        return float(mean_absolute_error(y_true_arr, y_pred_arr))
     except ValueError:
         return None
 
@@ -1105,7 +1217,7 @@ def train_chemprop_model(
             # Backward compatibility with older Lightning signatures.
             return trainer.predict(dataloaders=loader, ckpt_path="best")
 
-    def _predict_values(loader) -> np.ndarray:
+    def _predict_values(loader, *, context: str) -> np.ndarray:
         pred_batches = _predict_batches(loader)
         if isinstance(pred_batches, list):
             preds_t = torch.cat(
@@ -1116,12 +1228,21 @@ def train_chemprop_model(
         else:
             preds = _extract_tensor(pred_batches).detach().cpu().numpy().reshape(-1)
         preds = preds.astype(float)
-        if task_type == "classification" and (np.nanmin(preds) < 0.0 or np.nanmax(preds) > 1.0):
-            # Some configs may emit logits; convert to probabilities for metrics.
-            preds = 1.0 / (1.0 + np.exp(-preds))
+        if task_type == "classification":
+            preds = _validate_classification_score_values(
+                preds,
+                context=f"{context}: raw classification scores",
+            )
+            if preds.size > 0 and (np.nanmin(preds) < 0.0 or np.nanmax(preds) > 1.0):
+                # Some configs may emit logits; convert to probabilities for metrics.
+                preds = _sigmoid(preds)
+            preds = _validate_classification_score_values(
+                preds,
+                context=f"{context}: classification probabilities",
+            )
         return preds
 
-    preds = _predict_values(test_loader)
+    preds = _predict_values(test_loader, context="chemprop test scoring")
 
     metrics = {
         "max_epochs": int(max_epochs),
@@ -1137,19 +1258,19 @@ def train_chemprop_model(
         "freeze_encoder": bool(freeze_encoder),
     }
     if task_type == "classification":
-        y_true = df.loc[te_idx, "_label"].to_numpy(dtype=int)
-        y_pred = (preds >= 0.5).astype(int)
-        metrics.update(
-            {
-                "auc": _safe_auc(y_true, preds),
-                "auprc": _safe_auprc(y_true, preds),
-                "accuracy": float(accuracy_score(y_true, y_pred)),
-                "f1": float(f1_score(y_true, y_pred)),
-            }
+        y_true, preds, y_pred, classification_metrics = _classification_metrics_from_outputs(
+            df.loc[te_idx, "_label"].to_numpy(dtype=int),
+            preds,
+            (preds >= 0.5).astype(int),
+            context="chemprop test scoring",
         )
+        metrics.update(classification_metrics)
     else:
-        y_true = df.loc[te_idx, "_label"].to_numpy(dtype=float)
-        y_pred = preds.astype(float)
+        y_true, y_pred = _validate_regression_metric_inputs(
+            df.loc[te_idx, "_label"].to_numpy(dtype=float),
+            preds.astype(float),
+            context="chemprop test scoring",
+        )
         metrics.update(
             {
                 "r2": float(r2_score(y_true, y_pred)),
@@ -1157,24 +1278,24 @@ def train_chemprop_model(
             }
         )
     if plot_split_performance:
-        train_preds = _predict_values(train_eval_loader)
-        val_preds = _predict_values(val_loader)
+        train_preds = _predict_values(train_eval_loader, context="chemprop train scoring")
+        val_preds = _predict_values(val_loader, context="chemprop val scoring")
         if task_type == "classification":
-            train_y = df.loc[tr_idx, "_label"].to_numpy(dtype=int)
-            val_y = df.loc[va_idx, "_label"].to_numpy(dtype=int)
+            train_y, train_preds, train_pred_labels, train_metrics = _classification_metrics_from_outputs(
+                df.loc[tr_idx, "_label"].to_numpy(dtype=int),
+                train_preds,
+                (train_preds >= 0.5).astype(int),
+                context="chemprop train scoring",
+            )
+            val_y, val_preds, val_pred_labels, val_metrics = _classification_metrics_from_outputs(
+                df.loc[va_idx, "_label"].to_numpy(dtype=int),
+                val_preds,
+                (val_preds >= 0.5).astype(int),
+                context="chemprop val scoring",
+            )
             split_metrics: Dict[str, Dict[str, float | None]] = {
-                "train": {
-                    "auc": _safe_auc(train_y, train_preds),
-                    "auprc": _safe_auprc(train_y, train_preds),
-                    "accuracy": float(accuracy_score(train_y, (train_preds >= 0.5).astype(int))),
-                    "f1": float(f1_score(train_y, (train_preds >= 0.5).astype(int))),
-                },
-                "val": {
-                    "auc": _safe_auc(val_y, val_preds),
-                    "auprc": _safe_auprc(val_y, val_preds),
-                    "accuracy": float(accuracy_score(val_y, (val_preds >= 0.5).astype(int))),
-                    "f1": float(f1_score(val_y, (val_preds >= 0.5).astype(int))),
-                },
+                "train": train_metrics,
+                "val": val_metrics,
                 "test": {
                     "auc": metrics["auc"],
                     "auprc": metrics["auprc"],
@@ -1208,12 +1329,12 @@ def train_chemprop_model(
                         "train": {
                             "y_true": train_y,
                             "y_proba": train_preds,
-                            "y_pred": (train_preds >= 0.5).astype(int),
+                            "y_pred": train_pred_labels,
                         },
                         "val": {
                             "y_true": val_y,
                             "y_proba": val_preds,
-                            "y_pred": (val_preds >= 0.5).astype(int),
+                            "y_pred": val_pred_labels,
                         },
                         "test": {
                             "y_true": y_true,
@@ -1301,6 +1422,7 @@ def _run_optuna(
     
     best_model = None
     best_score = float("-inf")
+    pruned_reasons: list[str] = []
     
     def objective(trial: optuna.Trial) -> float:
         nonlocal best_model, best_score
@@ -1345,27 +1467,32 @@ def _run_optuna(
         y_pred = _predict_dl(trained_model, X_val)
 
         if task_type == "classification":
-            y_true = np.asarray(y_val).reshape(-1).astype(int)
-            y_proba = 1.0 / (1.0 + np.exp(-np.asarray(y_pred).reshape(-1)))
+            try:
+                y_true, y_score = _validate_classification_metric_inputs(
+                    y_val,
+                    np.asarray(y_pred).reshape(-1),
+                    context="optuna validation scoring",
+                )
+            except ValueError as exc:
+                pruned_reasons.append(str(exc))
+                raise optuna.exceptions.TrialPruned(str(exc)) from exc
+            y_proba = 1.0 / (1.0 + np.exp(-y_score))
             score = _safe_auc(y_true, y_proba)
             if score is None:
-                raise optuna.exceptions.TrialPruned("AUC undefined (single-class val set)")
+                message = "AUC undefined (single-class val set)"
+                pruned_reasons.append(message)
+                raise optuna.exceptions.TrialPruned(message)
         else:
-            score = float(r2_score(y_val, y_pred))
-
-        # NaN/Inf handling
-        y_true = np.asarray(y_val).reshape(-1)
-        y_hat = np.asarray(y_pred).reshape(-1)
-
-        if y_true.shape[0] != y_hat.shape[0]:
-            raise optuna.exceptions.TrialPruned(
-            f"Shape mismatch y_val={y_true.shape} y_pred={y_hat.shape}")
-
-        if not np.isfinite(y_true).all():
-            raise optuna.exceptions.TrialPruned("NaN/Inf in y_val (data issue)")
-
-        if not np.isfinite(y_hat).all():
-            raise optuna.exceptions.TrialPruned("NaN/Inf in y_pred (diverged training)")
+            try:
+                y_true, y_hat = _validate_regression_metric_inputs(
+                    y_val,
+                    y_pred,
+                    context="optuna validation scoring",
+                )
+            except ValueError as exc:
+                pruned_reasons.append(str(exc))
+                raise optuna.exceptions.TrialPruned(str(exc)) from exc
+            score = float(r2_score(y_true, y_hat))
 
         # Track best
         if score > best_score:
@@ -1389,7 +1516,14 @@ def _run_optuna(
     sampler = optuna.samplers.TPESampler(seed=random_state)
     study = optuna.create_study(direction="maximize", sampler=sampler)
     study.optimize(objective, n_trials=max_evals, show_progress_bar=True)
-    
+
+    if best_model is None:
+        detail = pruned_reasons[-1] if pruned_reasons else "no completed trials"
+        raise ValueError(
+            "DL hyperparameter search completed no valid trials; "
+            f"last prune reason: {detail}"
+        )
+
     best_params = study.best_params
     logging.info(f"Optuna complete. Best score={best_score:.4f}, params={best_params}")
     
@@ -2059,49 +2193,51 @@ def train_model(
         model_path = os.path.join(output_dir, f"{model_type}_best_model.cbm")
         estimator.save_model(model_path)
         best_params = estimator.get_params()
-        metrics = {
-            "auc": _safe_auc(y_test, y_pred_proba),
-            "auprc": _safe_auprc(y_test, y_pred_proba),
-            "accuracy": float(accuracy_score(y_test, y_pred)),
-            "f1": float(f1_score(y_test, y_pred)),
-        }
+        y_test_arr, y_pred_proba, y_pred, metrics = _classification_metrics_from_outputs(
+            y_test,
+            y_pred_proba,
+            y_pred,
+            context=f"{model_type} test scoring",
+        )
         if plot_split_performance:
             train_proba = estimator.predict_proba(X_train)[:, 1]
             train_pred = estimator.predict(X_train)
+            y_train_arr, train_proba, train_pred, train_metrics = _classification_metrics_from_outputs(
+                y_train,
+                train_proba,
+                train_pred,
+                context=f"{model_type} train scoring",
+            )
             split_metrics: Dict[str, Dict[str, float | None]] = {
-                "train": {
-                    "auc": _safe_auc(y_train, train_proba),
-                    "auprc": _safe_auprc(y_train, train_proba),
-                    "accuracy": float(accuracy_score(y_train, train_pred)),
-                    "f1": float(f1_score(y_train, train_pred)),
-                },
+                "train": train_metrics,
                 "test": metrics.copy(),
             }
             split_outputs: Dict[str, Dict[str, Any]] = {
                 "train": {
-                    "y_true": np.asarray(y_train).reshape(-1).astype(int),
-                    "y_proba": np.asarray(train_proba).reshape(-1).astype(float),
-                    "y_pred": np.asarray(train_pred).reshape(-1).astype(int),
+                    "y_true": y_train_arr,
+                    "y_proba": train_proba,
+                    "y_pred": train_pred,
                 },
                 "test": {
-                    "y_true": np.asarray(y_test).reshape(-1).astype(int),
-                    "y_proba": np.asarray(y_pred_proba).reshape(-1).astype(float),
-                    "y_pred": np.asarray(y_pred).reshape(-1).astype(int),
+                    "y_true": y_test_arr,
+                    "y_proba": y_pred_proba,
+                    "y_pred": y_pred,
                 },
             }
             if X_val is not None and y_val is not None and len(y_val) > 0:
                 y_val_proba = estimator.predict_proba(X_val)[:, 1]
                 y_val_pred = estimator.predict(X_val)
-                split_metrics["val"] = {
-                    "auc": _safe_auc(y_val, y_val_proba),
-                    "auprc": _safe_auprc(y_val, y_val_proba),
-                    "accuracy": float(accuracy_score(y_val, y_val_pred)),
-                    "f1": float(f1_score(y_val, y_val_pred)),
-                }
+                y_val_arr, y_val_proba, y_val_pred, val_metrics = _classification_metrics_from_outputs(
+                    y_val,
+                    y_val_proba,
+                    y_val_pred,
+                    context=f"{model_type} val scoring",
+                )
+                split_metrics["val"] = val_metrics
                 split_outputs["val"] = {
-                    "y_true": np.asarray(y_val).reshape(-1).astype(int),
-                    "y_proba": np.asarray(y_val_proba).reshape(-1).astype(float),
-                    "y_pred": np.asarray(y_val_pred).reshape(-1).astype(int),
+                    "y_true": y_val_arr,
+                    "y_proba": y_val_proba,
+                    "y_pred": y_val_pred,
                 }
             split_metrics_path, split_plot_path = _save_split_metrics_artifacts(
                 output_dir,
@@ -2210,14 +2346,12 @@ def train_model(
             model_type=model_type,
             X=X_test,
         )
-        y_true = np.asarray(y_test).reshape(-1).astype(int)
-
-        metrics = {
-            "auc": _safe_auc(y_true, y_pred_proba),
-            "auprc": _safe_auprc(y_true, y_pred_proba),
-            "accuracy": float(accuracy_score(y_true, y_pred_label)),
-            "f1": float(f1_score(y_true, y_pred_label)),
-        }
+        y_true, y_pred_proba, y_pred_label, metrics = _classification_metrics_from_outputs(
+            y_test,
+            y_pred_proba,
+            y_pred_label,
+            context=f"{model_type} test scoring",
+        )
         roc_path = _save_roc_curve(output_dir, model_type, y_true, y_pred_proba)
         if roc_path:
             metrics["roc_curve_path"] = roc_path
@@ -2230,9 +2364,14 @@ def train_model(
             "y_pred": y_pred_label,
         }).to_csv(pred_path, index=False)
     else:
+        y_true, y_pred = _validate_regression_metric_inputs(
+            y_test,
+            y_pred,
+            context=f"{model_type} test scoring",
+        )
         metrics = {
-            "r2": float(r2_score(y_test, y_pred)),
-            "mae": float(mean_absolute_error(y_test, y_pred)),
+            "r2": float(r2_score(y_true, y_pred)),
+            "mae": float(mean_absolute_error(y_true, y_pred)),
         }
     if feature_name_map_path:
         metrics["feature_name_map_path"] = feature_name_map_path
@@ -2248,14 +2387,13 @@ def train_model(
                 model_type=model_type,
                 X=X_train,
             )
-
-            y_tr = np.asarray(y_train).reshape(-1).astype(int)
-            split_metrics["train"] = {
-                "auc": _safe_auc(y_tr, tr_proba),
-                "auprc": _safe_auprc(y_tr, tr_proba),
-                "accuracy": float(accuracy_score(y_tr, tr_pred)),
-                "f1": float(f1_score(y_tr, tr_pred)),
-            }
+            y_tr, tr_proba, tr_pred, train_metrics = _classification_metrics_from_outputs(
+                y_train,
+                tr_proba,
+                tr_pred,
+                context=f"{model_type} train scoring",
+            )
+            split_metrics["train"] = train_metrics
             split_outputs["train"] = {
                 "y_true": y_tr,
                 "y_proba": tr_proba,
@@ -2268,14 +2406,13 @@ def train_model(
                 model_type=model_type,
                 X=X_test,
             )
-
-            y_te = np.asarray(y_test).reshape(-1).astype(int)
-            split_metrics["test"] = {
-                "auc": _safe_auc(y_te, te_proba),
-                "auprc": _safe_auprc(y_te, te_proba),
-                "accuracy": float(accuracy_score(y_te, te_pred)),
-                "f1": float(f1_score(y_te, te_pred)),
-            }
+            y_te, te_proba, te_pred, test_metrics = _classification_metrics_from_outputs(
+                y_test,
+                te_proba,
+                te_pred,
+                context=f"{model_type} test scoring",
+            )
+            split_metrics["test"] = test_metrics
             split_outputs["test"] = {
                 "y_true": y_te,
                 "y_proba": te_proba,
@@ -2289,14 +2426,13 @@ def train_model(
                     model_type=model_type,
                     X=X_val,
                 )
-
-                y_va = np.asarray(y_val).reshape(-1).astype(int)
-                split_metrics["val"] = {
-                    "auc": _safe_auc(y_va, va_proba),
-                    "auprc": _safe_auprc(y_va, va_proba),
-                    "accuracy": float(accuracy_score(y_va, va_pred)),
-                    "f1": float(f1_score(y_va, va_pred)),
-                }
+                y_va, va_proba, va_pred, val_metrics = _classification_metrics_from_outputs(
+                    y_val,
+                    va_proba,
+                    va_pred,
+                    context=f"{model_type} val scoring",
+                )
+                split_metrics["val"] = val_metrics
                 split_outputs["val"] = {
                     "y_true": y_va,
                     "y_proba": va_proba,
@@ -2423,13 +2559,21 @@ def run_explainability(
             def predict(self, X):
                 y_out = _predict_dl(self.model, X.values if hasattr(X, "values") else X)
                 if self.task_type == "classification":
-                    proba = 1.0 / (1.0 + np.exp(-np.asarray(y_out).reshape(-1)))
+                    scores = _validate_classification_score_values(
+                        y_out,
+                        context="dl explainability prediction",
+                    )
+                    proba = _sigmoid(scores)
                     return (proba >= 0.5).astype(int)
                 return y_out
 
             def predict_proba(self, X):
                 y_out = _predict_dl(self.model, X.values if hasattr(X, "values") else X)
-                proba = 1.0 / (1.0 + np.exp(-np.asarray(y_out).reshape(-1)))
+                scores = _validate_classification_score_values(
+                    y_out,
+                    context="dl explainability prediction",
+                )
+                proba = _sigmoid(scores)
                 return np.vstack([1.0 - proba, proba]).T
 
             def score(self, X, y):
@@ -2443,6 +2587,11 @@ def run_explainability(
                         return float(accuracy_score(y_true, pred))
                     return float(auc)
                 y_pred = _predict_dl(self.model, X.values if hasattr(X, "values") else X)
+                y_true, y_pred = _validate_regression_metric_inputs(
+                    y_true,
+                    y_pred,
+                    context="dl permutation importance scoring",
+                )
                 return float(r2_score(y_true, y_pred))
         
         wrapped_estimator = _SklearnWrapper(estimator, task_type=task_type)

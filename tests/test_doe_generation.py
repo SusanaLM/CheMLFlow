@@ -238,16 +238,30 @@ def test_generate_doe_enforces_split_mode_strategy_compatibility(tmp_path: Path)
     spec = _base_clf_doe(tmp_path)
     spec["search_space"]["split.mode"] = ["cv"]
     spec["search_space"]["split.strategy"] = ["tdc_scaffold"]
-    spec["search_space"]["split.cv.n_splits"] = [5]
-    spec["search_space"]["split.cv.repeats"] = [1]
-    spec["search_space"]["split.cv.fold_index"] = [0]
-    spec["search_space"]["split.cv.repeat_index"] = [0]
+    spec["defaults"]["split.cv.n_splits"] = 5
+    spec["defaults"]["split.cv.repeats"] = 1
+    spec["defaults"]["split.cv.fold_index"] = 0
+    spec["defaults"]["split.cv.repeat_index"] = 0
 
     result = generate_doe(spec)
     summary = result["summary"]
 
     assert summary["valid_cases"] == 0
     assert summary["issue_counts"].get("DOE_SPLIT_STRATEGY_MODE_INVALID", 0) == 1
+
+
+def test_generate_doe_rejects_execution_only_axes_in_search_space(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["split.mode"] = ["cv"]
+    spec["defaults"]["split.cv.n_splits"] = 3
+    spec["defaults"]["split.cv.repeats"] = 1
+    spec["search_space"]["split.cv.fold_index"] = [0]
+
+    with pytest.raises(
+        DOEGenerationError,
+        match="Execution-only split axes must not be placed in search_space",
+    ):
+        generate_doe(spec)
 
 
 def test_generate_doe_auto_expands_cv_execution_axes_when_omitted(tmp_path: Path) -> None:
@@ -263,11 +277,29 @@ def test_generate_doe_auto_expands_cv_execution_axes_when_omitted(tmp_path: Path
     assert summary["total_cases"] == 12
     assert summary["valid_cases"] == 12
     assert summary["skipped_cases"] == 0
+    assert summary["total_parent_cases"] == 2
+    assert summary["valid_parent_cases"] == 2
+    assert summary["total_execution_cases"] == 12
+    assert len(result["parent_cases"]) == 2
 
     first = result["valid_cases"][0]
+    assert first["parent_case_id"] == "parent_0001"
+    assert first["execution_count"] == 6
+    assert first["execution_label"] == "rep0_fold0"
+    assert first["scientific_config_id"]
     assert "split.cv.fold_index" not in first["factors"]
     assert "split.cv.repeat_index" not in first["factors"]
     assert set(first["execution_factors"]) == {"split.cv.fold_index", "split.cv.repeat_index"}
+
+    parent_manifest_lines = Path(result["parent_manifest_path"]).read_text(encoding="utf-8").strip().splitlines()
+    assert len(parent_manifest_lines) == 2
+    first_parent = json.loads(parent_manifest_lines[0])
+    assert first_parent["record_type"] == "parent"
+    assert first_parent["case_id"] == "parent_0001"
+    assert first_parent["execution_count"] == 6
+    assert len(first_parent["valid_execution_case_ids"]) == 6
+    assert len(first_parent["execution_case_ids"]) == len(first_parent["execution_labels"]) == 6
+    assert first_parent["status"] == "valid"
 
     seen_execution = {
         (
@@ -305,22 +337,35 @@ def test_generate_doe_respects_explicit_cv_execution_axes_in_defaults(tmp_path: 
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert config["split"]["cv"]["fold_index"] == 1
     assert config["split"]["cv"]["repeat_index"] == 0
+    assert result["valid_cases"][0]["parent_case_id"] == "parent_0001"
+    assert summary["total_parent_cases"] == 1
+    assert summary["total_execution_cases"] == 1
 
 
 def test_generate_doe_validates_cv_fold_index_bounds(tmp_path: Path) -> None:
     spec = _base_clf_doe(tmp_path)
     spec["search_space"]["split.mode"] = ["cv"]
     spec["search_space"]["split.strategy"] = ["random"]
-    spec["search_space"]["split.cv.n_splits"] = [3]
-    spec["search_space"]["split.cv.repeats"] = [1]
-    spec["search_space"]["split.cv.fold_index"] = [3]
-    spec["search_space"]["split.cv.repeat_index"] = [0]
+    spec["defaults"]["split.cv.n_splits"] = 3
+    spec["defaults"]["split.cv.repeats"] = 1
+    spec["defaults"]["split.cv.fold_index"] = 3
+    spec["defaults"]["split.cv.repeat_index"] = 0
 
     result = generate_doe(spec)
     summary = result["summary"]
 
     assert summary["valid_cases"] == 0
     assert summary["issue_counts"].get("DOE_SPLIT_PARAM_INVALID", 0) >= 1
+    manifest_lines = Path(result["manifest_path"]).read_text(encoding="utf-8").strip().splitlines()
+    assert len(manifest_lines) == 1
+    payload = json.loads(manifest_lines[0])
+    assert payload["status"] == "skipped"
+    assert payload["execution_label"] == "rep0_fold3"
+    parent_manifest_lines = Path(result["parent_manifest_path"]).read_text(encoding="utf-8").strip().splitlines()
+    assert len(parent_manifest_lines) == 1
+    parent_payload = json.loads(parent_manifest_lines[0])
+    assert parent_payload["execution_case_ids"] == ["case_0001"]
+    assert parent_payload["execution_labels"] == ["rep0_fold3"]
 
 
 def test_generate_doe_supports_auto_task_with_confirmation(tmp_path: Path) -> None:
@@ -368,7 +413,17 @@ def test_generate_doe_supports_auto_task_with_confirmation(tmp_path: Path) -> No
     manifest_lines = Path(result["manifest_path"]).read_text(encoding="utf-8").strip().splitlines()
     assert len(manifest_lines) == 1
     payload = json.loads(manifest_lines[0])
+    assert payload["record_type"] == "execution_child"
+    assert payload["parent_case_id"] == "parent_0001"
+    assert payload["execution_label"] == "holdout"
     assert payload["status"] == "valid"
+
+    parent_manifest_lines = Path(result["parent_manifest_path"]).read_text(encoding="utf-8").strip().splitlines()
+    assert len(parent_manifest_lines) == 1
+    parent_payload = json.loads(parent_manifest_lines[0])
+    assert parent_payload["record_type"] == "parent"
+    assert parent_payload["case_id"] == "parent_0001"
+    assert parent_payload["execution_count"] == 1
 
 
 def test_generate_doe_isolates_case_artifacts_by_default(tmp_path: Path) -> None:
@@ -811,6 +866,24 @@ def test_generate_doe_normalizes_legacy_curated_feature_alias(tmp_path: Path) ->
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert "featurize.none" in config["pipeline"]["nodes"]
     assert "use.curated_features" not in config["pipeline"]["nodes"]
+
+
+def test_generate_doe_canonicalizes_parent_identity_for_feature_alias_duplicates(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["featurize.none", "use.curated_features"]
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["total_cases"] == 1
+    assert summary["valid_cases"] == 1
+    assert summary["total_parent_cases"] == 1
+    assert len(result["parent_cases"]) == 1
+    parent_manifest_lines = Path(result["parent_manifest_path"]).read_text(encoding="utf-8").strip().splitlines()
+    assert len(parent_manifest_lines) == 1
+    parent_payload = json.loads(parent_manifest_lines[0])
+    assert parent_payload["execution_case_ids"] == ["case_0001"]
+    assert parent_payload["valid_execution_case_ids"] == ["case_0001"]
 
 
 def test_generate_doe_requires_max_cases_for_large_grid(tmp_path: Path) -> None:
