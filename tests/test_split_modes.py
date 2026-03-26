@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from main import _resolve_feature_inputs, _resolve_split_partitions, build_paths, run_node_split
+from main import _resolve_feature_inputs, _resolve_split_partitions, build_paths, run_node_explain, run_node_split
 
 
 def _make_curated_df(n_rows: int = 60) -> pd.DataFrame:
@@ -364,3 +364,55 @@ def test_resolve_feature_inputs_prefers_curated_path_for_missing_labels() -> Non
     features_file, labels_file = _resolve_feature_inputs(context)
     assert features_file == "features.csv"
     assert labels_file == "curated_latest.csv"
+
+
+def test_run_node_explain_writes_skip_marker_for_chemprop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output_dir = tmp_path / "run_chemprop_explain"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    context = {
+        "run_dir": str(output_dir),
+        "model_type": "chemprop",
+        "target_column": "label",
+        "paths": build_paths(str(tmp_path / "data_chemprop_explain")),
+        "pipeline_nodes": ["get_data", "curate", "split", "train", "explain"],
+    }
+
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("Explain skip should return before loading data or model.")
+
+    monkeypatch.setattr("main.data_preprocessing.load_features_labels", _unexpected)
+    monkeypatch.setattr("main.train_models.load_model", _unexpected)
+
+    run_node_explain(context)
+
+    payload = json.loads((output_dir / "explain_skipped.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "skipped"
+    assert payload["reason"] == "chemprop_explainability_not_supported"
+    assert payload["model_type"] == "chemprop"
+    assert payload["feature_method"] is None
+
+
+def test_run_node_explain_writes_skip_marker_for_morgan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output_dir = tmp_path / "run_morgan_explain"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    context = {
+        "run_dir": str(output_dir),
+        "model_type": "random_forest",
+        "target_column": "label",
+        "paths": build_paths(str(tmp_path / "data_morgan_explain")),
+        "pipeline_nodes": ["get_data", "curate", "featurize.morgan", "split", "train", "explain"],
+    }
+
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("Morgan explain skip should return before loading data or model.")
+
+    monkeypatch.setattr("main.data_preprocessing.load_features_labels", _unexpected)
+    monkeypatch.setattr("main.train_models.load_model", _unexpected)
+
+    run_node_explain(context)
+
+    payload = json.loads((output_dir / "explain_skipped.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "skipped"
+    assert payload["reason"] == "morgan_explainability_disabled"
+    assert payload["model_type"] == "random_forest"
+    assert payload["feature_method"] == "morgan"

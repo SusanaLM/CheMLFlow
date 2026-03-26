@@ -392,6 +392,7 @@ def run_node_featurize_none(context: dict) -> None:
     )
     context["feature_matrix"] = curated_path
     context["labels_matrix"] = curated_path
+    context["feature_method"] = "none"
 
 
 def run_node_featurize_lipinski(context: dict) -> None:
@@ -523,6 +524,7 @@ def run_node_featurize_rdkit(context: dict) -> None:
     )
     context["feature_matrix"] = labeled_output_file
     context["labels_matrix"] = labeled_output_file
+    context["feature_method"] = "rdkit"
 
 
 def run_node_featurize_rdkit_labeled(context: dict) -> None:
@@ -580,6 +582,7 @@ def run_node_featurize_morgan(context: dict) -> None:
     )
     context["feature_matrix"] = labeled_output
     context["labels_matrix"] = labeled_output
+    context["feature_method"] = "morgan"
 
 
 def run_node_label_normalize(context: dict) -> None:
@@ -634,6 +637,46 @@ def _has_explicit_feature_input_node(context: dict) -> bool:
     if not pipeline_nodes:
         return False
     return any(node in _EXPLICIT_FEATURE_INPUT_NODES for node in pipeline_nodes)
+
+
+def _resolve_feature_method(context: dict) -> str | None:
+    feature_method = context.get("feature_method")
+    if isinstance(feature_method, str) and feature_method.strip():
+        return feature_method.strip().lower()
+
+    pipeline_nodes = [str(node).strip().lower() for node in (context.get("pipeline_nodes") or [])]
+    for candidate in ("featurize.morgan", "featurize.rdkit_labeled", "featurize.rdkit", "featurize.none"):
+        if candidate in pipeline_nodes:
+            return candidate.split(".", 1)[1]
+
+    feature_matrix = str(context.get("feature_matrix", "")).strip().lower()
+    if "morgan" in feature_matrix:
+        return "morgan"
+    if "rdkit" in feature_matrix:
+        return "rdkit"
+
+    return None
+
+
+def _write_explain_skip_marker(
+    output_dir: str,
+    *,
+    reason: str,
+    model_type: str,
+    feature_method: str | None,
+) -> str:
+    skip_path = os.path.join(output_dir, "explain_skipped.json")
+    _write_json_atomic(
+        skip_path,
+        {
+            "status": "skipped",
+            "reason": reason,
+            "model_type": model_type,
+            "feature_method": feature_method,
+            "timestamp": _utc_now_iso(),
+        },
+    )
+    return skip_path
 
 
 def _normalize_and_validate_row_index(
@@ -2218,8 +2261,30 @@ def run_node_explain(context: dict) -> None:
     target_column = context["target_column"]
     paths = context["paths"]
     is_dl = model_type.startswith("dl_")
+    feature_method = _resolve_feature_method(context)
     if model_type == "chemprop":
-        logging.warning("Explainability is not implemented for chemprop; skipping explain node.")
+        skip_path = _write_explain_skip_marker(
+            output_dir,
+            reason="chemprop_explainability_not_supported",
+            model_type=model_type,
+            feature_method=feature_method,
+        )
+        logging.warning(
+            "Explainability is not implemented for chemprop; skipping explain node and writing %s.",
+            skip_path,
+        )
+        return
+    if feature_method == "morgan":
+        skip_path = _write_explain_skip_marker(
+            output_dir,
+            reason="morgan_explainability_disabled",
+            model_type=model_type,
+            feature_method=feature_method,
+        )
+        logging.warning(
+            "Explainability is disabled for Morgan fingerprints; skipping explain node and writing %s.",
+            skip_path,
+        )
         return
     split_indices = context.get("split_indices")
     if not split_indices:
@@ -2446,6 +2511,7 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
         "debug_logging": debug_logging,
         "config_hash": config_hash,
         "config_fingerprint": config_fingerprint,
+        "feature_method": None,
         "pipeline_nodes": list(nodes),
     }
 
