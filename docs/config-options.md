@@ -274,7 +274,7 @@ Standard single train/val/test split. Best for quick experiments.
 
 ### `mode: cv`
 
-K-fold cross-validation. Run the pipeline once per fold (varying `fold_index`) to get robust metrics.
+K-fold cross-validation. The runtime config executes one fold at a time; DOE generation can auto-expand all fold/repeat runs when those execution indices are omitted from the DOE spec. In DOE mode, those runs are modeled as execution children under one scientific parent config.
 
 **Additional keys:**
 
@@ -282,8 +282,8 @@ K-fold cross-validation. Run the pipeline once per fold (varying `fold_index`) t
 |-----|---------|-------------|
 | `cv.n_splits` | `5` | Number of folds. |
 | `cv.repeats` | `1` | Number of times to repeat the k-fold (with different random shuffles). |
-| `cv.fold_index` | `0` | Which fold to use as test (0 to n_splits-1). |
-| `cv.repeat_index` | `0` | Which repeat to use (0 to repeats-1). |
+| `cv.fold_index` | `0` | Which fold to use as test (0 to n_splits-1). Runtime/execution axis; keep it out of DOE `search_space`. |
+| `cv.repeat_index` | `0` | Which repeat to use (0 to repeats-1). Runtime/execution axis; keep it out of DOE `search_space`. |
 | `cv.random_state` | (from split) | Seed for fold assignment. |
 | `val_from_train.val_size` | (from split) | Fraction of train_pool to hold out as validation. |
 | `val_from_train.stratify` | (from split) | Whether to stratify the val split. |
@@ -294,6 +294,7 @@ K-fold cross-validation. Run the pipeline once per fold (varying `fold_index`) t
 2. Fold at `fold_index` becomes the test set.
 3. Remaining rows form `train_pool`.
 4. Validation is sampled from `train_pool` using `val_from_train` settings.
+5. In DOE mode, keep `fold_index` / `repeat_index` out of `search_space`; put them in `defaults` only for a targeted retry/debug slice, or omit them so the generator fans out all folds/repeats automatically.
 
 ### `mode: nested_holdout_cv`
 
@@ -308,8 +309,8 @@ Two-level splitting: an outer holdout test set (never touched during model selec
 | `outer.random_state` | (from split) | Seed for outer split. |
 | `inner.n_splits` | `5` | Number of inner CV folds. |
 | `inner.repeats` | `1` | Number of inner CV repeats. |
-| `inner.fold_index` | `0` | Which inner fold to run. |
-| `inner.repeat_index` | `0` | Which inner repeat to run. |
+| `inner.fold_index` | `0` | Which inner fold to run. Runtime/execution axis; keep it out of DOE `search_space`. |
+| `inner.repeat_index` | `0` | Which inner repeat to run. Runtime/execution axis; keep it out of DOE `search_space`. |
 | `inner.random_state` | (from split) | Seed for inner CV. |
 
 **Behavior:**
@@ -344,6 +345,7 @@ Controls feature preprocessing (variance filtering, correlation removal, scaling
 **Example:**
 ```yaml
 preprocess:
+  scaler: robust
   variance_threshold: 0.1
   corr_threshold: 0.9
   stable_features_k: 100
@@ -353,6 +355,7 @@ preprocess:
 
 | Key | Default | Description |
 |-----|---------|-------------|
+| `scaler` | `robust` | Feature scaling strategy before variance/correlation filtering. One of `robust`, `standard`, `minmax`, `none`. `minmax` uses clipped held-out transforms to keep values in `[0, 1]`. |
 | `variance_threshold` | `0.16` | Remove features with variance below this threshold. |
 | `corr_threshold` | `0.95` | Remove one of each pair of features with correlation above this. |
 | `clip_range` | `[-1e10, 1e10]` | Clip feature values to this range before processing. |
@@ -407,10 +410,10 @@ train:
 |------|-------------|
 | Regression | `random_forest`, `svm`, `decision_tree`, `xgboost`, `ensemble` |
 | Regression (DL) | `dl_simple`, `dl_deep`, `dl_gru`, `dl_resmlp`, `dl_tabtransformer`, `dl_aereg` |
-| Regression (SMILES-native) | `chemprop` |
+| Regression (SMILES-native) | `chemprop`, `chemeleon` |
 | Classification | `random_forest`, `decision_tree`, `xgboost`, `svm`, `ensemble`, `catboost_classifier` |
 | Classification (DL) | `dl_simple`, `dl_deep`, `dl_gru`, `dl_resmlp`, `dl_tabtransformer`, `dl_aereg` |
-| Classification (SMILES-native) | `chemprop` |
+| Classification (SMILES-native) | `chemprop`, `chemeleon` |
 
 **General keys:**
 
@@ -419,9 +422,10 @@ train:
 | `train.model.params` | `{}` | Model-specific hyperparameters passed to fixed and `train_cv` training paths. |
 | `train.model.n_jobs` | `-1` | Parallelism for sklearn/joblib. Use `1` to disable parallelism. |
 
-**Chemprop-specific keys:**
+**Chemprop / CheMeleon-specific keys:**
 
-Chemprop is a graph neural network that works directly on SMILES (no descriptor generation needed).
+Chemprop is a graph neural network that works directly on SMILES (no descriptor generation needed). `chemeleon` is a first-class model alias that uses the Chemprop training path with `foundation: chemeleon`.
+Set `pipeline.feature_input: smiles_native` for Chemprop/CheMeleon runs.
 
 | Key | Default | Description |
 |-----|---------|-------------|

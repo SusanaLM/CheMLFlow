@@ -37,6 +37,14 @@ _DOE_SPEC_NAMESPACE_LEN = 8
 _FEATURE_INPUT_ALIASES = {
     "use.curated_features": "featurize.none",
 }
+_CHEMPROP_LIKE_MODELS = {"chemprop", "chemeleon"}
+_CHEMPROP_LIKE_FEATURE_INPUTS = {"smiles_native"}
+_EXECUTION_ONLY_AXES = {
+    "split.cv.fold_index",
+    "split.cv.repeat_index",
+    "split.inner.fold_index",
+    "split.inner.repeat_index",
+}
 
 
 @dataclass(frozen=True)
@@ -75,8 +83,8 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         task_type="regression",
         train_node="train",
         default_source="local_csv",
-        allowed_feature_inputs=("none", "featurize.none", "featurize.rdkit", "featurize.morgan"),
-        allowed_models=("random_forest", "svm", "decision_tree", "xgboost", "ensemble", "chemprop", "dl_*"),
+        allowed_feature_inputs=("none", "smiles_native", "featurize.none", "featurize.rdkit", "featurize.morgan"),
+        allowed_models=("random_forest", "svm", "decision_tree", "xgboost", "ensemble", "chemprop", "chemeleon", "dl_*"),
         supports_label_normalize=False,
         supports_label_ic50=False,
         supports_split=True,
@@ -103,6 +111,7 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         default_source="local_csv",
         allowed_feature_inputs=(
             "none",
+            "smiles_native",
             "featurize.none",
             "featurize.rdkit",
             "featurize.morgan",
@@ -115,6 +124,7 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
             "ensemble",
             "catboost_classifier",
             "chemprop",
+            "chemeleon",
             "dl_*",
         ),
         supports_label_normalize=True,
@@ -194,6 +204,17 @@ def _flatten_dict(obj: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     return out
 
 
+def _validate_search_space_axes(search_space_flat: dict[str, Any]) -> None:
+    invalid_axes = sorted(set(search_space_flat) & _EXECUTION_ONLY_AXES)
+    if not invalid_axes:
+        return
+    raise DOEGenerationError(
+        "Execution-only split axes must not be placed in search_space. "
+        "Use defaults for an explicit retry/debug slice, or omit them so DOE can expand "
+        f"the folds/repeats automatically. Invalid axes: {', '.join(invalid_axes)}"
+    )
+
+
 def _set_dotted(container: dict[str, Any], dotted: str, value: Any) -> None:
     parts = [part for part in dotted.split(".") if part]
     if not parts:
@@ -216,6 +237,29 @@ def _get_dotted(container: dict[str, Any], dotted: str, default: Any = None) -> 
             return default
         current = current[part]
     return current
+
+
+def _pop_dotted(container: dict[str, Any], dotted: str) -> None:
+    parts = [part for part in dotted.split(".") if part]
+    if not parts:
+        return
+    parents: list[tuple[dict[str, Any], str]] = []
+    current: Any = container
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or part not in current:
+            return
+        parents.append((current, part))
+        current = current[part]
+    if not isinstance(current, dict):
+        return
+    current.pop(parts[-1], None)
+    while parents:
+        parent, key = parents.pop()
+        child = parent.get(key)
+        if isinstance(child, dict) and not child:
+            parent.pop(key, None)
+        else:
+            break
 
 
 def _extract_prefixed(flat_map: dict[str, Any], prefix: str) -> dict[str, Any]:
@@ -291,6 +335,18 @@ def _hashable_config_payload(config: dict[str, Any]) -> dict[str, Any]:
         runs_cfg = global_cfg.get("runs")
         if isinstance(runs_cfg, dict):
             runs_cfg.pop("id", None)
+    return payload
+
+
+def _scientific_config_payload(config: dict[str, Any]) -> dict[str, Any]:
+    payload = _hashable_config_payload(config)
+    split_mode = str(_get_dotted(payload, "split.mode", "")).strip().lower()
+    if split_mode == "cv":
+        _pop_dotted(payload, "split.cv.fold_index")
+        _pop_dotted(payload, "split.cv.repeat_index")
+    elif split_mode == "nested_holdout_cv":
+        _pop_dotted(payload, "split.inner.fold_index")
+        _pop_dotted(payload, "split.inner.repeat_index")
     return payload
 
 
@@ -577,6 +633,88 @@ def _expand_search_space(search_space: dict[str, Any], max_cases: int | None) ->
     return combos
 
 
+def _execution_axis_values(axis_key: str, merged: dict[str, Any], declared_axes: set[str], upper_bound: int) -> list[int]:
+    if axis_key in declared_axes:
+        return [int(merged.get(axis_key, 0))]
+    return list(range(max(int(upper_bound), 1)))
+
+
+def _expand_execution_axes(merged: dict[str, Any], declared_axes: set[str]) -> list[dict[str, Any]]:
+    split_mode = str(merged.get("split.mode", "holdout")).strip().lower() or "holdout"
+    if split_mode == "cv":
+        n_splits = int(merged.get("split.cv.n_splits", 5))
+        repeats = int(merged.get("split.cv.repeats", 1))
+        fold_values = _execution_axis_values("split.cv.fold_index", merged, declared_axes, upper_bound=n_splits)
+        repeat_values = _execution_axis_values("split.cv.repeat_index", merged, declared_axes, upper_bound=repeats)
+        return [
+            {
+                "split.cv.fold_index": int(fold_index),
+                "split.cv.repeat_index": int(repeat_index),
+            }
+            for repeat_index, fold_index in itertools.product(repeat_values, fold_values)
+        ]
+
+    if split_mode == "nested_holdout_cv":
+        stage = str(merged.get("split.stage", "inner")).strip().lower() or "inner"
+        if stage != "inner":
+            return [{}]
+        n_splits = int(merged.get("split.inner.n_splits", 5))
+        repeats = int(merged.get("split.inner.repeats", 1))
+        fold_values = _execution_axis_values(
+            "split.inner.fold_index",
+            merged,
+            declared_axes,
+            upper_bound=n_splits,
+        )
+        repeat_values = _execution_axis_values(
+            "split.inner.repeat_index",
+            merged,
+            declared_axes,
+            upper_bound=repeats,
+        )
+        return [
+            {
+                "split.inner.fold_index": int(fold_index),
+                "split.inner.repeat_index": int(repeat_index),
+            }
+            for repeat_index, fold_index in itertools.product(repeat_values, fold_values)
+        ]
+
+    return [{}]
+
+
+def _execution_label(config: dict[str, Any]) -> str:
+    split_mode = str(_get_dotted(config, "split.mode", "holdout")).strip().lower() or "holdout"
+    if split_mode == "cv":
+        repeat_index = int(_get_dotted(config, "split.cv.repeat_index", 0))
+        fold_index = int(_get_dotted(config, "split.cv.fold_index", 0))
+        return f"rep{repeat_index}_fold{fold_index}"
+    if split_mode == "nested_holdout_cv":
+        stage = str(_get_dotted(config, "split.stage", "inner")).strip().lower() or "inner"
+        if stage == "inner":
+            repeat_index = int(_get_dotted(config, "split.inner.repeat_index", 0))
+            fold_index = int(_get_dotted(config, "split.inner.fold_index", 0))
+            return f"{stage}_rep{repeat_index}_fold{fold_index}"
+        return stage
+    return split_mode
+
+
+def _case_execution_tokens(config: dict[str, Any]) -> list[str]:
+    split_mode = str(_get_dotted(config, "split.mode", "")).strip().lower()
+    if split_mode == "cv":
+        repeat_index = int(_get_dotted(config, "split.cv.repeat_index", 0))
+        fold_index = int(_get_dotted(config, "split.cv.fold_index", 0))
+        return [f"rep{repeat_index}", f"fold{fold_index}"]
+    if split_mode == "nested_holdout_cv":
+        stage = str(_get_dotted(config, "split.stage", "inner")).strip().lower() or "inner"
+        if stage == "inner":
+            repeat_index = int(_get_dotted(config, "split.inner.repeat_index", 0))
+            fold_index = int(_get_dotted(config, "split.inner.fold_index", 0))
+            return [stage, f"rep{repeat_index}", f"fold{fold_index}"]
+        return [stage]
+    return []
+
+
 def _build_label_block(
     dataset_cfg: dict[str, Any],
     target_column: str,
@@ -597,7 +735,9 @@ def _build_label_block(
 
 
 def _profile_default_feature_input(profile: ProfileSpec, model_type: str) -> str:
-    if model_type == "chemprop":
+    if model_type in _CHEMPROP_LIKE_MODELS:
+        if "smiles_native" in set(profile.allowed_feature_inputs):
+            return "smiles_native"
         return "none"
     allowed_inputs = set(profile.allowed_feature_inputs)
     preferred = ("featurize.morgan", "featurize.rdkit", "featurize.none")
@@ -631,7 +771,7 @@ def _build_pipeline_nodes(
     elif label_normalize_enabled:
         nodes.append("label.normalize")
 
-    if feature_input != "none":
+    if feature_input not in {"none", "smiles_native"}:
         nodes.append(feature_input)
     nodes.append("split")
 
@@ -733,7 +873,10 @@ def _build_case_config(
 
     config: dict[str, Any] = {
         "global": global_cfg,
-        "pipeline": {"nodes": nodes},
+        "pipeline": {
+            "nodes": nodes,
+            "feature_input": feature_input,
+        },
     }
 
     if "get_data" in nodes:
@@ -920,6 +1063,8 @@ def _build_case_config(
             if passthrough in merged:
                 key = passthrough.removeprefix("train.model.")
                 model_cfg[key] = merged[passthrough]
+        if model_type == "chemeleon":
+            model_cfg["foundation"] = "chemeleon"
         train_cfg: dict[str, Any] = {"model": model_cfg}
         if "train.random_state" in merged:
             train_cfg["random_state"] = int(merged["train.random_state"])
@@ -1091,13 +1236,24 @@ def _validate_case(
         "featurize.rdkit_labeled",
         "featurize.morgan",
     }
-    selected_feature_input = "none"
+    preprocess_scaler = str(_get_dotted(config, "preprocess.scaler", "robust")).strip().lower() or "robust"
+    selected_feature_input = _normalize_feature_input(
+        str(_get_dotted(config, "pipeline.feature_input", "none")).strip()
+    ) or "none"
     if "featurize.none" in nodes or "use.curated_features" in nodes:
         selected_feature_input = "featurize.none"
     elif "featurize.rdkit" in nodes or "featurize.rdkit_labeled" in nodes:
         selected_feature_input = "featurize.rdkit"
     elif "featurize.morgan" in nodes:
         selected_feature_input = "featurize.morgan"
+    chemprop_like_passthrough_preprocess = (
+        model_type in _CHEMPROP_LIKE_MODELS
+        and has_preprocess
+        and not has_select
+        and preprocess_scaler == "none"
+        and selected_feature_input == "smiles_native"
+        and not any(node in feature_nodes for node in nodes)
+    )
     if has_train and not profile.allows_feature_input(selected_feature_input):
         _add_issue(
             issues,
@@ -1105,28 +1261,70 @@ def _validate_case(
             path="pipeline.nodes",
             message=f"Feature input {selected_feature_input!r} is not supported for profile {profile.name!r}.",
         )
-    if has_train and model_type != "chemprop":
-        if not any(node in feature_nodes for node in nodes):
+    if has_train and model_type not in _CHEMPROP_LIKE_MODELS:
+        if selected_feature_input == "smiles_native":
+            _add_issue(
+                issues,
+                code="DOE_SMILES_NATIVE_MODEL_UNSUPPORTED",
+                path="pipeline.feature_input",
+                message=(
+                    "smiles_native is reserved for SMILES-native models (chemprop/chemeleon). "
+                    "Use featurize.rdkit, featurize.morgan, or featurize.none for tabular models."
+                ),
+            )
+        elif not any(node in feature_nodes for node in nodes):
             _add_issue(
                 issues,
                 code="DOE_FEATURE_INPUT_REQUIRED",
                 path="pipeline.nodes",
                 message="Non-chemprop training requires one feature input node (featurize.none or featurize.*).",
             )
-    if (has_preprocess or has_select) and not any(node in feature_nodes for node in nodes):
+    if (
+        (has_preprocess or has_select)
+        and not any(node in feature_nodes for node in nodes)
+        and not chemprop_like_passthrough_preprocess
+        and selected_feature_input != "smiles_native"
+    ):
         _add_issue(
             issues,
             code="DOE_FEATURE_INPUT_REQUIRED_FOR_PREPROCESS",
             path="pipeline.nodes",
             message="preprocess.features/select.features require an explicit feature input node.",
         )
-    if model_type == "chemprop" and (has_preprocess or has_select):
+    if model_type in _CHEMPROP_LIKE_MODELS and selected_feature_input not in _CHEMPROP_LIKE_FEATURE_INPUTS:
         _add_issue(
             issues,
-            code="DOE_CHEMPROP_PREPROCESS_UNSUPPORTED",
-            path="pipeline.nodes",
-            message="chemprop does not use tabular preprocess/select nodes; remove preprocess.features/select.features.",
-        )
+                code="DOE_CHEMPROP_FEATURE_INPUT_UNSUPPORTED",
+                path="pipeline.feature_input",
+                message=(
+                "chemprop and chemeleon are SMILES-native; set pipeline.feature_input to "
+                "'smiles_native' for these rows."
+                ),
+            )
+    if model_type in _CHEMPROP_LIKE_MODELS and (
+        has_select or (has_preprocess and not chemprop_like_passthrough_preprocess)
+    ):
+        _add_issue(
+            issues,
+                code="DOE_CHEMPROP_PREPROCESS_UNSUPPORTED",
+                path="pipeline.nodes",
+                message=(
+                "chemprop/chemeleon do not use tabular preprocess/select nodes; only the no-op combination "
+                "(pipeline.feature_input=smiles_native and preprocess.scaler=none) is supported."
+                ),
+            )
+    foundation_mode = str(_get_dotted(config, "train.model.foundation", "none")).strip().lower() or "none"
+    if model_type == "chemeleon":
+        foundation_mode = "chemeleon"
+    if foundation_mode == "chemeleon":
+        checkpoint = str(_get_dotted(config, "train.model.foundation_checkpoint", "")).strip()
+        if not checkpoint:
+            _add_issue(
+                issues,
+                code="DOE_CHEMELEON_CHECKPOINT_REQUIRED",
+                path="train.model.foundation_checkpoint",
+                message="CheMeleon runs require train.model.foundation_checkpoint to point to the .pt checkpoint.",
+            )
     if profile.name == "reg_chembl_ic50" and "featurize.rdkit" not in nodes:
         _add_issue(
             issues,
@@ -1266,7 +1464,7 @@ def _validate_case(
                     path="split.inner.repeat_index",
                     message="split.inner.repeat_index must satisfy 0 <= repeat_index < repeats.",
                 )
-        if model_type == "chemprop" or model_type.startswith(DL_PREFIX):
+        if model_type in _CHEMPROP_LIKE_MODELS or model_type.startswith(DL_PREFIX):
             if split_mode == "holdout":
                 val_size = float(_get_dotted(config, "split.val_size", 0.0) or 0.0)
             else:
@@ -1418,18 +1616,19 @@ def _validate_case(
                 message="train.tdc currently supports only model.type=catboost_classifier.",
             )
 
-    try:
-        from main import validate_pipeline_nodes
+    if not issues:
+        try:
+            from main import validate_pipeline_nodes
 
-        validate_pipeline_nodes(nodes)
-        validate_config_strict(config, nodes)
-    except Exception as exc:  # pragma: no cover - runtime path exercised in tests
-        _add_issue(
-            issues,
-            code="DOE_RUNTIME_SCHEMA_INVALID",
-            path="pipeline/config",
-            message=str(exc),
-        )
+            validate_pipeline_nodes(nodes)
+            validate_config_strict(config, nodes)
+        except Exception as exc:  # pragma: no cover - runtime path exercised in tests
+            _add_issue(
+                issues,
+                code="DOE_RUNTIME_SCHEMA_INVALID",
+                path="pipeline/config",
+                message=str(exc),
+            )
     return issues
 
 
@@ -1472,88 +1671,194 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
 
     defaults_flat = _flatten_dict(defaults_cfg)
     search_space_flat = _flatten_dict(search_space)
+    _validate_search_space_axes(search_space_flat)
+    declared_axes = set(defaults_flat) | set(search_space_flat)
     max_cases = constraints_cfg.get("max_cases")
     if max_cases is not None:
         max_cases = int(max_cases)
     isolate_case_artifacts = _as_bool(constraints_cfg.get("isolate_case_artifacts", True))
     expanded = _expand_search_space(search_space_flat, max_cases=max_cases)
 
+    expanded_case_total = 0
+    for factors in expanded:
+        merged_preview = dict(defaults_flat)
+        merged_preview.update(factors)
+        expanded_case_total += len(_expand_execution_axes(merged_preview, declared_axes))
+        limit = max_cases if max_cases is not None else _DEFAULT_MAX_EXPANDED_CASES
+        if expanded_case_total > limit:
+            limit_name = "constraints.max_cases" if max_cases is not None else "default safety limit"
+            raise DOEGenerationError(
+                "Expanded DOE is too large after CV/nested execution-axis expansion. "
+                f"Expanded cases={expanded_case_total:,} exceeds {limit_name}={limit:,}."
+            )
+
     valid_records: list[dict[str, Any]] = []
     all_records: list[dict[str, Any]] = []
+    parent_records: list[dict[str, Any]] = []
     seen_config_hashes: set[str] = set()
-
-    for index, factors in enumerate(expanded, start=1):
-        case_id = f"case_{index:04d}"
-        merged = dict(defaults_flat)
-        merged.update(factors)
-        base_config = _build_case_config(
+    seen_parent_scientific_ids: set[str] = set()
+    case_index = 0
+    parent_index = 0
+    for factors in expanded:
+        merged_base = dict(defaults_flat)
+        merged_base.update(factors)
+        execution_axes = _expand_execution_axes(merged_base, declared_axes)
+        scientific_config = _build_case_config(
             profile=profile,
             dataset_cfg=dataset_cfg,
-            merged=merged,
+            merged=merged_base,
             resolved_task=resolved_task,
             probe=probe,
         )
-        issues = _validate_case(profile=profile, config=base_config, probe=probe)
-
-        record: dict[str, Any] = {
-            "case_id": case_id,
+        scientific_config_id = _stable_hash(_scientific_config_payload(scientific_config))
+        if scientific_config_id in seen_parent_scientific_ids:
+            continue
+        seen_parent_scientific_ids.add(scientific_config_id)
+        parent_index += 1
+        parent_case_id = f"parent_{parent_index:04d}"
+        parent_model_type = _get_dotted(
+            scientific_config,
+            "train.model.type",
+            _get_dotted(scientific_config, "train_tdc.model.type", "model"),
+        )
+        parent_split_mode = _get_dotted(scientific_config, "split.mode", "nosplit")
+        parent_split_strategy = _get_dotted(scientific_config, "split.strategy", "na")
+        parent_record: dict[str, Any] = {
+            "record_type": "parent",
+            "case_id": parent_case_id,
+            "parent_case_id": parent_case_id,
+            "scientific_config_id": scientific_config_id,
             "profile": profile.name,
             "task_type": resolved_task,
             "status": "valid",
+            "model_type": parent_model_type,
+            "split_mode": parent_split_mode,
+            "split_strategy": parent_split_strategy,
             "factors": factors,
             "issues": [],
+            "execution_count": len(execution_axes),
+            "valid_execution_cases": 0,
+            "skipped_execution_cases": 0,
+            "execution_case_ids": [],
+            "valid_execution_case_ids": [],
+            "execution_labels": [],
         }
+        parent_issue_keys: set[str] = set()
 
-        if issues:
-            record["status"] = "skipped"
-            record["issues"] = [issue.__dict__ for issue in issues]
-            all_records.append(record)
-            continue
-
-        config_fingerprint = _stable_hash(_hashable_config_payload(base_config))
-        if config_fingerprint in seen_config_hashes:
-            record["status"] = "skipped"
-            record["issues"] = [
-                {
-                    "code": "DOE_DUPLICATE_CONFIG",
-                    "path": "search_space",
-                    "message": "Different factor combinations rendered the same runtime config.",
-                }
-            ]
-            all_records.append(record)
-            continue
-        seen_config_hashes.add(config_fingerprint)
-
-        config = json.loads(json.dumps(base_config))
-        if isolate_case_artifacts:
-            _apply_case_isolation(
-                config,
-                case_id=case_id,
-                output_dir=output_dir,
-                spec_namespace=spec_namespace,
+        for execution_index, execution_factors in enumerate(execution_axes, start=1):
+            case_index += 1
+            case_id = f"case_{case_index:04d}"
+            merged = dict(merged_base)
+            merged.update(execution_factors)
+            base_config = _build_case_config(
+                profile=profile,
+                dataset_cfg=dataset_cfg,
+                merged=merged,
+                resolved_task=resolved_task,
+                probe=probe,
             )
-        config_hash = _stable_hash(config)
+            issues = _validate_case(profile=profile, config=base_config, probe=probe)
 
-        model_type = _get_dotted(config, "train.model.type", _get_dotted(config, "train_tdc.model.type", "model"))
-        split_mode = _get_dotted(config, "split.mode", "nosplit")
-        split_strategy = _get_dotted(config, "split.strategy", "na")
-        filename = (
-            f"{case_id}__{_sanitize_token(profile.name)}__{_sanitize_token(model_type)}__"
-            f"{_sanitize_token(split_mode)}__{_sanitize_token(split_strategy)}.yaml"
-        )
-        config_path = os.path.join(output_dir, filename)
-        with open(config_path, "w", encoding="utf-8") as fh:
-            yaml.safe_dump(config, fh, sort_keys=False)
+            record: dict[str, Any] = {
+                "record_type": "execution_child",
+                "case_id": case_id,
+                "parent_case_id": parent_case_id,
+                "scientific_config_id": scientific_config_id,
+                "execution_index": execution_index,
+                "execution_count": len(execution_axes),
+                "profile": profile.name,
+                "task_type": resolved_task,
+                "status": "valid",
+                "factors": factors,
+                "execution_factors": execution_factors,
+                "issues": [],
+            }
+            execution_label = _execution_label(base_config)
+            record["execution_label"] = execution_label
+            parent_record["execution_case_ids"].append(case_id)
+            parent_record["execution_labels"].append(execution_label)
 
-        record["config_path"] = config_path
-        record["config_hash"] = config_hash
-        record["config_fingerprint"] = config_fingerprint
-        valid_records.append(record)
-        all_records.append(record)
+            if issues:
+                record["status"] = "skipped"
+                record["issues"] = [issue.__dict__ for issue in issues]
+                parent_record["skipped_execution_cases"] += 1
+                for issue in record["issues"]:
+                    issue_key = json.dumps(issue, sort_keys=True)
+                    if issue_key in parent_issue_keys:
+                        continue
+                    parent_issue_keys.add(issue_key)
+                    parent_record["issues"].append(issue)
+                all_records.append(record)
+                continue
+
+            config_fingerprint = _stable_hash(_hashable_config_payload(base_config))
+            if config_fingerprint in seen_config_hashes:
+                record["status"] = "skipped"
+                record["issues"] = [
+                    {
+                        "code": "DOE_DUPLICATE_CONFIG",
+                        "path": "search_space",
+                        "message": "Different factor combinations rendered the same runtime config.",
+                    }
+                ]
+                parent_record["skipped_execution_cases"] += 1
+                issue_key = json.dumps(record["issues"][0], sort_keys=True)
+                if issue_key not in parent_issue_keys:
+                    parent_issue_keys.add(issue_key)
+                    parent_record["issues"].append(record["issues"][0])
+                all_records.append(record)
+                continue
+            seen_config_hashes.add(config_fingerprint)
+
+            config = json.loads(json.dumps(base_config))
+            if isolate_case_artifacts:
+                _apply_case_isolation(
+                    config,
+                    case_id=case_id,
+                    output_dir=output_dir,
+                    spec_namespace=spec_namespace,
+                )
+            config_hash = _stable_hash(config)
+
+            model_type = _get_dotted(config, "train.model.type", _get_dotted(config, "train_tdc.model.type", "model"))
+            split_mode = _get_dotted(config, "split.mode", "nosplit")
+            split_strategy = _get_dotted(config, "split.strategy", "na")
+            execution_tokens = _case_execution_tokens(config)
+            filename = (
+                f"{case_id}__{_sanitize_token(profile.name)}__{_sanitize_token(model_type)}__"
+                f"{_sanitize_token(split_mode)}__{_sanitize_token(split_strategy)}"
+            )
+            if execution_tokens:
+                filename += "__" + "__".join(_sanitize_token(token) for token in execution_tokens)
+            filename += ".yaml"
+            config_path = os.path.join(output_dir, filename)
+            with open(config_path, "w", encoding="utf-8") as fh:
+                yaml.safe_dump(config, fh, sort_keys=False)
+
+            record["config_path"] = config_path
+            record["config_hash"] = config_hash
+            record["config_fingerprint"] = config_fingerprint
+            parent_record["valid_execution_cases"] += 1
+            parent_record["valid_execution_case_ids"].append(case_id)
+            valid_records.append(record)
+            all_records.append(record)
+
+        if parent_record["valid_execution_cases"] == parent_record["execution_count"] and parent_record["execution_count"] > 0:
+            parent_record["status"] = "valid"
+        elif parent_record["valid_execution_cases"] > 0:
+            parent_record["status"] = "partial"
+        else:
+            parent_record["status"] = "skipped"
+        parent_records.append(parent_record)
 
     manifest_path = os.path.join(output_dir, "manifest.jsonl")
     with open(manifest_path, "w", encoding="utf-8") as fh:
         for record in all_records:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
+
+    parent_manifest_path = os.path.join(output_dir, "parent_manifest.jsonl")
+    with open(parent_manifest_path, "w", encoding="utf-8") as fh:
+        for record in parent_records:
             fh.write(json.dumps(record, sort_keys=True) + "\n")
 
     counts_by_issue: dict[str, int] = {}
@@ -1579,8 +1884,16 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
         "total_cases": len(all_records),
         "valid_cases": len(valid_records),
         "skipped_cases": len(all_records) - len(valid_records),
+        "total_parent_cases": len(parent_records),
+        "valid_parent_cases": sum(1 for record in parent_records if str(record.get("status", "")).lower() == "valid"),
+        "skipped_parent_cases": sum(1 for record in parent_records if str(record.get("status", "")).lower() == "skipped"),
+        "partial_parent_cases": sum(1 for record in parent_records if str(record.get("status", "")).lower() == "partial"),
+        "total_execution_cases": len(all_records),
+        "valid_execution_cases": len(valid_records),
+        "skipped_execution_cases": len(all_records) - len(valid_records),
         "issue_counts": counts_by_issue,
         "manifest_path": manifest_path,
+        "parent_manifest_path": parent_manifest_path,
         "doe_spec_hash": doe_spec_hash,
         "doe_spec_snapshot_path": doe_spec_snapshot_path,
         "git_sha": _git_sha(),
@@ -1599,7 +1912,9 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
     return {
         "summary_path": summary_path,
         "manifest_path": manifest_path,
+        "parent_manifest_path": parent_manifest_path,
         "valid_cases": valid_records,
         "all_cases": all_records,
+        "parent_cases": parent_records,
         "summary": summary,
     }

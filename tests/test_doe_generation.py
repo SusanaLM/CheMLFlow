@@ -138,7 +138,7 @@ def test_generate_doe_allows_tree_models_for_classification(tmp_path: Path) -> N
 
 def test_generate_doe_requires_validation_split_for_chemprop(tmp_path: Path) -> None:
     spec = _base_clf_doe(tmp_path)
-    spec["search_space"]["pipeline.feature_input"] = ["none"]
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
     spec["search_space"]["train.model.type"] = ["chemprop"]
     spec["defaults"]["split.val_size"] = 0.0
 
@@ -152,7 +152,7 @@ def test_generate_doe_requires_validation_split_for_chemprop(tmp_path: Path) -> 
 
 def test_generate_doe_propagates_chemprop_legacy_split_flag(tmp_path: Path) -> None:
     spec = _base_clf_doe(tmp_path)
-    spec["search_space"]["pipeline.feature_input"] = ["none"]
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
     spec["search_space"]["pipeline.explain"] = [False]
     spec["search_space"]["train.model.type"] = ["chemprop"]
     spec["defaults"]["train.model.allow_legacy_split_positions"] = True
@@ -167,19 +167,39 @@ def test_generate_doe_propagates_chemprop_legacy_split_flag(tmp_path: Path) -> N
     assert config["train"]["model"]["allow_legacy_split_positions"] is True
 
 
-def test_generate_doe_skips_chemprop_with_preprocess_and_no_features(tmp_path: Path) -> None:
+def test_generate_doe_allows_chemprop_with_noop_preprocess_and_no_features(tmp_path: Path) -> None:
     spec = _base_clf_doe(tmp_path)
-    spec["search_space"]["pipeline.feature_input"] = ["none"]
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
     spec["search_space"]["pipeline.preprocess"] = [True]
     spec["search_space"]["train.model.type"] = ["chemprop"]
+    spec["defaults"]["preprocess.scaler"] = "none"
+    spec["defaults"]["split.val_size"] = 0.1
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 1
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert "preprocess.features" in config["pipeline"]["nodes"]
+    assert "featurize.none" not in config["pipeline"]["nodes"]
+    assert config["preprocess"]["scaler"] == "none"
+
+
+def test_generate_doe_skips_chemprop_with_non_noop_preprocess(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
+    spec["search_space"]["pipeline.preprocess"] = [True]
+    spec["search_space"]["train.model.type"] = ["chemprop"]
+    spec["defaults"]["preprocess.scaler"] = "standard"
     spec["defaults"]["split.val_size"] = 0.1
 
     result = generate_doe(spec)
     summary = result["summary"]
 
     assert summary["valid_cases"] == 0
-    assert summary["issue_counts"].get("DOE_FEATURE_INPUT_REQUIRED_FOR_PREPROCESS", 0) == 1
     assert summary["issue_counts"].get("DOE_CHEMPROP_PREPROCESS_UNSUPPORTED", 0) == 1
+    assert summary["issue_counts"].get("DOE_RUNTIME_SCHEMA_INVALID", 0) == 0
 
 
 def test_generate_doe_allows_chemprop_for_regression_local_csv(tmp_path: Path) -> None:
@@ -202,7 +222,7 @@ def test_generate_doe_allows_chemprop_for_regression_local_csv(tmp_path: Path) -
         "search_space": {
             "split.mode": ["holdout"],
             "split.strategy": ["random"],
-            "pipeline.feature_input": ["none"],
+            "pipeline.feature_input": ["smiles_native"],
             "pipeline.preprocess": [False],
             "pipeline.select": [False],
             "pipeline.explain": [False],
@@ -232,16 +252,112 @@ def test_generate_doe_allows_chemprop_for_regression_local_csv(tmp_path: Path) -
     assert config["global"]["task_type"] == "regression"
     assert config["train"]["model"]["type"] == "chemprop"
     assert "featurize.none" not in config["pipeline"]["nodes"]
+    assert config["pipeline"]["feature_input"] == "smiles_native"
+
+
+def test_generate_doe_skips_chemprop_with_tabular_feature_input(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["featurize.rdkit"]
+    spec["search_space"]["train.model.type"] = ["chemprop"]
+    spec["defaults"]["split.val_size"] = 0.1
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 0
+    assert summary["issue_counts"].get("DOE_CHEMPROP_FEATURE_INPUT_UNSUPPORTED", 0) == 1
+
+
+def test_generate_doe_skips_chemprop_with_featurize_none_alias(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["featurize.none"]
+    spec["search_space"]["train.model.type"] = ["chemprop"]
+    spec["defaults"]["split.val_size"] = 0.1
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 0
+    assert summary["issue_counts"].get("DOE_CHEMPROP_FEATURE_INPUT_UNSUPPORTED", 0) == 1
+    assert summary["issue_counts"].get("DOE_RUNTIME_SCHEMA_INVALID", 0) == 0
+
+
+def test_generate_doe_allows_chemprop_with_smiles_native_feature_input(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
+    spec["search_space"]["train.model.type"] = ["chemprop"]
+    spec["search_space"]["pipeline.preprocess"] = [True]
+    spec["defaults"]["preprocess.scaler"] = "none"
+    spec["defaults"]["split.val_size"] = 0.1
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 1
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["pipeline"]["feature_input"] == "smiles_native"
+    assert "preprocess.features" in config["pipeline"]["nodes"]
+    assert "featurize.rdkit" not in config["pipeline"]["nodes"]
+    assert "featurize.morgan" not in config["pipeline"]["nodes"]
+
+
+def test_generate_doe_skips_tabular_models_with_smiles_native_feature_input(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
+    spec["search_space"]["train.model.type"] = ["random_forest"]
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 0
+    assert summary["issue_counts"].get("DOE_SMILES_NATIVE_MODEL_UNSUPPORTED", 0) == 1
+    assert summary["issue_counts"].get("DOE_RUNTIME_SCHEMA_INVALID", 0) == 0
+
+
+def test_generate_doe_allows_chemeleon_with_smiles_native_feature_input(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "chemeleon_mp.pt"
+    checkpoint.write_bytes(b"fake-checkpoint")
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
+    spec["search_space"]["pipeline.preprocess"] = [True]
+    spec["search_space"]["train.model.type"] = ["chemeleon"]
+    spec["defaults"]["preprocess.scaler"] = "none"
+    spec["defaults"]["train.model.foundation_checkpoint"] = str(checkpoint)
+    spec["defaults"]["split.val_size"] = 0.1
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 1
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["train"]["model"]["type"] == "chemeleon"
+    assert config["train"]["model"]["foundation"] == "chemeleon"
+    assert config["train"]["model"]["foundation_checkpoint"] == str(checkpoint)
+    assert config["pipeline"]["feature_input"] == "smiles_native"
+
+
+def test_generate_doe_requires_chemeleon_checkpoint(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["smiles_native"]
+    spec["search_space"]["train.model.type"] = ["chemeleon"]
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["valid_cases"] == 0
+    assert summary["issue_counts"].get("DOE_CHEMELEON_CHECKPOINT_REQUIRED", 0) == 1
 
 
 def test_generate_doe_enforces_split_mode_strategy_compatibility(tmp_path: Path) -> None:
     spec = _base_clf_doe(tmp_path)
     spec["search_space"]["split.mode"] = ["cv"]
     spec["search_space"]["split.strategy"] = ["tdc_scaffold"]
-    spec["search_space"]["split.cv.n_splits"] = [5]
-    spec["search_space"]["split.cv.repeats"] = [1]
-    spec["search_space"]["split.cv.fold_index"] = [0]
-    spec["search_space"]["split.cv.repeat_index"] = [0]
+    spec["defaults"]["split.cv.n_splits"] = 5
+    spec["defaults"]["split.cv.repeats"] = 1
+    spec["defaults"]["split.cv.fold_index"] = 0
+    spec["defaults"]["split.cv.repeat_index"] = 0
 
     result = generate_doe(spec)
     summary = result["summary"]
@@ -250,20 +366,122 @@ def test_generate_doe_enforces_split_mode_strategy_compatibility(tmp_path: Path)
     assert summary["issue_counts"].get("DOE_SPLIT_STRATEGY_MODE_INVALID", 0) == 1
 
 
+def test_generate_doe_rejects_execution_only_axes_in_search_space(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["split.mode"] = ["cv"]
+    spec["defaults"]["split.cv.n_splits"] = 3
+    spec["defaults"]["split.cv.repeats"] = 1
+    spec["search_space"]["split.cv.fold_index"] = [0]
+
+    with pytest.raises(
+        DOEGenerationError,
+        match="Execution-only split axes must not be placed in search_space",
+    ):
+        generate_doe(spec)
+
+
+def test_generate_doe_auto_expands_cv_execution_axes_when_omitted(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["split.mode"] = ["cv"]
+    spec["search_space"]["split.strategy"] = ["random", "scaffold"]
+    spec["defaults"]["split.cv.n_splits"] = 3
+    spec["defaults"]["split.cv.repeats"] = 2
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["total_cases"] == 12
+    assert summary["valid_cases"] == 12
+    assert summary["skipped_cases"] == 0
+    assert summary["total_parent_cases"] == 2
+    assert summary["valid_parent_cases"] == 2
+    assert summary["total_execution_cases"] == 12
+    assert len(result["parent_cases"]) == 2
+
+    first = result["valid_cases"][0]
+    assert first["parent_case_id"] == "parent_0001"
+    assert first["execution_count"] == 6
+    assert first["execution_label"] == "rep0_fold0"
+    assert first["scientific_config_id"]
+    assert "split.cv.fold_index" not in first["factors"]
+    assert "split.cv.repeat_index" not in first["factors"]
+    assert set(first["execution_factors"]) == {"split.cv.fold_index", "split.cv.repeat_index"}
+
+    parent_manifest_lines = Path(result["parent_manifest_path"]).read_text(encoding="utf-8").strip().splitlines()
+    assert len(parent_manifest_lines) == 2
+    first_parent = json.loads(parent_manifest_lines[0])
+    assert first_parent["record_type"] == "parent"
+    assert first_parent["case_id"] == "parent_0001"
+    assert first_parent["execution_count"] == 6
+    assert len(first_parent["valid_execution_case_ids"]) == 6
+    assert len(first_parent["execution_case_ids"]) == len(first_parent["execution_labels"]) == 6
+    assert first_parent["status"] == "valid"
+
+    seen_execution = {
+        (
+            int(case["execution_factors"]["split.cv.repeat_index"]),
+            int(case["execution_factors"]["split.cv.fold_index"]),
+        )
+        for case in result["valid_cases"]
+        if case["factors"]["split.strategy"] == "random"
+    }
+    assert seen_execution == {
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+    }
+
+
+def test_generate_doe_respects_explicit_cv_execution_axes_in_defaults(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["split.mode"] = ["cv"]
+    spec["defaults"]["split.cv.n_splits"] = 3
+    spec["defaults"]["split.cv.repeats"] = 2
+    spec["defaults"]["split.cv.fold_index"] = 1
+    spec["defaults"]["split.cv.repeat_index"] = 0
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["total_cases"] == 1
+    assert summary["valid_cases"] == 1
+
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["split"]["cv"]["fold_index"] == 1
+    assert config["split"]["cv"]["repeat_index"] == 0
+    assert result["valid_cases"][0]["parent_case_id"] == "parent_0001"
+    assert summary["total_parent_cases"] == 1
+    assert summary["total_execution_cases"] == 1
+
+
 def test_generate_doe_validates_cv_fold_index_bounds(tmp_path: Path) -> None:
     spec = _base_clf_doe(tmp_path)
     spec["search_space"]["split.mode"] = ["cv"]
     spec["search_space"]["split.strategy"] = ["random"]
-    spec["search_space"]["split.cv.n_splits"] = [3]
-    spec["search_space"]["split.cv.repeats"] = [1]
-    spec["search_space"]["split.cv.fold_index"] = [3]
-    spec["search_space"]["split.cv.repeat_index"] = [0]
+    spec["defaults"]["split.cv.n_splits"] = 3
+    spec["defaults"]["split.cv.repeats"] = 1
+    spec["defaults"]["split.cv.fold_index"] = 3
+    spec["defaults"]["split.cv.repeat_index"] = 0
 
     result = generate_doe(spec)
     summary = result["summary"]
 
     assert summary["valid_cases"] == 0
     assert summary["issue_counts"].get("DOE_SPLIT_PARAM_INVALID", 0) >= 1
+    manifest_lines = Path(result["manifest_path"]).read_text(encoding="utf-8").strip().splitlines()
+    assert len(manifest_lines) == 1
+    payload = json.loads(manifest_lines[0])
+    assert payload["status"] == "skipped"
+    assert payload["execution_label"] == "rep0_fold3"
+    parent_manifest_lines = Path(result["parent_manifest_path"]).read_text(encoding="utf-8").strip().splitlines()
+    assert len(parent_manifest_lines) == 1
+    parent_payload = json.loads(parent_manifest_lines[0])
+    assert parent_payload["execution_case_ids"] == ["case_0001"]
+    assert parent_payload["execution_labels"] == ["rep0_fold3"]
 
 
 def test_generate_doe_supports_auto_task_with_confirmation(tmp_path: Path) -> None:
@@ -311,7 +529,17 @@ def test_generate_doe_supports_auto_task_with_confirmation(tmp_path: Path) -> No
     manifest_lines = Path(result["manifest_path"]).read_text(encoding="utf-8").strip().splitlines()
     assert len(manifest_lines) == 1
     payload = json.loads(manifest_lines[0])
+    assert payload["record_type"] == "execution_child"
+    assert payload["parent_case_id"] == "parent_0001"
+    assert payload["execution_label"] == "holdout"
     assert payload["status"] == "valid"
+
+    parent_manifest_lines = Path(result["parent_manifest_path"]).read_text(encoding="utf-8").strip().splitlines()
+    assert len(parent_manifest_lines) == 1
+    parent_payload = json.loads(parent_manifest_lines[0])
+    assert parent_payload["record_type"] == "parent"
+    assert parent_payload["case_id"] == "parent_0001"
+    assert parent_payload["execution_count"] == 1
 
 
 def test_generate_doe_isolates_case_artifacts_by_default(tmp_path: Path) -> None:
@@ -754,6 +982,24 @@ def test_generate_doe_normalizes_legacy_curated_feature_alias(tmp_path: Path) ->
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert "featurize.none" in config["pipeline"]["nodes"]
     assert "use.curated_features" not in config["pipeline"]["nodes"]
+
+
+def test_generate_doe_canonicalizes_parent_identity_for_feature_alias_duplicates(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["search_space"]["pipeline.feature_input"] = ["featurize.none", "use.curated_features"]
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["total_cases"] == 1
+    assert summary["valid_cases"] == 1
+    assert summary["total_parent_cases"] == 1
+    assert len(result["parent_cases"]) == 1
+    parent_manifest_lines = Path(result["parent_manifest_path"]).read_text(encoding="utf-8").strip().splitlines()
+    assert len(parent_manifest_lines) == 1
+    parent_payload = json.loads(parent_manifest_lines[0])
+    assert parent_payload["execution_case_ids"] == ["case_0001"]
+    assert parent_payload["valid_execution_case_ids"] == ["case_0001"]
 
 
 def test_generate_doe_requires_max_cases_for_large_grid(tmp_path: Path) -> None:

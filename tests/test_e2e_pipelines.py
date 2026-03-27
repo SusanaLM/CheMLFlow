@@ -226,7 +226,8 @@ def test_e2e_pgp_chemprop_fast(tmp_path: Path) -> None:
             "run_dir": str(run_dir),
         },
         "pipeline": {
-            "nodes": ["get_data", "curate", "label.normalize", "split", "train"]
+            "nodes": ["get_data", "curate", "label.normalize", "split", "train"],
+            "feature_input": "smiles_native",
         },
         "get_data": {
             "data_source": "local_csv",
@@ -299,7 +300,8 @@ def test_e2e_flash_chemprop_regression_fast(tmp_path: Path) -> None:
             "run_dir": str(run_dir),
         },
         "pipeline": {
-            "nodes": ["get_data", "curate", "split", "train"]
+            "nodes": ["get_data", "curate", "split", "train"],
+            "feature_input": "smiles_native",
         },
         "get_data": {
             "data_source": "local_csv",

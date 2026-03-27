@@ -6,6 +6,14 @@ import pandas as pd
 import pytest
 
 from MLModels import train_models
+from analysis import (
+    GeneralizationRecord,
+    _aggregate_all_runs_metric_rows,
+    _aggregate_generalization_records,
+    _infer_feature_input,
+    _resolve_metrics_path,
+    _resolve_split_metrics,
+)
 
 
 def test_train_model_writes_split_metrics_artifacts(tmp_path):
@@ -59,6 +67,326 @@ def test_train_model_writes_split_metrics_artifacts(tmp_path):
     split_metrics = json.loads(Path(split_metrics_path).read_text(encoding="utf-8"))
     assert set(split_metrics.keys()) == {"train", "val", "test"}
     assert {"r2", "mae"}.issubset(split_metrics["train"].keys())
+
+
+def test_aggregate_all_runs_metric_rows_groups_execution_slices():
+    rows = [
+        {
+            "case_name": "case_0001",
+            "parent_case_id": "parent_0001",
+            "scientific_config_id": "cfg-a",
+            "job_id": "101",
+            "state": "COMPLETED",
+            "failure_reason": "",
+            "profile": "reg_local_csv",
+            "model_type": "random_forest",
+            "feature_input": "featurize.morgan",
+            "split_mode": "cv",
+            "split_strategy": "random",
+            "execution_label": "rep0_fold0",
+            "config_path": "/tmp/case_0001.yaml",
+            "run_dir": "/tmp/run1",
+            "metrics_path": "/tmp/m1.json",
+            "test_r2": 0.2,
+            "test_mae": 1.0,
+        },
+        {
+            "case_name": "case_0002",
+            "parent_case_id": "parent_0001",
+            "scientific_config_id": "cfg-a",
+            "job_id": "102",
+            "state": "COMPLETED",
+            "failure_reason": "",
+            "profile": "reg_local_csv",
+            "model_type": "random_forest",
+            "feature_input": "featurize.morgan",
+            "split_mode": "cv",
+            "split_strategy": "random",
+            "execution_label": "rep0_fold1",
+            "config_path": "/tmp/case_0002.yaml",
+            "run_dir": "/tmp/run2",
+            "metrics_path": "/tmp/m2.json",
+            "test_r2": 0.4,
+            "test_mae": 2.0,
+        },
+        {
+            "case_name": "case_0003",
+            "parent_case_id": "parent_0002",
+            "scientific_config_id": "cfg-b",
+            "job_id": "103",
+            "state": "FAILED",
+            "failure_reason": "timeout",
+            "profile": "reg_local_csv",
+            "model_type": "svm",
+            "feature_input": "featurize.rdkit",
+            "split_mode": "cv",
+            "split_strategy": "scaffold",
+            "execution_label": "rep0_fold0",
+            "config_path": "/tmp/case_0003.yaml",
+            "run_dir": "/tmp/run3",
+            "metrics_path": "",
+        },
+    ]
+
+    aggregated = _aggregate_all_runs_metric_rows(rows)
+
+    assert len(aggregated) == 2
+    first = aggregated[0]
+    second = aggregated[1]
+
+    assert first["parent_case_id"] == "parent_0001"
+    assert first["scientific_config_id"] == "cfg-a"
+    assert first["state"] == "COMPLETED"
+    assert first["slice_count"] == 2
+    assert first["completed_slices"] == 2
+    assert first["failed_slices"] == 0
+    assert abs(float(first["test_r2"]) - 0.3) < 1e-12
+    assert abs(float(first["test_r2_std"]) - 0.1) < 1e-12
+    assert first["test_mae"] == 1.5
+
+    assert second["parent_case_id"] == "parent_0002"
+    assert second["scientific_config_id"] == "cfg-b"
+    assert second["state"] == "FAILED"
+    assert second["completed_slices"] == 0
+    assert second["failure_reason"] == "timeout=1"
+    assert second["test_r2"] == ""
+
+
+def test_aggregate_generalization_records_marks_partial_configs():
+    records = [
+        GeneralizationRecord(
+            case_name="case_0001",
+            model_type="random_forest",
+            split_mode="cv",
+            split_strategy="random",
+            feature_input="featurize.morgan",
+            metric_name="r2",
+            train_value=0.8,
+            test_value=0.5,
+            val_value=0.55,
+            gap_train_minus_test=0.3,
+            gap_train_minus_test_std=None,
+            overfit_flag=True,
+            underfit_flag=False,
+            config_path="/tmp/case_0001.yaml",
+            run_dir="/tmp/run1",
+            parent_case_id="parent_0001",
+            scientific_config_id="cfg-a",
+            execution_label="rep0_fold0",
+            state="COMPLETED",
+            failure_reason=None,
+            slice_count=1,
+            completed_slices=1,
+            failed_slices=0,
+            config_paths=("/tmp/case_0001.yaml",),
+            run_dirs=("/tmp/run1",),
+        ),
+        GeneralizationRecord(
+            case_name="case_0002",
+            model_type="random_forest",
+            split_mode="cv",
+            split_strategy="random",
+            feature_input="featurize.morgan",
+            metric_name="r2",
+            train_value=0.9,
+            test_value=0.7,
+            val_value=0.72,
+            gap_train_minus_test=0.2,
+            gap_train_minus_test_std=None,
+            overfit_flag=True,
+            underfit_flag=False,
+            config_path="/tmp/case_0002.yaml",
+            run_dir="/tmp/run2",
+            parent_case_id="parent_0001",
+            scientific_config_id="cfg-a",
+            execution_label="rep0_fold1",
+            state="COMPLETED",
+            failure_reason=None,
+            slice_count=1,
+            completed_slices=1,
+            failed_slices=0,
+            config_paths=("/tmp/case_0002.yaml",),
+            run_dirs=("/tmp/run2",),
+        ),
+    ]
+
+    aggregated = _aggregate_generalization_records(
+        records=records,
+        overfit_threshold=0.2,
+        underfit_threshold_r2=0.2,
+        underfit_threshold_auc=0.65,
+        config_summary={
+            "parent_0001": {
+                "state": "PARTIAL",
+                "failure_reason": "timeout=1",
+                "slice_count": 3,
+                "completed_slices": 2,
+                "failed_slices": 1,
+            }
+        },
+    )
+
+    assert len(aggregated) == 1
+    record = aggregated[0]
+    assert record.parent_case_id == "parent_0001"
+    assert record.scientific_config_id == "cfg-a"
+    assert record.slice_count == 3
+    assert record.metric_slices_used == 2
+    assert record.completed_slices == 2
+    assert record.failed_slices == 1
+    assert record.state == "PARTIAL"
+    assert record.failure_reason == "timeout=1"
+    assert abs(record.train_value - 0.85) < 1e-12
+    assert record.test_value == 0.6
+    assert record.gap_train_minus_test == 0.25
+    assert abs((record.gap_train_minus_test_std or 0.0) - 0.05) < 1e-12
+    assert record.overfit_flag is True
+    assert record.execution_label == "aggregated"
+
+
+def test_aggregate_generalization_records_marks_missing_metric_slices_partial():
+    records = [
+        GeneralizationRecord(
+            case_name="case_0001",
+            model_type="random_forest",
+            split_mode="cv",
+            split_strategy="random",
+            feature_input="featurize.morgan",
+            metric_name="r2",
+            train_value=0.8,
+            test_value=0.5,
+            val_value=0.55,
+            gap_train_minus_test=0.3,
+            gap_train_minus_test_std=None,
+            overfit_flag=True,
+            underfit_flag=False,
+            config_path="/tmp/case_0001.yaml",
+            run_dir="/tmp/run1",
+            parent_case_id="parent_0001",
+            scientific_config_id="cfg-a",
+            execution_label="rep0_fold0",
+            state="COMPLETED",
+            failure_reason=None,
+            slice_count=1,
+            metric_slices_used=1,
+            completed_slices=1,
+            failed_slices=0,
+            config_paths=("/tmp/case_0001.yaml",),
+            run_dirs=("/tmp/run1",),
+        ),
+        GeneralizationRecord(
+            case_name="case_0002",
+            model_type="random_forest",
+            split_mode="cv",
+            split_strategy="random",
+            feature_input="featurize.morgan",
+            metric_name="r2",
+            train_value=0.9,
+            test_value=0.7,
+            val_value=0.72,
+            gap_train_minus_test=0.2,
+            gap_train_minus_test_std=None,
+            overfit_flag=True,
+            underfit_flag=False,
+            config_path="/tmp/case_0002.yaml",
+            run_dir="/tmp/run2",
+            parent_case_id="parent_0001",
+            scientific_config_id="cfg-a",
+            execution_label="rep0_fold1",
+            state="COMPLETED",
+            failure_reason=None,
+            slice_count=1,
+            metric_slices_used=1,
+            completed_slices=1,
+            failed_slices=0,
+            config_paths=("/tmp/case_0002.yaml",),
+            run_dirs=("/tmp/run2",),
+        ),
+    ]
+
+    aggregated = _aggregate_generalization_records(
+        records=records,
+        overfit_threshold=0.2,
+        underfit_threshold_r2=0.2,
+        underfit_threshold_auc=0.65,
+        config_summary={
+            "parent_0001": {
+                "state": "COMPLETED",
+                "failure_reason": "",
+                "slice_count": 3,
+                "completed_slices": 3,
+                "failed_slices": 0,
+            }
+        },
+    )
+
+    assert len(aggregated) == 1
+    record = aggregated[0]
+    assert record.state == "PARTIAL"
+    assert record.slice_count == 3
+    assert record.metric_slices_used == 2
+    assert record.completed_slices == 2
+    assert record.failed_slices == 1
+    assert record.failure_reason == "missing_generalization_metrics=1"
+
+
+def test_analysis_prefers_explicit_feature_node_over_declared_pipeline_feature_input() -> None:
+    config = {
+        "pipeline": {
+            "feature_input": "smiles_native",
+            "nodes": ["get_data", "curate", "featurize.rdkit", "split", "train"],
+        }
+    }
+
+    assert _infer_feature_input(config) == "featurize.rdkit"
+
+
+def test_analysis_recognizes_legacy_use_curated_features_alias() -> None:
+    config = {
+        "pipeline": {
+            "nodes": ["get_data", "curate", "use.curated_features", "split", "train"],
+        }
+    }
+
+    assert _infer_feature_input(config) == "featurize.none"
+
+
+def test_analysis_normalizes_configured_use_curated_features_alias() -> None:
+    config = {
+        "pipeline": {
+            "feature_input": "use.curated_features",
+            "nodes": ["get_data", "curate", "split", "train"],
+        }
+    }
+
+    assert _infer_feature_input(config) == "featurize.none"
+
+
+def test_analysis_infers_smiles_native_for_historical_chemprop_runs() -> None:
+    config = {
+        "pipeline": {
+            "nodes": ["get_data", "curate", "split", "train"],
+        },
+        "train": {
+            "model": {"type": "chemprop"},
+        },
+    }
+
+    assert _infer_feature_input(config) == "smiles_native"
+
+
+def test_analysis_uses_chemprop_artifacts_for_chemeleon(tmp_path: Path) -> None:
+    run_dir = tmp_path / "chemeleon_run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = run_dir / "chemprop_metrics.json"
+    split_metrics_path = run_dir / "chemprop_split_metrics.json"
+    metrics_path.write_text(json.dumps({"split_metrics_path": str(split_metrics_path)}), encoding="utf-8")
+    split_metrics_path.write_text(json.dumps({"train": {"r2": 0.9}, "test": {"r2": 0.7}}), encoding="utf-8")
+
+    assert _resolve_metrics_path(run_dir, "chemeleon") == metrics_path
+    payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    resolved = _resolve_split_metrics("chemeleon", run_dir, payload)
+    assert resolved == {"train": {"r2": 0.9}, "test": {"r2": 0.7}}
 
 
 def test_classification_split_plot_artifacts(tmp_path):
@@ -290,3 +618,63 @@ def test_predict_classification_outputs_falls_back_to_hard_predictions():
     assert np.array_equal(y_pred, np.array([0, 1, 1, 0], dtype=int))
     assert np.array_equal(y_proba, y_pred.astype(float))
     assert np.array_equal(y_score, y_pred.astype(float))
+
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf])
+def test_train_model_dl_classification_raises_clear_error_for_non_finite_scores(
+    monkeypatch,
+    tmp_path,
+    bad_value,
+):
+    class _FakeDlModel:
+        def __init__(self, params: dict[str, object]) -> None:
+            self.params = dict(params)
+
+        def state_dict(self) -> dict[str, object]:
+            return {}
+
+    cfg = train_models.DLSearchConfig(
+        model_class=_FakeDlModel,
+        search_space={},
+        default_params={
+            "epochs": 5,
+            "batch_size": 8,
+            "learning_rate": 1e-3,
+            "hidden_dim": 16,
+        },
+    )
+
+    monkeypatch.setattr(train_models, "_initialize_model", lambda *args, **kwargs: cfg)
+    monkeypatch.setattr(train_models, "_seed_dl_runtime", lambda _seed: None)
+    monkeypatch.setattr(
+        train_models,
+        "_train_dl",
+        lambda *args, **kwargs: {"model": args[0], "best_params": {"epochs": 5}},
+    )
+    monkeypatch.setattr(
+        train_models,
+        "_predict_dl",
+        lambda model, X: np.array([0.0, bad_value, 1.0, 1.5], dtype=float),
+    )
+
+    X = pd.DataFrame(np.ones((16, 4), dtype=float), columns=["f0", "f1", "f2", "f3"])
+    y = pd.Series([0, 1] * 8, dtype=int)
+    X_train, X_val, X_test = X.iloc[:8], X.iloc[8:12], X.iloc[12:]
+    y_train, y_val, y_test = y.iloc[:8], y.iloc[8:12], y.iloc[12:]
+
+    with pytest.raises(
+        ValueError,
+        match="dl_simple classification raw scores: non-finite values in classification scores",
+    ):
+        train_models.train_model(
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            y_test=y_test,
+            model_type="dl_simple",
+            output_dir=str(tmp_path),
+            task_type="classification",
+            model_config={"params": {"epochs": 5, "batch_size": 8, "learning_rate": 1e-3}},
+            X_val=X_val,
+            y_val=y_val,
+        )

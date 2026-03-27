@@ -459,6 +459,9 @@ Use a runtime config with `train.model.type: chemprop`:
 CHEMLFLOW_CONFIG=<path-to-chemprop-config.yaml> python main.py
 ```
 
+For Chemprop/CheMeleon runs, set:
+- `pipeline.feature_input: smiles_native`
+
 If omitted, `train.model.foundation` defaults to `none`, so no external
 foundation checkpoint file is required.
 
