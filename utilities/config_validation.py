@@ -373,6 +373,7 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                 )
             )
 
+    train_tdc_model_type = ""
     if "train_tdc" in blocks_present and not isinstance(config.get("train_tdc"), dict):
         issues.append(
             ValidationIssue(
@@ -402,6 +403,8 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                         message="train_tdc.model.type is required.",
                     )
                 )
+            else:
+                train_tdc_model_type = str(model_cfg.get("type", "")).strip().lower()
 
     if "get_data" in nodes:
         source_cfg = _as_dict(get_data_cfg.get("source"))
@@ -449,13 +452,15 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                         ),
                     )
                 )
-            if model_type and not _allows_model(model_type, profile_contract["allowed_models"]):
+            profile_model_type = train_tdc_model_type if profile_key == "clf_tdc_benchmark" else model_type
+            profile_model_path = "train_tdc.model.type" if profile_key == "clf_tdc_benchmark" else "train.model.type"
+            if profile_model_type and not _allows_model(profile_model_type, profile_contract["allowed_models"]):
                 issues.append(
                     ValidationIssue(
                         code="CFG_MODEL_NOT_SUPPORTED_FOR_PROFILE",
-                        path="train.model.type",
+                        path=profile_model_path,
                         message=(
-                            f"Model {model_type!r} is not supported for runtime profile {profile_key!r}."
+                            f"Model {profile_model_type!r} is not supported for runtime profile {profile_key!r}."
                         ),
                     )
                 )

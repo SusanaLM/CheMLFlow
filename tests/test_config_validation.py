@@ -222,3 +222,14 @@ def test_strict_rejects_tdc_split_profile_shape() -> None:
     issues = collect_config_issues(cfg, ["get_data", "split", "train.tdc"])
     codes = {issue.code for issue in issues}
     assert "CFG_PROFILE_NODE_UNSUPPORTED" in codes
+
+
+def test_strict_rejects_tdc_profile_wrong_model_type() -> None:
+    cfg = _base_config(["get_data", "train.tdc"])
+    cfg["global"]["task_type"] = "classification"
+    cfg["get_data"] = {"data_source": "tdc", "source": {}}
+    cfg["train_tdc"] = {"model": {"type": "random_forest"}}
+
+    issues = collect_config_issues(cfg, ["get_data", "train.tdc"])
+    codes = {issue.code for issue in issues}
+    assert "CFG_MODEL_NOT_SUPPORTED_FOR_PROFILE" in codes
