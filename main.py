@@ -419,6 +419,7 @@ def run_node_featurize_lipinski(context: dict) -> None:
         bind_output_path(FEATURIZE_LIPINSKI_OUTPUT_CONTRACT, output_file),
         warn_only=True,
     )
+    context["curated_path"] = output_file
 
 
 def run_node_label_ic50(context: dict) -> None:
