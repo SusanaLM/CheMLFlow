@@ -18,9 +18,10 @@ except Exception as exc:
 class ChemblDataRetriever:
     """Class to retrieve bioactivity data from ChEMBL for a given target name."""
 
-    def __init__(self, target_name, bioactivity):
+    def __init__(self, target_name, bioactivity, target_chembl_id=None):
         """Initialize the data retriever with the target name and bioactivity setting."""
         self.target_name = target_name
+        self.target_chembl_id = str(target_chembl_id or "").strip()
         self.target = new_client.target
         self.activity = new_client.activity
         self.selected_targets = []
@@ -38,7 +39,12 @@ class ChemblDataRetriever:
             else:
                 self.bioactivity = [bioactivity]
 
-        logging.info(f"Initialized ChemblDataRetriever for target: {self.target_name} with bioactivity: {self.bioactivity or 'all'}")
+        logging.info(
+            "Initialized ChemblDataRetriever for target=%s target_chembl_id=%s bioactivity=%s",
+            self.target_name,
+            self.target_chembl_id or "(search)",
+            self.bioactivity or "all",
+        )
 
     def search_target(self):
         """
@@ -48,6 +54,11 @@ class ChemblDataRetriever:
             A list of ChEMBL IDs for the selected targets.
         """
         try:
+            if self.target_chembl_id:
+                self.selected_targets = [self.target_chembl_id]
+                logging.info("Using pinned target ChEMBL ID: %s", self.target_chembl_id)
+                return self.selected_targets
+
             logging.info(f"Searching for target: {self.target_name}")
             target_query = self.target.search(self.target_name)
             if not target_query:
@@ -134,7 +145,7 @@ class ChemblDataRetriever:
             raise
 
 
-def main(target_name, output_file, bioactivity):
+def main(target_name, output_file, bioactivity, target_chembl_id=None):
     """
     Main function to retrieve and save bioactivity data.
 
@@ -144,7 +155,7 @@ def main(target_name, output_file, bioactivity):
         bioactivity: A list of bioactivity measures or 'all'.
     """
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    retriever = ChemblDataRetriever(target_name, bioactivity)
+    retriever = ChemblDataRetriever(target_name, bioactivity, target_chembl_id=target_chembl_id)
 
     try:
         retriever.search_target()
@@ -186,6 +197,12 @@ if __name__ == "__main__":
             "Defaults to IC50."
         )
     )
+    parser.add_argument(
+        '--target-chembl-id',
+        type=str,
+        default='',
+        help="Optional exact ChEMBL target ID to pin (for example CHEMBL3885651).",
+    )
 
     args = parser.parse_args()
-    main(args.target_name, args.output_file, args.bioactivity)
+    main(args.target_name, args.output_file, args.bioactivity, target_chembl_id=args.target_chembl_id)

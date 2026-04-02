@@ -269,6 +269,7 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
     foundation_checkpoint = str(model_cfg.get("foundation_checkpoint", "")).strip()
     preprocess_cfg = _as_dict(config.get("preprocess"))
     preprocess_scaler = str(preprocess_cfg.get("scaler", "robust")).strip().lower() or "robust"
+    curate_cfg = _as_dict(config.get("curate"))
     global_cfg = _as_dict(config.get("global"))
     task_type = str(global_cfg.get("task_type", "")).strip().lower()
     get_data_cfg = _as_dict(config.get("get_data"))
@@ -416,12 +417,15 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                     message="local_csv source requires get_data.source.path.",
                 )
             )
-        if source_type == "chembl" and not str(source_cfg.get("target_name", "")).strip():
+        if source_type == "chembl" and not (
+            str(source_cfg.get("target_name", "")).strip()
+            or str(source_cfg.get("target_chembl_id", "")).strip()
+        ):
             issues.append(
                 ValidationIssue(
                     code="CFG_DATA_SOURCE_CONFIG_INVALID",
-                    path="get_data.source.target_name",
-                    message="chembl source requires get_data.source.target_name.",
+                    path="get_data.source",
+                    message="chembl source requires get_data.source.target_name or get_data.source.target_chembl_id.",
                 )
             )
         profile_key = _infer_runtime_profile_key(task_type, source_type or "local_csv")
@@ -479,8 +483,18 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                             code="CFG_PROFILE_TRAIN_NODE_MISMATCH",
                             path="pipeline.nodes",
                             message="TDC benchmark profile requires the train.tdc node.",
-                        )
-                    )
+                )
+            )
+
+    row_filters_cfg = curate_cfg.get("row_filters")
+    if row_filters_cfg is not None and not isinstance(row_filters_cfg, dict):
+        issues.append(
+            ValidationIssue(
+                code="CFG_CURATE_ROW_FILTERS_INVALID",
+                path="curate.row_filters",
+                message="curate.row_filters must be a mapping of column names to allowed value(s).",
+            )
+        )
 
     # Legacy preprocess keys that leaked into other nodes.
     if "keep_all_columns" in preprocess_cfg:

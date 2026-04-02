@@ -685,6 +685,59 @@ def test_generate_doe_reg_chembl_defaults_target_column_to_pic50(tmp_path: Path)
     assert config["global"]["target_column"] == "pIC50"
 
 
+def test_generate_doe_reg_chembl_propagates_target_pin_and_row_filters(tmp_path: Path) -> None:
+    spec = {
+        "version": 1,
+        "dataset": {
+            "profile": "reg_chembl_ic50",
+            "task_type": "regression",
+            "source": {"type": "chembl", "target_chembl_id": "CHEMBL3885651"},
+            "curate": {
+                "row_filters": {
+                    "target_chembl_id": ["CHEMBL3885651"],
+                    "standard_type": ["IC50"],
+                    "standard_units": ["nM"],
+                    "standard_relation": ["="],
+                }
+            },
+        },
+        "search_space": {
+            "split.mode": ["holdout"],
+            "split.strategy": ["scaffold"],
+            "pipeline.feature_input": ["featurize.rdkit"],
+            "pipeline.preprocess": [False],
+            "pipeline.select": [False],
+            "pipeline.explain": [False],
+            "train.model.type": ["random_forest"],
+        },
+        "defaults": {
+            "global.base_dir": str(tmp_path / "chembl_row_filters"),
+            "global.runs.enabled": False,
+            "split.test_size": 0.2,
+            "split.val_size": 0.1,
+        },
+        "output": {"dir": str(tmp_path / "generated_chembl_row_filters")},
+    }
+
+    result = generate_doe(spec)
+    assert result["summary"]["valid_cases"] == 1
+
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    nodes = config["pipeline"]["nodes"]
+
+    assert config["get_data"]["source"]["target_chembl_id"] == "CHEMBL3885651"
+    assert config["curate"]["row_filters"] == {
+        "target_chembl_id": ["CHEMBL3885651"],
+        "standard_type": ["IC50"],
+        "standard_units": ["nM"],
+        "standard_relation": ["="],
+    }
+    assert "featurize.lipinski" not in nodes
+    assert nodes.index("label.ic50") < nodes.index("featurize.rdkit")
+    assert nodes.index("featurize.rdkit") < nodes.index("split")
+
+
 def test_generate_doe_validates_invalid_dedupe_strategy(tmp_path: Path) -> None:
     spec = _base_clf_doe(tmp_path)
     spec["defaults"]["curate.dedupe_strategy"] = "keepfirst_typo"

@@ -10,14 +10,23 @@ HTTP_TIMEOUT_SECONDS = 60
 
 
 def fetch_chembl(output_file: str, source: dict) -> int:
-    target_name = source.get("target_name")
-    if not target_name:
-        logging.error("Missing source.target_name for data_source=chembl")
+    target_name = str(source.get("target_name", "")).strip()
+    target_chembl_id = str(source.get("target_chembl_id", "")).strip()
+    if not target_name and not target_chembl_id:
+        logging.error("Missing source.target_name or source.target_chembl_id for data_source=chembl")
         return 1
 
     script_path = os.path.join("GetData", "get_ChEMBL_target_full.py")
+    cmd = [
+        sys.executable,
+        script_path,
+        target_name or target_chembl_id,
+        output_file,
+    ]
+    if target_chembl_id:
+        cmd.extend(["--target-chembl-id", target_chembl_id])
     result = subprocess.run(
-        [sys.executable, script_path, target_name, output_file],
+        cmd,
         capture_output=True,
         text=True,
     )

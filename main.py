@@ -375,6 +375,9 @@ def run_node_curate(context: dict) -> None:
     required_non_null_columns = _as_str_list(curate_config.get("required_non_null_columns", []))
     if required_non_null_columns:
         cmd.extend(["--required_non_null_columns", ",".join(required_non_null_columns)])
+    row_filters = curate_config.get("row_filters", {})
+    if isinstance(row_filters, dict) and row_filters:
+        cmd.extend(["--row_filters", json.dumps(row_filters, separators=(",", ":"))])
     _run_subprocess(cmd)
     validate_contract(bind_output_path(PREPROCESSED_CONTRACT, preprocessed_file), warn_only=True)
     validate_contract(bind_output_path(CURATE_OUTPUT_CONTRACT, curated_file), warn_only=True)
@@ -419,12 +422,12 @@ def run_node_featurize_lipinski(context: dict) -> None:
 
 
 def run_node_label_ic50(context: dict) -> None:
+    input_file = context.get("curated_path", context["paths"]["curated"])
     validate_contract(
-        bind_output_path(LABEL_IC50_INPUT_CONTRACT, context["paths"]["lipinski"]),
+        bind_output_path(LABEL_IC50_INPUT_CONTRACT, input_file),
         warn_only=False,
     )
     script_path = os.path.join("utilities", "IC50_pIC50.py")
-    input_file = context["paths"]["lipinski"]
     output_file_3class = context["paths"]["pic50_3class"]
     output_file_2class = context["paths"]["pic50_2class"]
     _run_subprocess(

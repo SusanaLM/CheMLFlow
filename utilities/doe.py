@@ -173,6 +173,10 @@ def _as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def _as_str_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -767,7 +771,7 @@ def _build_pipeline_nodes(
 
     nodes: list[str] = ["get_data", "curate"]
     if profile.supports_label_ic50:
-        nodes.extend(["featurize.lipinski", "label.ic50"])
+        nodes.append("label.ic50")
     elif label_normalize_enabled:
         nodes.append("label.normalize")
 
@@ -887,6 +891,8 @@ def _build_case_config(
             get_data_cfg["source"]["path"] = str(source_cfg.get("path", ""))
         elif source_type == "chembl":
             get_data_cfg["source"]["target_name"] = str(source_cfg.get("target_name", ""))
+            if source_cfg.get("target_chembl_id"):
+                get_data_cfg["source"]["target_chembl_id"] = str(source_cfg.get("target_chembl_id"))
         elif source_type == "http_csv":
             get_data_cfg["source"]["url"] = str(source_cfg.get("url", ""))
         elif source_type == "tdc":
@@ -954,6 +960,9 @@ def _build_case_config(
         required_non_null = _as_str_list(raw_required_non_null)
         if required_non_null:
             curate_cfg["required_non_null_columns"] = required_non_null
+        row_filters = merged.get("curate.row_filters", dataset_curate.get("row_filters"))
+        if isinstance(row_filters, dict) and row_filters:
+            curate_cfg["row_filters"] = row_filters
         config["curate"] = curate_cfg
 
     if "label.normalize" in nodes:
@@ -1173,12 +1182,15 @@ def _validate_case(
                 path="get_data.source.path",
                 message="local_csv source requires get_data.source.path.",
             )
-        if source_type == "chembl" and not str(_get_dotted(config, "get_data.source.target_name", "")).strip():
+        if source_type == "chembl" and not (
+            str(_get_dotted(config, "get_data.source.target_name", "")).strip()
+            or str(_get_dotted(config, "get_data.source.target_chembl_id", "")).strip()
+        ):
             _add_issue(
                 issues,
                 code="DOE_DATA_SOURCE_CONFIG_INVALID",
-                path="get_data.source.target_name",
-                message="chembl source requires get_data.source.target_name.",
+                path="get_data.source",
+                message="chembl source requires get_data.source.target_name or get_data.source.target_chembl_id.",
             )
 
     if "curate" in nodes:
@@ -1569,6 +1581,45 @@ def _validate_case(
                     message=(
                         "curate.required_non_null_columns contains columns missing from dataset: "
                         + ", ".join(missing_required)
+                    ),
+                )
+        row_filters = _as_dict(_get_dotted(config, "curate.row_filters", {}))
+        if row_filters:
+            missing_filter_columns: list[str] = []
+            for raw_col in row_filters.keys():
+                col = str(raw_col).strip()
+                if not col:
+                    continue
+                normalized = col
+                if (
+                    smiles_column
+                    and smiles_column != "canonical_smiles"
+                    and normalized == smiles_column
+                ):
+                    normalized = "canonical_smiles"
+                elif (
+                    resolved_smiles_column
+                    and resolved_smiles_column != "canonical_smiles"
+                    and normalized == resolved_smiles_column
+                ):
+                    normalized = "canonical_smiles"
+                if normalized not in columns and not (
+                    normalized == "canonical_smiles"
+                    and (
+                        "canonical_smiles" in columns
+                        or (smiles_column and smiles_column in columns)
+                        or (resolved_smiles_column and resolved_smiles_column in columns)
+                    )
+                ):
+                    missing_filter_columns.append(normalized)
+            if missing_filter_columns:
+                _add_issue(
+                    issues,
+                    code="DOE_CURATE_ROW_FILTER_COLUMNS_MISSING",
+                    path="curate.row_filters",
+                    message=(
+                        "curate.row_filters contains columns missing from dataset: "
+                        + ", ".join(sorted(set(missing_filter_columns)))
                     ),
                 )
         if task_type == "classification" and "label.normalize" in nodes:

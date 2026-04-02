@@ -148,12 +148,15 @@ get_data:
 | Key | Required | Description |
 |-----|----------|-------------|
 | `data_source` | Yes | Source type: `chembl`, `local_csv`, `http_csv`, or `tdc`. |
-| `source.target_name` | For chembl | ChEMBL target name to query. |
+| `source.target_name` | For chembl* | ChEMBL target name to query. |
+| `source.target_chembl_id` | For chembl* | Optional exact ChEMBL target ID to pin instead of merging all `target_name` matches. |
 | `source.path` | For local_csv | Path to CSV file (relative to repo root). |
 | `source.url` | For http_csv | URL to fetch CSV from. |
 | `source.group` | For tdc | TDC dataset group (default: `ADME`). |
 | `source.name` | For tdc | TDC dataset name within the group. |
 | `max_rows` | No | Row limit for sampling raw CSV rows. Set under `get_data`, applied during `curate` when `pipeline_type: qm9`. |
+
+`*` For `chembl`, provide at least one of `source.target_name` or `source.target_chembl_id`. If both are set, `source.target_chembl_id` pins the fetch to that exact target.
 
 ## `curate` Block
 
@@ -168,6 +171,9 @@ curate:
   drop_invalid_smiles: true
   drop_missing_target: true
   required_non_null_columns: Name, FP Exp.
+  row_filters:
+    standard_units: [nM]
+    standard_relation: ["="]
   keep_all_columns: true
 ```
 
@@ -183,6 +189,7 @@ curate:
 | `drop_invalid_smiles` | `true` | When `true`, drops rows that fail SMILES sanitization/canonicalization. |
 | `drop_missing_target` | `true` | When `true`, drops rows with null values in `global.target_column` if that column exists during curate. |
 | `required_non_null_columns` | (none) | Optional list or comma-separated string of columns that must be non-null; rows missing values in any listed column are dropped. |
+| `row_filters` | (none) | Optional mapping of column name to allowed exact value(s). Useful for chemistry data, for example filtering `standard_type`, `standard_units`, `standard_relation`, or `target_chembl_id`. |
 | `require_neutral_charge` | `false` | When `true`, removes molecules with net charge. |
 | `prefer_largest_fragment` | `true` | When `true`, keeps only the largest fragment of multi-fragment molecules. |
 | `keep_all_columns` | `false` | When `true`, preserves all source columns through curation. When `false`, only essential columns (SMILES, target) are kept. |
@@ -337,6 +344,7 @@ featurize:
 | `n_bits` | `2048` | Fingerprint bit vector length. |
 
 > **Note:** `featurize.rdkit` and `featurize.lipinski` use fixed settings and do not accept additional config keys.
+> `featurize.lipinski` is optional exploratory featurization. `label.ic50` only needs `standard_value` and can run directly on curated ChemBL data.
 
 ## `preprocess` Block
 
@@ -517,7 +525,7 @@ These nodes run with fixed behavior and do not accept config blocks:
 | Node | What it does |
 |------|--------------|
 | `featurize.none` | Uses the curated CSV directly as features (no descriptor generation). |
-| `label.ic50` | Converts IC50 values to pIC50 with activity classes. |
+| `label.ic50` | Converts raw IC50 `standard_value` values to `pIC50` and emits 3-class / 2-class labeled outputs. |
 | `analyze.stats` | Runs statistical tests on the dataset. |
 | `analyze.eda` | Generates exploratory data analysis plots. |
 | `explain` | Generates feature importance and SHAP explanations. |
