@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
+from utilities import doe as doe_module
 from utilities.doe import DOEGenerationError, generate_doe
 
 
@@ -683,6 +685,242 @@ def test_generate_doe_reg_chembl_defaults_target_column_to_pic50(tmp_path: Path)
     config_path = Path(result["valid_cases"][0]["config_path"])
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert config["global"]["target_column"] == "pIC50"
+
+
+def test_generate_doe_reg_local_csv_ic50_inserts_label_step(tmp_path: Path) -> None:
+    raw_csv = tmp_path / "chembl_raw_local.csv"
+    raw_csv.write_text(
+        "\n".join(
+            [
+                "canonical_smiles,standard_value,standard_units,standard_relation,standard_type,target_chembl_id",
+                "CCO,1000,nM,=,IC50,CHEMBL3885651",
+                "CCN,2500,nM,=,IC50,CHEMBL3885651",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    spec = {
+        "version": 1,
+        "dataset": {
+            "profile": "reg_local_csv_ic50",
+            "task_type": "regression",
+            "target_column": "pIC50",
+            "source": {"type": "local_csv", "path": str(raw_csv)},
+            "smiles_column": "canonical_smiles",
+            "curate": {
+                "required_non_null_columns": ["standard_value", "standard_units", "standard_relation"],
+                "row_filters": {
+                    "standard_type": ["IC50"],
+                    "standard_units": ["nM"],
+                    "standard_relation": ["="],
+                },
+            },
+        },
+        "search_space": {
+            "split.mode": ["cv"],
+            "split.strategy": ["random"],
+            "pipeline.feature_input": ["featurize.rdkit"],
+            "pipeline.preprocess": [False],
+            "pipeline.select": [False],
+            "pipeline.explain": [False],
+            "train.model.type": ["random_forest"],
+        },
+        "defaults": {
+            "global.base_dir": str(tmp_path / "chembl_raw_ic50"),
+            "global.runs.enabled": False,
+            "split.cv.n_splits": 2,
+            "split.cv.repeats": 1,
+            "split.val_from_train.val_size": 0.1,
+        },
+        "output": {"dir": str(tmp_path / "generated_chembl_raw_ic50")},
+    }
+
+    result = generate_doe(spec)
+    assert result["summary"]["valid_cases"] == 2
+
+    config_path = Path(result["valid_cases"][0]["config_path"])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["global"]["target_column"] == "pIC50"
+    assert config["curate"]["properties"] == "standard_value"
+    assert config["curate"]["keep_all_columns"] is True
+    assert config["curate"]["row_filters"] == {
+        "standard_type": ["IC50"],
+        "standard_units": ["nM"],
+        "standard_relation": ["="],
+    }
+    assert config["pipeline"]["nodes"] == [
+        "get_data",
+        "curate",
+        "label.ic50",
+        "featurize.rdkit",
+        "split",
+        "train",
+    ]
+
+
+def test_generate_doe_reg_local_csv_ic50_requires_standard_value_column(tmp_path: Path) -> None:
+    raw_csv = tmp_path / "chembl_raw_local_missing_value.csv"
+    raw_csv.write_text(
+        "\n".join(
+            [
+                "canonical_smiles",
+                "CCO",
+                "CCN",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    spec = {
+        "version": 1,
+        "dataset": {
+            "profile": "reg_local_csv_ic50",
+            "task_type": "regression",
+            "target_column": "pIC50",
+            "source": {"type": "local_csv", "path": str(raw_csv)},
+            "smiles_column": "canonical_smiles",
+        },
+        "search_space": {
+            "split.mode": ["holdout"],
+            "split.strategy": ["random"],
+            "pipeline.feature_input": ["featurize.rdkit"],
+            "pipeline.preprocess": [False],
+            "pipeline.select": [False],
+            "pipeline.explain": [False],
+            "train.model.type": ["random_forest"],
+        },
+        "defaults": {
+            "global.base_dir": str(tmp_path / "chembl_raw_ic50_missing_value"),
+            "global.runs.enabled": False,
+            "split.test_size": 0.2,
+            "split.val_size": 0.1,
+        },
+        "output": {"dir": str(tmp_path / "generated_chembl_raw_ic50_missing_value")},
+    }
+
+    result = generate_doe(spec)
+    assert result["summary"]["valid_cases"] == 0
+    assert result["summary"]["issue_counts"]["DOE_LABEL_IC50_SOURCE_COLUMNS_MISSING"] == 1
+
+
+def test_generate_doe_reg_local_csv_ic50_rejects_curate_dropping_standard_value(tmp_path: Path) -> None:
+    raw_csv = tmp_path / "chembl_raw_local_dropped_value.csv"
+    raw_csv.write_text(
+        "\n".join(
+            [
+                "canonical_smiles,standard_value,other_col",
+                "CCO,1000,1",
+                "CCN,2500,2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    spec = {
+        "version": 1,
+        "dataset": {
+            "profile": "reg_local_csv_ic50",
+            "task_type": "regression",
+            "target_column": "pIC50",
+            "source": {"type": "local_csv", "path": str(raw_csv)},
+            "smiles_column": "canonical_smiles",
+            "curate": {
+                "properties": ["other_col"],
+                "keep_all_columns": False,
+            },
+        },
+        "search_space": {
+            "split.mode": ["holdout"],
+            "split.strategy": ["random"],
+            "pipeline.feature_input": ["featurize.rdkit"],
+            "pipeline.preprocess": [False],
+            "pipeline.select": [False],
+            "pipeline.explain": [False],
+            "train.model.type": ["random_forest"],
+        },
+        "defaults": {
+            "global.base_dir": str(tmp_path / "chembl_raw_ic50_dropped_value"),
+            "global.runs.enabled": False,
+            "split.test_size": 0.2,
+            "split.val_size": 0.1,
+        },
+        "output": {"dir": str(tmp_path / "generated_chembl_raw_ic50_dropped_value")},
+    }
+
+    result = generate_doe(spec)
+    assert result["summary"]["valid_cases"] == 0
+    assert result["summary"]["issue_counts"]["DOE_CURATE_LABEL_IC50_SOURCE_DROPPED"] == 1
+
+
+def test_generate_doe_records_dirty_git_provenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = {
+        "version": 1,
+        "dataset": {
+            "profile": "reg_local_csv",
+            "name": "flash_reg_doe",
+            "task_type": "regression",
+            "target_column": "FP Exp.",
+            "source": {"type": "local_csv", "path": _flash_dataset_path()},
+            "smiles_column": "SMILES",
+            "curate": {
+                "properties": "FP Exp.",
+                "smiles_column": "SMILES",
+                "dedupe_strategy": "first",
+                "keep_all_columns": True,
+            },
+        },
+        "search_space": {
+            "split.mode": ["holdout"],
+            "split.strategy": ["random"],
+            "pipeline.feature_input": ["featurize.none"],
+            "pipeline.preprocess": [False],
+            "pipeline.select": [False],
+            "pipeline.explain": [False],
+            "train.model.type": ["random_forest"],
+        },
+        "defaults": {
+            "global.base_dir": str(tmp_path / "data"),
+            "global.runs.enabled": False,
+            "split.test_size": 0.2,
+            "split.val_size": 0.1,
+        },
+        "output": {"dir": str(tmp_path / "generated")},
+    }
+
+    git_outputs = {
+        ("git", "rev-parse", "--short", "HEAD"): "abc123\n",
+        ("git", "status", "--short"): " M utilities/doe.py\n?? tmp/example.yaml\n",
+        ("git", "diff", "--no-ext-diff", "--binary", "HEAD"): "diff --git a/utilities/doe.py b/utilities/doe.py\n",
+    }
+
+    def fake_run(
+        cmd: list[str],
+        *,
+        check: bool,
+        capture_output: bool,
+        text: bool,
+        cwd: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        key = tuple(cmd)
+        if key not in git_outputs:
+            raise AssertionError(f"Unexpected git command: {cmd!r}")
+        return subprocess.CompletedProcess(cmd, 0, stdout=git_outputs[key], stderr="")
+
+    monkeypatch.setattr(doe_module.subprocess, "run", fake_run)
+
+    result = generate_doe(spec)
+    summary = result["summary"]
+
+    assert summary["git_sha"] == "abc123"
+    assert summary["git_dirty"] is True
+    assert summary["git_status_short"] == [" M utilities/doe.py", "?? tmp/example.yaml"]
+    diff_path = Path(summary["git_diff_snapshot_path"])
+    assert diff_path.exists()
+    diff_text = diff_path.read_text(encoding="utf-8")
+    assert "# git status --short" in diff_text
+    assert "# git diff --no-ext-diff --binary HEAD" in diff_text
+    assert summary["git_diff_hash"]
 
 
 def test_generate_doe_reg_chembl_propagates_target_pin_and_row_filters(tmp_path: Path) -> None:

@@ -45,6 +45,8 @@ _EXECUTION_ONLY_AXES = {
     "split.inner.fold_index",
     "split.inner.repeat_index",
 }
+_LABEL_IC50_REQUIRED_COLUMNS = ("standard_value",)
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,19 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         allowed_models=("random_forest", "svm", "decision_tree", "xgboost", "ensemble", "chemprop", "chemeleon", "dl_*"),
         supports_label_normalize=False,
         supports_label_ic50=False,
+        supports_split=True,
+        supports_analyze=False,
+        supports_explain=True,
+    ),
+    "reg_local_csv_ic50": ProfileSpec(
+        name="reg_local_csv_ic50",
+        task_type="regression",
+        train_node="train",
+        default_source="local_csv",
+        allowed_feature_inputs=("none", "smiles_native", "featurize.none", "featurize.rdkit", "featurize.morgan"),
+        allowed_models=("random_forest", "svm", "decision_tree", "xgboost", "ensemble", "chemprop", "chemeleon", "dl_*"),
+        supports_label_normalize=False,
+        supports_label_ic50=True,
         supports_split=True,
         supports_analyze=False,
         supports_explain=True,
@@ -402,17 +417,56 @@ def _apply_case_isolation(
     runs_cfg["id"] = configured_id.replace("{case_id}", case_id) if configured_id else case_id
 
 
-def _git_sha() -> str | None:
+def _run_git_command(args: list[str]) -> str | None:
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+            ["git", *args],
             check=True,
             capture_output=True,
             text=True,
+            cwd=_REPO_ROOT,
         )
-        return result.stdout.strip() or None
+        stdout = result.stdout.rstrip("\n")
+        return stdout or None
     except Exception:
         return None
+
+
+def _git_sha() -> str | None:
+    return _run_git_command(["rev-parse", "--short", "HEAD"])
+
+
+def _capture_git_provenance(output_dir: str) -> dict[str, Any]:
+    git_sha = _git_sha()
+    status_short = _run_git_command(["status", "--short"]) or ""
+    dirty = bool(status_short.strip())
+    diff_snapshot_path: str | None = None
+    diff_hash: str | None = None
+
+    if dirty:
+        tracked_diff = _run_git_command(["diff", "--no-ext-diff", "--binary", "HEAD"]) or ""
+        snapshot_parts = ["# git status --short", status_short.rstrip()]
+        if tracked_diff.strip():
+            snapshot_parts.extend(
+                [
+                    "",
+                    "# git diff --no-ext-diff --binary HEAD",
+                    tracked_diff.rstrip(),
+                ]
+            )
+        snapshot_text = "\n".join(snapshot_parts).rstrip() + "\n"
+        diff_snapshot_path = os.path.join(output_dir, "git_worktree.patch")
+        with open(diff_snapshot_path, "w", encoding="utf-8") as fh:
+            fh.write(snapshot_text)
+        diff_hash = hashlib.sha256(snapshot_text.encode("utf-8")).hexdigest()
+
+    return {
+        "git_sha": git_sha,
+        "git_dirty": dirty,
+        "git_status_short": status_short.splitlines(),
+        "git_diff_snapshot_path": diff_snapshot_path,
+        "git_diff_hash": diff_hash,
+    }
 
 
 def load_doe_spec(path: str) -> dict[str, Any]:
@@ -913,7 +967,7 @@ def _build_case_config(
                 resolved_smiles_column = str(resolved_smiles).strip()
         default_properties: Any = dataset_curate.get("properties")
         if default_properties is None:
-            if profile.name == "reg_chembl_ic50":
+            if profile.supports_label_ic50:
                 default_properties = "standard_value"
             elif resolved_task == "classification":
                 default_properties = str(
@@ -943,9 +997,11 @@ def _build_case_config(
             curate_cfg["prefer_largest_fragment"] = _as_bool(merged["curate.prefer_largest_fragment"])
         if "curate.keep_all_columns" in merged:
             curate_cfg["keep_all_columns"] = _as_bool(merged["curate.keep_all_columns"])
+        elif "keep_all_columns" in dataset_curate:
+            curate_cfg["keep_all_columns"] = _as_bool(dataset_curate.get("keep_all_columns"))
         elif feature_input == "featurize.none":
             curate_cfg["keep_all_columns"] = True
-        elif profile.name == "reg_chembl_ic50":
+        elif profile.supports_label_ic50:
             curate_cfg["keep_all_columns"] = True
         for bool_key in ("drop_missing_smiles", "drop_invalid_smiles", "drop_missing_target"):
             merged_key = f"curate.{bool_key}"
@@ -1493,6 +1549,38 @@ def _validate_case(
     if columns:
         resolved_smiles_probe = probe.get("resolved_smiles_column")
         resolved_smiles_column = str(resolved_smiles_probe).strip() if resolved_smiles_probe else ""
+        if task_type == "regression" and profile.default_source == "local_csv" and profile.supports_label_ic50:
+            missing_label_source_columns = [
+                col for col in _LABEL_IC50_REQUIRED_COLUMNS if col not in columns
+            ]
+            if missing_label_source_columns:
+                _add_issue(
+                    issues,
+                    code="DOE_LABEL_IC50_SOURCE_COLUMNS_MISSING",
+                    path="dataset.source.path",
+                    message=(
+                        "Regression local_csv_ic50 DOE requires raw IC50 source columns to exist in the dataset: "
+                        + ", ".join(missing_label_source_columns)
+                    ),
+                )
+            else:
+                keep_all_columns = _as_bool(_get_dotted(config, "curate.keep_all_columns", False))
+                curate_properties = set(_as_str_list(_get_dotted(config, "curate.properties", [])))
+                preserves_label_source = keep_all_columns or all(
+                    col in curate_properties for col in _LABEL_IC50_REQUIRED_COLUMNS
+                )
+                if not preserves_label_source:
+                    _add_issue(
+                        issues,
+                        code="DOE_CURATE_LABEL_IC50_SOURCE_DROPPED",
+                        path="curate.properties",
+                        message=(
+                            "Regression local_csv_ic50 DOE requires label.ic50 input columns to survive curate. "
+                            "Configure curate.keep_all_columns=true or include "
+                            + ", ".join(repr(col) for col in _LABEL_IC50_REQUIRED_COLUMNS)
+                            + " in curate.properties."
+                        ),
+                    )
         if task_type == "regression" and profile.default_source == "local_csv" and not profile.supports_label_ic50:
             target_column = str(_get_dotted(config, "global.target_column", "")).strip()
             if not target_column or target_column not in columns:
@@ -1704,6 +1792,7 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
 
     probe = probe_dataset(dataset_cfg)
     resolved_task = _resolve_task_type(dataset_cfg, probe)
+    profile = resolve_profile(dataset_cfg, probe)
     if probe.get("source_type") == "local_csv" and probe.get("target_column_present") is False:
         label_cfg = dataset_cfg.get("label", {}) if isinstance(dataset_cfg.get("label"), dict) else {}
         label_map_cfg = dataset_cfg.get("label_map", {}) if isinstance(dataset_cfg.get("label_map"), dict) else {}
@@ -1713,12 +1802,11 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
             or label_map_cfg.get("positive")
             and label_map_cfg.get("negative")
         )
-        if resolved_task != "classification" or not has_label_mapping:
+        if (resolved_task != "classification" or not has_label_mapping) and not profile.supports_label_ic50:
             target_column = dataset_cfg.get("target_column")
             raise DOEGenerationError(
                 f"dataset.target_column={target_column!r} was not found in dataset.source.path."
             )
-    profile = resolve_profile(dataset_cfg, probe)
 
     defaults_flat = _flatten_dict(defaults_cfg)
     search_space_flat = _flatten_dict(search_space)
@@ -1926,6 +2014,7 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
     if resolved_task == "regression" and primary_metric not in {"r2", "mae"}:
         primary_metric = "r2"
 
+    git_provenance = _capture_git_provenance(output_dir)
     summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "doe_path": doe_path,
@@ -1947,7 +2036,7 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
         "parent_manifest_path": parent_manifest_path,
         "doe_spec_hash": doe_spec_hash,
         "doe_spec_snapshot_path": doe_spec_snapshot_path,
-        "git_sha": _git_sha(),
+        **git_provenance,
         "selection": {
             "primary_metric": primary_metric,
             "optimize": str(selection_cfg.get("optimize", "max")).strip().lower() or "max",

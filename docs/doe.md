@@ -5,7 +5,7 @@ The generator expands your search space, filters invalid combinations, and write
 
 - `manifest.jsonl` (one row per attempted execution child, including skipped reasons)
 - `parent_manifest.jsonl` (one row per scientific parent config)
-- `summary.json` (counts, profile/task, selection metadata, DOE spec hash/snapshot path)
+- `summary.json` (counts, profile/task, selection metadata, DOE spec hash/snapshot path, git provenance)
 - one config YAML per valid case
 
 Script:
@@ -23,6 +23,7 @@ python scripts/generate_doe.py --doe config/doe.example.yaml
 ## Supported profiles
 
 - `reg_local_csv`
+- `reg_local_csv_ic50`
 - `reg_chembl_ic50`
 - `clf_local_csv`
 - `clf_tdc_benchmark`
@@ -78,6 +79,13 @@ dataset:
 
 For regression with `source.type: local_csv`, `target_column` is required and must exist in the CSV.
 
+For regression with `dataset.profile: reg_local_csv_ic50`, DOE expects a raw IC50-style local CSV:
+
+- `target_column` is the downstream labeled target (typically `pIC50`)
+- the source CSV must include `standard_value`
+- if you rely on activity filtering, also include the columns referenced by `curate.required_non_null_columns` / `curate.row_filters` (commonly `standard_type`, `standard_units`, `standard_relation`)
+- preserve `standard_value` through curate (`curate.keep_all_columns: true` or include it in `curate.properties`)
+
 For classification with non-binary raw labels, provide a label map:
 
 ```yaml
@@ -102,9 +110,11 @@ Examples:
 - `DOE_SPLIT_PARAM_INVALID`
 - `DOE_DATASET_COLUMN_MISSING`
 - `DOE_TARGET_COLUMN_MISSING`
+- `DOE_LABEL_IC50_SOURCE_COLUMNS_MISSING`
 - `DOE_SMILES_COLUMN_MISSING`
 - `DOE_CURATE_DEDUPE_INVALID`
 - `DOE_CURATE_TARGET_DROPPED`
+- `DOE_CURATE_LABEL_IC50_SOURCE_DROPPED`
 - `DOE_RUNTIME_SCHEMA_INVALID`
 
 `manifest.jsonl` contains these codes per skipped execution child.
@@ -200,3 +210,4 @@ Use these rules when building DOE files for cluster runs.
 - Set `global.random_state` explicitly.
 - Keep `constraints.isolate_case_artifacts: true`.
 - Preserve generated configs + manifests with results bundles for reproducibility.
+- When generating from a dirty working tree, keep the emitted `git_worktree.patch` referenced by `summary.json`.

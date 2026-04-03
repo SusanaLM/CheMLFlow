@@ -73,6 +73,10 @@ _RUNTIME_PROFILE_CONTRACTS: dict[str, dict[str, Any]] = {
         "allowed_feature_inputs": ("none", "smiles_native", "featurize.none", "featurize.rdkit", "featurize.morgan"),
         "allowed_models": ("random_forest", "svm", "decision_tree", "xgboost", "ensemble", "chemprop", "chemeleon", _DL_WILDCARD),
     },
+    "reg_local_csv_ic50": {
+        "allowed_feature_inputs": ("none", "smiles_native", "featurize.none", "featurize.rdkit", "featurize.morgan"),
+        "allowed_models": ("random_forest", "svm", "decision_tree", "xgboost", "ensemble", "chemprop", "chemeleon", _DL_WILDCARD),
+    },
     "reg_chembl_ic50": {
         "allowed_feature_inputs": ("featurize.rdkit",),
         "allowed_models": ("random_forest", "svm", "decision_tree", "xgboost", "ensemble", _DL_WILDCARD),
@@ -128,7 +132,7 @@ def _allows_model(model_type: str, allowed_models: tuple[str, ...]) -> bool:
     return model_type in set(allowed_models)
 
 
-def _infer_runtime_profile_key(task_type: str, source_type: str) -> str | None:
+def _infer_runtime_profile_key(task_type: str, source_type: str, nodes: list[str]) -> str | None:
     if source_type == "tdc":
         if task_type == "classification":
             return "clf_tdc_benchmark"
@@ -138,6 +142,8 @@ def _infer_runtime_profile_key(task_type: str, source_type: str) -> str | None:
             return "reg_chembl_ic50"
         return None
     if task_type == "regression":
+        if source_type == "local_csv" and "label.ic50" in nodes:
+            return "reg_local_csv_ic50"
         return "reg_local_csv"
     if task_type == "classification":
         return "clf_local_csv"
@@ -428,7 +434,7 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                     message="chembl source requires get_data.source.target_name or get_data.source.target_chembl_id.",
                 )
             )
-        profile_key = _infer_runtime_profile_key(task_type, source_type or "local_csv")
+        profile_key = _infer_runtime_profile_key(task_type, source_type or "local_csv", nodes)
         if task_type and source_type and profile_key is None:
             issues.append(
                 ValidationIssue(
