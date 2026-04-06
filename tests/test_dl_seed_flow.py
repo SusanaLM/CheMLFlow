@@ -144,13 +144,21 @@ def test_run_optuna_seeds_before_model_construction(monkeypatch) -> None:
 
 def test_train_model_dl_fixed_respects_model_params(monkeypatch, tmp_path) -> None:
     captured: dict[str, object] = {}
+    saved_tensors: dict[str, object] = {}
 
     class _FakeDlModel:
         def __init__(self, params: dict[str, object]) -> None:
             self.params = dict(params)
+            self.loaded_state = None
 
         def state_dict(self) -> dict[str, object]:
             return {}
+
+        def load_state_dict(self, state_dict: dict[str, object]) -> None:
+            self.loaded_state = dict(state_dict)
+
+        def eval(self):
+            return self
 
     cfg = train_models.DLSearchConfig(
         model_class=_FakeDlModel,
@@ -168,6 +176,11 @@ def test_train_model_dl_fixed_respects_model_params(monkeypatch, tmp_path) -> No
 
     monkeypatch.setattr(train_models, "_initialize_model", lambda *args, **kwargs: cfg)
     monkeypatch.setattr(train_models, "_seed_dl_runtime", lambda _seed: None)
+    fake_torch = types.SimpleNamespace(
+        save=lambda obj, path: saved_tensors.__setitem__(str(path), obj),
+        load=lambda path, weights_only=True: saved_tensors[str(path)],
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
     def _fake_train_dl(
         model,
@@ -197,7 +210,7 @@ def test_train_model_dl_fixed_respects_model_params(monkeypatch, tmp_path) -> No
     X_train, X_val, X_test = X.iloc[:8], X.iloc[8:12], X.iloc[12:]
     y_train, y_val, y_test = y.iloc[:8], y.iloc[8:12], y.iloc[12:]
 
-    train_models.train_model(
+    estimator, train_result = train_models.train_model(
         X_train=X_train,
         y_train=y_train,
         X_test=X_test,
@@ -221,6 +234,17 @@ def test_train_model_dl_fixed_respects_model_params(monkeypatch, tmp_path) -> No
     assert captured["batch_size"] == 7
     assert captured["learning_rate"] == 0.02
     assert captured["model_params"]["hidden_dim"] == 17
+    assert estimator.params["hidden_dim"] == 17
+
+    reloaded = train_models.load_model(
+        train_result.model_path,
+        "dl_simple",
+        input_dim=X_train.shape[1],
+    )
+    assert reloaded.params["hidden_dim"] == 17
+    assert reloaded.params["batch_size"] == 7
+    assert reloaded.params["learning_rate"] == 0.02
+    assert reloaded.params["epochs"] == 3
 
 
 def test_run_optuna_prunes_non_finite_regression_predictions(monkeypatch) -> None:
