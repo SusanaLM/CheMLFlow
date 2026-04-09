@@ -10,7 +10,12 @@ The goal is simple:
 
 ## Tutorial Roadmap
 
-1. `01_single_config_colab`
+1. `00_dataset_eda`
+   Load a local CSV and generate generic EDA outputs with a two-node workflow:
+   - `get_data`
+   - `analyze.eda`
+
+2. `01_single_config_colab`
    Run one PGP classification config in a Colab-style workflow.
    This tutorial uses:
    - the bundled `local_data/pgp_broccatelli.csv` dataset
@@ -19,10 +24,10 @@ The goal is simple:
    - `split.mode: cv` with `n_splits: 5`
    - a single runnable slice: `fold_index: 0`, `repeat_index: 0`
 
-2. `02_submit_doe`
+3. `02_submit_doe`
    Planned. Generate a DOE from one dataset profile and inspect the manifest/summary outputs.
 
-3. `03_submit_phase2`
+4. `03_submit_phase2`
    Planned. Launch a focused phase-2 tuning DOE from a parent winner.
 
 ## Important CV Note

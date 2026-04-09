@@ -153,6 +153,50 @@ def test_e2e_ara_fast(tmp_path: Path) -> None:
     assert (out_dir / "run_config.yaml").exists()
 
 
+def test_e2e_generic_eda_from_local_csv(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_pgp_eda"
+    config = {
+        "global": {
+            "pipeline_type": "pgp",
+            "task_type": "classification",
+            "base_dir": str(tmp_path / "data_pgp_eda"),
+            "target_column": "Activity",
+            "thresholds": {"active": 1000, "inactive": 10000},
+            "run_dir": str(run_dir),
+        },
+        "pipeline": {"nodes": ["get_data", "analyze.eda"]},
+        "get_data": {
+            "data_source": "local_csv",
+            "source": {"path": str(FIXTURES / "pgp_small.csv")},
+        },
+        "analyze": {
+            "eda": {
+                "include": {
+                    "overview": True,
+                    "missingness": True,
+                    "numeric_histograms": True,
+                    "correlation_heatmap": True,
+                    "target_distribution": True,
+                    "class_balance": True,
+                    "descriptor_scatter": False,
+                    "descriptor_boxplots": False,
+                }
+            }
+        },
+    }
+
+    out_dir = _run_pipeline(tmp_path, config)
+    eda_dir = out_dir / "eda"
+    manifest_path = eda_dir / "eda_manifest.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert (eda_dir / "dataset_overview.png").exists()
+    assert (eda_dir / "target_distribution.png").exists()
+    assert (eda_dir / "class_balance.png").exists()
+    assert manifest["skipped"]["numeric_histograms"] == "no numeric columns available"
+    assert manifest["skipped"]["correlation_heatmap"] == "fewer than two numeric columns available"
+
+
 def test_e2e_pgp_fast(tmp_path: Path) -> None:
     run_dir = tmp_path / "run_pgp"
     config = {
