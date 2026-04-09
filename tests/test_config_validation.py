@@ -200,6 +200,40 @@ def test_strict_rejects_chembl_smiles_native_chemprop_runtime_branch() -> None:
     assert "CFG_MODEL_NOT_SUPPORTED_FOR_PROFILE" in codes
 
 
+def test_strict_allows_chembl_target_pin_with_curate_row_filters() -> None:
+    nodes = ["get_data", "curate", "label.ic50", "featurize.rdkit", "split", "train"]
+    cfg = _base_config(nodes)
+    cfg["global"]["task_type"] = "regression"
+    cfg["global"]["target_column"] = "pIC50"
+    cfg["get_data"] = {
+        "data_source": "chembl",
+        "source": {"target_chembl_id": "CHEMBL3885651"},
+    }
+    cfg["curate"] = {
+        "row_filters": {
+            "standard_type": ["IC50"],
+            "standard_units": ["nM"],
+            "standard_relation": ["="],
+        }
+    }
+    cfg["split"] = {"strategy": "random"}
+    cfg["train"] = {"model": {"type": "random_forest"}}
+
+    validate_config_strict(cfg, nodes)
+
+
+def test_strict_rejects_non_mapping_curate_row_filters() -> None:
+    nodes = ["curate", "split", "featurize.rdkit", "train"]
+    cfg = _base_config(nodes)
+    cfg["curate"] = {"row_filters": ["not", "a", "mapping"]}
+    cfg["split"] = {"strategy": "random"}
+    cfg["train"] = {"model": {"type": "random_forest"}}
+
+    issues = collect_config_issues(cfg, nodes)
+    codes = {issue.code for issue in issues}
+    assert "CFG_CURATE_ROW_FILTERS_INVALID" in codes
+
+
 def test_strict_allows_rdkit_labeled_as_rdkit_profile_branch() -> None:
     cfg = _base_config(["get_data", "featurize.rdkit_labeled", "split", "train"])
     cfg["global"]["task_type"] = "regression"

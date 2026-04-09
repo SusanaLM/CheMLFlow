@@ -87,6 +87,49 @@ def test_handle_missing_data_rejects_missing_required_columns(tmp_path) -> None:
         )
 
 
+def test_handle_missing_data_applies_row_filters_before_dedupe(tmp_path) -> None:
+    raw = tmp_path / "raw.csv"
+    preprocessed = tmp_path / "preprocessed.csv"
+    curated = tmp_path / "curated.csv"
+
+    pd.DataFrame(
+        {
+            "canonical_smiles": ["CCO", "CCO", "CCN"],
+            "target_chembl_id": ["CHEMBL9999999", "CHEMBL3885651", "CHEMBL3885651"],
+            "standard_value": [1.0, 2.0, 3.0],
+        }
+    ).to_csv(raw, index=False)
+
+    preparer = DataPreparer(str(raw), str(preprocessed), str(curated), keep_all_columns=False)
+    preparer.handle_missing_data_and_duplicates(
+        properties_of_interest=["target_chembl_id", "standard_value"],
+        dedupe_strategy="first",
+        row_filters={"target_chembl_id": "CHEMBL3885651"},
+    )
+
+    out = pd.read_csv(preprocessed)
+    assert len(out) == 2
+    assert set(out["canonical_smiles"]) == {"CCO", "CCN"}
+    filtered_row = out.loc[out["canonical_smiles"] == "CCO"].iloc[0]
+    assert filtered_row["target_chembl_id"] == "CHEMBL3885651"
+    assert float(filtered_row["standard_value"]) == 2.0
+
+
+def test_handle_missing_data_rejects_missing_row_filter_columns(tmp_path) -> None:
+    raw = tmp_path / "raw.csv"
+    preprocessed = tmp_path / "preprocessed.csv"
+    curated = tmp_path / "curated.csv"
+
+    pd.DataFrame({"canonical_smiles": ["CCO"], "target": [1.0]}).to_csv(raw, index=False)
+    preparer = DataPreparer(str(raw), str(preprocessed), str(curated), keep_all_columns=False)
+
+    with pytest.raises(ValueError, match="row_filters configured column"):
+        preparer.handle_missing_data_and_duplicates(
+            properties_of_interest=["target"],
+            row_filters={"target_chembl_id": "CHEMBL3885651"},
+        )
+
+
 def test_required_non_null_columns_accepts_original_smiles_name(tmp_path) -> None:
     raw = tmp_path / "raw.csv"
     preprocessed = tmp_path / "preprocessed.csv"

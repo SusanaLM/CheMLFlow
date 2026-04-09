@@ -1,6 +1,8 @@
-import pandas as pd
 import argparse
+import json
 import logging
+
+import pandas as pd
 
 from rdkit import Chem
 
@@ -23,6 +25,27 @@ def _normalize_dedupe_strategy(dedupe_strategy: str | None) -> str | None:
     return normalized
 
 
+def _normalize_row_filters(row_filters: dict[str, object] | None) -> dict[str, list[object]]:
+    if row_filters is None:
+        return {}
+    if not isinstance(row_filters, dict):
+        raise ValueError("row_filters must be a mapping of column -> allowed value(s).")
+
+    normalized: dict[str, list[object]] = {}
+    for raw_column, raw_values in row_filters.items():
+        column = str(raw_column).strip()
+        if not column:
+            continue
+        if isinstance(raw_values, (list, tuple, set)):
+            values = [value for value in raw_values]
+        else:
+            values = [raw_values]
+        if not values:
+            raise ValueError(f"row_filters[{column!r}] must contain at least one allowed value.")
+        normalized[column] = values
+    return normalized
+
+
 class DataPreparer:
     def __init__(self, raw_data_file, preprocessed_file, curated_file, keep_all_columns=False):
         self.raw_data_file = raw_data_file
@@ -41,6 +64,7 @@ class DataPreparer:
         target_column: str | None = None,
         drop_missing_target: bool = True,
         required_non_null_columns: list[str] | None = None,
+        row_filters: dict[str, object] | None = None,
     ):
         """Load data, identify the SMILES column, handle missing values, and remove duplicates.
         - Auto-detect the SMILES column if not provided (try 'canonical_smiles', 'smiles', 'SMILES').
@@ -53,6 +77,7 @@ class DataPreparer:
             logging.info(f"Loading data from {self.raw_data_file}")
             df = pd.read_csv(self.raw_data_file)
             dedupe_strategy = _normalize_dedupe_strategy(dedupe_strategy)
+            normalized_row_filters = _normalize_row_filters(row_filters)
 
             # Detect the SMILES column
             candidate_smiles = [smiles_column] if smiles_column else [
@@ -129,6 +154,26 @@ class DataPreparer:
                         removed,
                         required_cols,
                     )
+
+            if normalized_row_filters:
+                for col, allowed_values in normalized_row_filters.items():
+                    normalized_col = col
+                    if original_smiles_col != "canonical_smiles" and col == original_smiles_col:
+                        normalized_col = "canonical_smiles"
+                    if normalized_col not in df_clean.columns:
+                        raise ValueError(
+                            f"row_filters configured column {normalized_col!r}, but it was not found in the dataset."
+                        )
+                    before = len(df_clean)
+                    df_clean = df_clean[df_clean[normalized_col].isin(allowed_values)].copy()
+                    removed = before - len(df_clean)
+                    if removed:
+                        logging.info(
+                            "Dropped %s row(s) outside row_filters[%r]=%s.",
+                            removed,
+                            normalized_col,
+                            allowed_values,
+                        )
 
             # Remove exact duplicates by SMILES text (pre-canonicalization)
             if dedupe_strategy in {None, "first", "last"}:
@@ -398,6 +443,7 @@ def main(
     drop_missing_target=True,
     required_non_null_columns=None,
     drop_invalid_smiles=True,
+    row_filters=None,
 ):
     """Main function to preprocess, optionally label, and clean SMILES data."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -412,6 +458,7 @@ def main(
         target_column=target_column,
         drop_missing_target=drop_missing_target,
         required_non_null_columns=required_non_null_columns,
+        row_filters=row_filters,
     )
     # Label if bioactivity present; otherwise pass-through
     preparer.label_bioactivity(active_threshold=active_threshold, inactive_threshold=inactive_threshold)
@@ -453,6 +500,8 @@ if __name__ == "__main__":
                         help="Optional target column to enforce non-null values during curate.")
     parser.add_argument('--required_non_null_columns', type=str, default=None,
                         help="Optional comma-separated columns that must be non-null; rows missing values are dropped.")
+    parser.add_argument('--row_filters', type=str, default=None,
+                        help="Optional JSON object mapping column names to allowed exact values.")
     parser.add_argument('--drop_missing_smiles', action='store_true',
                         help="Drop rows with missing SMILES during curate preprocessing.")
     parser.add_argument('--no_drop_missing_smiles', dest='drop_missing_smiles', action='store_false',
@@ -479,6 +528,9 @@ if __name__ == "__main__":
     required_cols = None
     if args.required_non_null_columns:
         required_cols = [c.strip() for c in args.required_non_null_columns.split(",") if c.strip()]
+    row_filters = None
+    if args.row_filters:
+        row_filters = json.loads(args.row_filters)
 
     main(
         args.raw_data_file,
@@ -499,4 +551,5 @@ if __name__ == "__main__":
         drop_missing_target=args.drop_missing_target,
         required_non_null_columns=required_cols,
         drop_invalid_smiles=args.drop_invalid_smiles,
+        row_filters=row_filters,
     )
