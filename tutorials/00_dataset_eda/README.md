@@ -20,7 +20,15 @@ For the first example, it uses the bundled tutorial PGP dataset:
 
 ## What it makes
 
-For this raw PGP dataset, the generic EDA flow should create:
+For this raw PGP dataset, the notebook now starts with an interactive molecular landscape view, then walks through:
+
+- interactive structure-first molecular map
+- paged molecule gallery
+- raw dataset EDA outputs
+- target analysis
+- SMILES-derived property analysis
+
+The generic EDA flow itself should create:
 
 - dataset overview
 - missingness plot
