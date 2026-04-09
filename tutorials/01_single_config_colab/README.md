@@ -1,5 +1,7 @@
 # Tutorial 01: Single Config in Colab
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/bsmith24/CheMLFlow/blob/phase2_doe_support/tutorials/01_single_config_colab/CheMLFlow_Tutorial_01_Single_Config.ipynb)
+
 This is the easiest real CheMLFlow tutorial.
 
 It runs one PGP classification config end to end with:
@@ -43,9 +45,9 @@ CHEMLFLOW_CONFIG=tutorials/01_single_config_colab/configs/pgp_svm_cv_fold0.yaml 
 
 ## Colab Run
 
-Open:
+Open in Colab:
 
-- `CheMLFlow_Tutorial_01_Single_Config.ipynb`
+- [CheMLFlow_Tutorial_01_Single_Config.ipynb](https://colab.research.google.com/github/bsmith24/CheMLFlow/blob/phase2_doe_support/tutorials/01_single_config_colab/CheMLFlow_Tutorial_01_Single_Config.ipynb)
 
 The notebook:
 

@@ -1,5 +1,7 @@
 # Tutorial 00: Dataset EDA
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/bsmith24/CheMLFlow/blob/phase2_doe_support/tutorials/00_dataset_eda/CheMLFlow_Tutorial_00_Dataset_EDA.ipynb)
+
 This tutorial is the shortest path to "load a dataset and make plots" in CheMLFlow.
 
 It uses a two-node workflow:
@@ -40,6 +42,10 @@ Outputs go to:
 - `tutorials/00_dataset_eda/artifacts/run/eda`
 
 ## Colab
+
+Open in Colab:
+
+- [CheMLFlow_Tutorial_00_Dataset_EDA.ipynb](https://colab.research.google.com/github/bsmith24/CheMLFlow/blob/phase2_doe_support/tutorials/00_dataset_eda/CheMLFlow_Tutorial_00_Dataset_EDA.ipynb)
 
 The notebook keeps the config visible in a code cell, writes it to disk, then launches:
 
