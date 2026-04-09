@@ -29,7 +29,7 @@ So this tutorial gives you:
 
 ## What the config does
 
-- dataset: `local_data/pgp_broccatelli.csv`
+- dataset: `tutorials/data/pgp_broccatelli.csv`
 - target column: existing binary `Activity`
 - split: `mode: cv`, `n_splits: 5`, `repeats: 1`
 - preprocess: `scaler: standard`

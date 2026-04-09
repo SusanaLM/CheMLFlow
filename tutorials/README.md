@@ -19,7 +19,7 @@ The goal is simple:
 2. `01_single_config_colab`
    Run one PGP classification config in a Colab-style workflow.
    This tutorial uses:
-   - the bundled `local_data/pgp_broccatelli.csv` dataset
+   - the bundled `tutorials/data/pgp_broccatelli.csv` dataset
    - Morgan fingerprints
    - `preprocess.scaler: standard`
    - `split.mode: cv` with `n_splits: 5`

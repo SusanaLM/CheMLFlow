@@ -9,9 +9,9 @@ It uses a two-node workflow:
 - `get_data`
 - `analyze.eda`
 
-For the first example, it uses the bundled PGP dataset:
+For the first example, it uses the bundled tutorial PGP dataset:
 
-- `local_data/pgp_broccatelli.csv`
+- `tutorials/data/pgp_broccatelli.csv`
 
 ## Config
 
