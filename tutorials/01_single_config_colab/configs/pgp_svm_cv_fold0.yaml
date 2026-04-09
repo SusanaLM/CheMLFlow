@@ -1,0 +1,70 @@
+global:
+  pipeline_type: adme
+  task_type: classification
+  base_dir: tutorials/01_single_config_colab/artifacts/data/pgp_svm_cv_fold0
+  run_dir: tutorials/01_single_config_colab/artifacts/runs/pgp_svm_cv_fold0
+  target_column: Activity
+  random_state: 42
+  thresholds:
+    active: 1000
+    inactive: 10000
+
+pipeline:
+  nodes:
+    - get_data
+    - curate
+    - featurize.morgan
+    - split
+    - preprocess.features
+    - train
+
+get_data:
+  data_source: local_csv
+  source:
+    path: local_data/pgp_broccatelli.csv
+
+curate:
+  properties: Activity
+  smiles_column: SMILES
+  dedupe_strategy: drop_conflicts
+  label_column: Activity
+  prefer_largest_fragment: true
+
+split:
+  mode: cv
+  strategy: random
+  stratify: true
+  stratify_column: Activity
+  random_state: 42
+  cv:
+    n_splits: 5
+    repeats: 1
+    fold_index: 0
+    repeat_index: 0
+    random_state: 42
+  val_from_train:
+    val_size: 0.1
+    stratify: true
+  require_disjoint: true
+  require_full_test_coverage: true
+
+featurize:
+  radius: 2
+  n_bits: 2048
+
+preprocess:
+  scaler: standard
+  variance_threshold: 0.0
+  corr_threshold: 0.95
+
+train:
+  tuning:
+    method: fixed
+  model:
+    type: svm
+    params:
+      kernel: rbf
+      C: 1.0
+      gamma: scale
+  reporting:
+    plot_split_performance: true
