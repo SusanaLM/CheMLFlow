@@ -17,6 +17,7 @@ import numpy as np
 from contracts import (
     ANALYZE_EDA_INPUT_2CLASS_CONTRACT,
     ANALYZE_EDA_INPUT_3CLASS_CONTRACT,
+    ANALYZE_EDA_GENERIC_INPUT_CONTRACT,
     ANALYZE_EDA_OUTPUT_CONTRACT,
     ANALYZE_STATS_INPUT_CONTRACT,
     ANALYZE_STATS_OUTPUT_CONTRACT,
@@ -477,20 +478,22 @@ def run_node_analyze_stats(context: dict) -> None:
 
 
 def run_node_analyze_eda(context: dict) -> None:
+    from utilities.generic_eda import run_generic_eda
+
+    input_file = context.get("curated_path", context["paths"]["raw"])
     validate_contract(
-        bind_output_path(ANALYZE_EDA_INPUT_2CLASS_CONTRACT, context["paths"]["pic50_2class"]),
+        bind_output_path(ANALYZE_EDA_GENERIC_INPUT_CONTRACT, input_file),
         warn_only=False,
     )
-    validate_contract(
-        bind_output_path(ANALYZE_EDA_INPUT_3CLASS_CONTRACT, context["paths"]["pic50_3class"]),
-        warn_only=False,
-    )
-    script_path = os.path.join("utilities", "EDA.py")
-    input_file_2class = context["paths"]["pic50_2class"]
-    input_file_3class = context["paths"]["pic50_3class"]
-    output_dir = context["base_dir"]
-    _run_subprocess(
-        [sys.executable, script_path, input_file_2class, input_file_3class, output_dir]
+    analyze_cfg = context.get("analyze_config", {}) or {}
+    eda_cfg = analyze_cfg.get("eda", {}) if isinstance(analyze_cfg, dict) else {}
+    output_dir = str((eda_cfg or {}).get("output_dir") or os.path.join(context["run_dir"], "eda"))
+    run_generic_eda(
+        input_path=input_file,
+        output_dir=output_dir,
+        task_type=context.get("task_type"),
+        target_column=context.get("target_column"),
+        config=eda_cfg,
     )
     validate_contract(
         bind_output_path(ANALYZE_EDA_OUTPUT_CONTRACT, output_dir),
@@ -2541,6 +2544,7 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
         "split_config": runtime_config.get("split", {}),
         "featurize_config": runtime_config.get("featurize", {}),
         "label_config": runtime_config.get("label", {}),
+        "analyze_config": runtime_config.get("analyze", {}),
         "train_config": train_config,
         "model_config": model_config,
         "train_tdc_config": train_tdc_config,

@@ -24,6 +24,14 @@ def test_strict_rejects_unknown_top_level_block() -> None:
         validate_config_strict(cfg, ["train"])
 
 
+def test_strict_allows_analyze_block_for_analyze_node() -> None:
+    cfg = _base_config(["get_data", "analyze.eda"])
+    cfg["global"]["task_type"] = "classification"
+    cfg["get_data"] = {"data_source": "local_csv", "source": {"path": "local_data/example.csv"}}
+    cfg["analyze"] = {"eda": {"include": {"overview": True}}}
+    validate_config_strict(cfg, ["get_data", "analyze.eda"])
+
+
 def test_strict_rejects_block_not_in_pipeline() -> None:
     cfg = _base_config(["train"])
     cfg["train"] = {"model": {"type": "decision_tree"}}

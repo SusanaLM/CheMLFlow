@@ -37,6 +37,8 @@ _NODE_TO_BLOCK = {
     "select.features": "preprocess",
     "train": "train",
     "train.tdc": "train_tdc",
+    "analyze.stats": "analyze",
+    "analyze.eda": "analyze",
 }
 
 _CONFIGLESS_NODE_TO_BLOCK = {
@@ -54,6 +56,7 @@ _KNOWN_TOP_LEVEL_BLOCKS = {
     "preprocess",
     "train",
     "train_tdc",
+    "analyze",
 }
 _FEATURE_INPUT_NODES = {
     "featurize.none",

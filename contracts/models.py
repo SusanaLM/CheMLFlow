@@ -154,6 +154,13 @@ ANALYZE_STATS_INPUT_CONTRACT = ContractSpec(
     sample_model=PIC50Row,
 )
 
+ANALYZE_EDA_GENERIC_INPUT_CONTRACT = ContractSpec(
+    name="analyze_eda_generic_input",
+    description="Generic tabular CSV input for EDA.",
+    min_columns=1,
+    sample_model=None,
+)
+
 ANALYZE_STATS_OUTPUT_CONTRACT = ContractSpec(
     name="analyze_stats_output",
     output_kind="dir",

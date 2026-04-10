@@ -2323,7 +2323,9 @@ def train_model(
                 task_type=task_type,
             )
             estimator = result["model"]
-            best_params = result["best_params"]
+            # Persist the full effective DL config so downstream reload/explain
+            # rebuilds the same architecture instead of falling back to defaults.
+            best_params = {**effective_params, **result["best_params"]}
         
         y_pred = _predict_dl(estimator, X_test.values)
         import torch

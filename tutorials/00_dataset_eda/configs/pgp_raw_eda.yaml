@@ -1,0 +1,32 @@
+global:
+  pipeline_type: pgp
+  task_type: classification
+  base_dir: tutorials/00_dataset_eda/artifacts/data
+  run_dir: tutorials/00_dataset_eda/artifacts/run
+  target_column: Activity
+  random_state: 42
+  thresholds:
+    active: 1000
+    inactive: 10000
+
+pipeline:
+  nodes:
+    - get_data
+    - analyze.eda
+
+get_data:
+  data_source: local_csv
+  source:
+    path: tutorials/data/pgp_broccatelli.csv
+
+analyze:
+  eda:
+    include:
+      overview: true
+      missingness: true
+      numeric_histograms: true
+      correlation_heatmap: true
+      target_distribution: true
+      class_balance: true
+      descriptor_scatter: false
+      descriptor_boxplots: false
