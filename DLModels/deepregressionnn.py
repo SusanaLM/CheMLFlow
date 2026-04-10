@@ -12,9 +12,24 @@ class DeepRegressionNN(nn.Module):
         super().__init__()
 
         layers = []
-        prev_dim = input_dim
+        
+        # Following the research, the tropical layer is utilized as the 
+        # first hidden layer to perform tropical embedding[cite: 13, 55].
+        if use_tropical:
+            layers.append(TropicalLayer(input_dim, hidden_dims[0]))
+            # Note: Classical layers like BatchNorm follow the embedding[cite: 13, 55].
+            layers.append(nn.BatchNorm1d(hidden_dims[0]))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            prev_dim = hidden_dims[0]
+            # Start loop from the second hidden dimension
+            current_hidden_dims = hidden_dims[1:]
+        else:
+            prev_dim = input_dim
+            current_hidden_dims = hidden_dims
 
-        for h_dim in hidden_dims:
+        # Subsequent layers are the same as classical ones[cite: 13, 30].
+        for h_dim in current_hidden_dims:
             layers += [
                 nn.Linear(prev_dim, h_dim),
                 nn.BatchNorm1d(h_dim),
@@ -23,10 +38,8 @@ class DeepRegressionNN(nn.Module):
             ]
             prev_dim = h_dim
 
-        if use_tropical:
-            layers.append(TropicalLayer(prev_dim, 1))
-        else:
-            layers.append(nn.Linear(prev_dim, 1))
+        # Final linear output head for regression mapping
+        layers.append(nn.Linear(prev_dim, 1))
 
         self.net = nn.Sequential(*layers)
 
