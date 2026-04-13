@@ -419,6 +419,7 @@ def _scientific_config_payload(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(global_cfg, dict):
         global_cfg.pop("base_dir", None)
         global_cfg.pop("run_dir", None)
+        global_cfg.pop("artifact_retention", None)
         runs_cfg = global_cfg.get("runs")
         if isinstance(runs_cfg, dict):
             runs_cfg.pop("id", None)

@@ -570,6 +570,60 @@ def test_generate_doe_isolates_case_artifacts_by_default(tmp_path: Path) -> None
     assert all(Path(path).parts[-2] == namespace for path in run_dirs)
 
 
+def test_generate_doe_propagates_global_artifact_retention(tmp_path: Path) -> None:
+    profile = doe_module.PROFILE_SPECS["clf_local_csv"]
+    dataset_cfg = _base_clf_doe(tmp_path)["dataset"]
+    merged = {
+        "global.base_dir": str(tmp_path / "data"),
+        "global.random_state": 42,
+        "global.runs.enabled": False,
+        "global.artifact_retention": "audit_light",
+        "split.mode": "holdout",
+        "split.strategy": "random",
+        "split.test_size": 0.2,
+        "split.val_size": 0.1,
+        "split.stratify": True,
+        "split.require_disjoint": True,
+        "split.require_full_test_coverage": True,
+        "pipeline.feature_input": "featurize.morgan",
+        "pipeline.preprocess": False,
+        "pipeline.select": False,
+        "pipeline.explain": True,
+        "train.model.type": "catboost_classifier",
+    }
+    config = doe_module._build_case_config(
+        profile=profile,
+        dataset_cfg=dataset_cfg,
+        merged=merged,
+        resolved_task="classification",
+        probe={"resolved_smiles_column": "SMILES"},
+    )
+    assert config["global"]["artifact_retention"] == "audit_light"
+
+
+def test_hashable_payload_ignores_global_artifact_retention() -> None:
+    base_config = {
+        "global": {
+            "base_dir": "/tmp/data",
+            "run_dir": "/tmp/run",
+            "artifact_retention": "full",
+            "runs": {"enabled": True, "id": "case_001"},
+        },
+        "pipeline": {"nodes": ["get_data", "train"]},
+        "train": {"model": {"type": "random_forest"}},
+    }
+    audit_config = json.loads(json.dumps(base_config))
+    audit_config["global"]["artifact_retention"] = "audit_light"
+
+    base_hash = doe_module._stable_hash(doe_module._hashable_config_payload(base_config))
+    audit_hash = doe_module._stable_hash(doe_module._hashable_config_payload(audit_config))
+    base_science_hash = doe_module._stable_hash(doe_module._scientific_config_payload(base_config))
+    audit_science_hash = doe_module._stable_hash(doe_module._scientific_config_payload(audit_config))
+
+    assert base_hash == audit_hash
+    assert base_science_hash == audit_science_hash
+
+
 def test_generate_doe_isolation_namespaces_paths_by_spec_hash(tmp_path: Path) -> None:
     spec_a = _base_clf_doe(tmp_path)
     spec_a["search_space"]["train.model.type"] = ["catboost_classifier"]

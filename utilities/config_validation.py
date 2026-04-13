@@ -71,6 +71,7 @@ _FEATURE_INPUT_ALIASES = {
 }
 _CLASSIFICATION_ONLY_MODELS = {"catboost_classifier"}
 _DL_WILDCARD = "dl_*"
+_ARTIFACT_RETENTION_VALUES = {"full", "audit_light"}
 _RUNTIME_PROFILE_CONTRACTS: dict[str, dict[str, Any]] = {
     "reg_local_csv": {
         "allowed_feature_inputs": ("none", "smiles_native", "featurize.none", "featurize.rdkit", "featurize.morgan"),
@@ -281,8 +282,17 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
     curate_cfg = _as_dict(config.get("curate"))
     global_cfg = _as_dict(config.get("global"))
     task_type = str(global_cfg.get("task_type", "")).strip().lower()
+    artifact_retention = str(global_cfg.get("artifact_retention", "")).strip().lower()
     get_data_cfg = _as_dict(config.get("get_data"))
     source_type = str(get_data_cfg.get("data_source", "")).strip().lower()
+    if artifact_retention and artifact_retention not in _ARTIFACT_RETENTION_VALUES:
+        issues.append(
+            ValidationIssue(
+                code="CFG_GLOBAL_ARTIFACT_RETENTION_INVALID",
+                path="global.artifact_retention",
+                message="global.artifact_retention must be one of: full, audit_light.",
+            )
+        )
     chemprop_like_noop_preprocess = (
         model_type in _CHEMPROP_LIKE_MODELS
         and configured_feature_input == "smiles_native"
