@@ -872,6 +872,7 @@ def run_node_split(context: dict) -> None:
     split_source = "curated"
     split_features_file = ""
     split_labels_file = ""
+    retained_duplicate_feature_label_rows = 0
     feature_nodes = {
         "featurize.none",
         "featurize.rdkit",
@@ -896,15 +897,17 @@ def run_node_split(context: dict) -> None:
                 "split pre-split cleaning expected feature/label artifacts from explicit feature input, "
                 f"but files were missing (features={features_file} labels={labels_file})."
             )
-        X_split, _ = data_preprocessing.load_features_labels(
+        X_split, y_split = data_preprocessing.load_features_labels(
             features_file,
             labels_file,
             context["target_column"],
             context.get("categorical_features"),
             exclude_columns=_exclude_feature_columns(context),
             drop_invalid_rows=True,
-            drop_duplicate_rows=True,
+            drop_duplicate_rows=False,
+            fail_on_duplicate_rows=False,
         )
+        retained_duplicate_feature_label_rows = int(pd.concat([X_split, y_split], axis=1).duplicated().sum())
         eligible_row_ids = [int(i) for i in X_split.index.tolist()]
         if not eligible_row_ids:
             raise ValueError("Pre-split cleaning produced zero rows; cannot build split indices.")
@@ -980,6 +983,7 @@ def run_node_split(context: dict) -> None:
         "split_source": split_source,
         "split_features_file": split_features_file,
         "split_labels_file": split_labels_file,
+        "retained_duplicate_feature_label_rows": int(retained_duplicate_feature_label_rows),
         "stratify": bool(stratify),
         "stratify_column": stratify_column,
         "random_state": int(random_state),
@@ -1529,7 +1533,7 @@ def _resolve_split_partitions(
     Resolve train/val/test indices against a cleaned feature/label index.
 
     If split_indices exist in the context, we filter them down to rows that are
-    still present after cleaning (NaN/duplicate dropping). If a split becomes
+    still present after NaN/Inf cleaning. If a split becomes
     empty after filtering, we raise instead of silently re-splitting elsewhere.
     """
     split_indices = context.get("split_indices")

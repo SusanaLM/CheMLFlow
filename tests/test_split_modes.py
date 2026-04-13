@@ -356,6 +356,51 @@ def test_split_rejects_feature_cleaned_row_id_mismatch(tmp_path: Path) -> None:
         run_node_split(ctx)
 
 
+def test_split_retains_duplicate_feature_rows_before_split(tmp_path: Path) -> None:
+    curated_df = _make_curated_df(20)
+    curated_df["__row_index"] = list(range(20))
+    split_cfg = {
+        "mode": "holdout",
+        "strategy": "random",
+        "test_size": 0.2,
+        "val_size": 0.1,
+        "stratify": False,
+    }
+    ctx = _build_context(
+        tmp_path,
+        split_config=split_cfg,
+        curated_df=curated_df,
+        run_name="run_retained_duplicate_features",
+        base_name="shared_retained_duplicate_features_data",
+    )
+    ctx["pipeline_nodes"] = ["get_data", "curate", "featurize.morgan", "split", "train"]
+
+    feature_df = pd.DataFrame(
+        {
+            "__row_index": list(range(20)),
+            "fp_0": list(range(20)),
+            "fp_1": [v + 100 for v in range(20)],
+            "label": curated_df["label"].tolist(),
+        }
+    )
+    feature_df.loc[4, ["fp_0", "fp_1"]] = feature_df.loc[2, ["fp_0", "fp_1"]].to_numpy()
+    feature_path = Path(ctx["paths"]["morgan_labeled"])
+    feature_df.to_csv(feature_path, index=False)
+    ctx["feature_matrix"] = str(feature_path)
+    ctx["labels_matrix"] = str(feature_path)
+
+    run_node_split(ctx)
+
+    assigned = sorted(
+        ctx["split_indices"]["train"] + ctx["split_indices"]["val"] + ctx["split_indices"]["test"]
+    )
+    assert assigned == list(range(len(curated_df)))
+    assert ctx["split_meta"]["split_source"] == "feature_cleaned"
+    assert int(ctx["split_meta"]["dataset_rows"]) == len(curated_df)
+    assert int(ctx["split_meta"]["coverage"]["dropped_before_split"]) == 0
+    assert int(ctx["split_meta"]["retained_duplicate_feature_label_rows"]) == 1
+
+
 def test_resolve_feature_inputs_prefers_curated_path_for_missing_labels() -> None:
     context = {
         "feature_matrix": "features.csv",
