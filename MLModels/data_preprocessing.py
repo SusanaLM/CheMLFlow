@@ -352,6 +352,13 @@ def load_features_labels(
             if drop_duplicate_rows:
                 combined = combined.drop_duplicates()
                 logging.info("Removed %s duplicate entries.", duplicate_rows)
+            else:
+                logging.warning(
+                    "Retaining %s duplicate aligned feature/label row(s). "
+                    "This can happen when distinct molecules collide under a feature representation; "
+                    "row IDs are preserved for split comparability.",
+                    duplicate_rows,
+                )
 
         X_clean = combined.drop(columns=[target_col])
         y_clean = combined[target_col]

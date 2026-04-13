@@ -1659,7 +1659,7 @@ def run_node_preprocess_features(context: dict) -> None:
         drop_invalid_rows=False,
         drop_duplicate_rows=False,
         fail_on_invalid_rows=True,
-        fail_on_duplicate_rows=True,
+        fail_on_duplicate_rows=False,
     )
     data_preprocessing.verify_data_quality(X_clean, y_clean)
 
@@ -1758,7 +1758,7 @@ def run_node_select_features(context: dict) -> None:
         drop_invalid_rows=False,
         drop_duplicate_rows=False,
         fail_on_invalid_rows=True,
-        fail_on_duplicate_rows=True,
+        fail_on_duplicate_rows=False,
     )
 
     partitions = _resolve_split_partitions(context, X.index)
@@ -2236,7 +2236,7 @@ def run_node_train(context: dict) -> None:
         drop_invalid_rows=False,
         drop_duplicate_rows=False,
         fail_on_invalid_rows=True,
-        fail_on_duplicate_rows=True,
+        fail_on_duplicate_rows=False,
     )
     if isinstance(y, pd.DataFrame):
         y = data_preprocessing.select_target_series(y, target_column)
@@ -2377,7 +2377,7 @@ def run_node_explain(context: dict) -> None:
         drop_invalid_rows=False,
         drop_duplicate_rows=False,
         fail_on_invalid_rows=True,
-        fail_on_duplicate_rows=True,
+        fail_on_duplicate_rows=False,
     )
     partitions = _resolve_split_partitions(context, X.index)
     assert partitions is not None  # split_indices was validated above
