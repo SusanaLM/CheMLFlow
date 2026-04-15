@@ -1,3 +1,5 @@
+import logging
+
 import pandas as pd
 import pytest
 
@@ -45,3 +47,34 @@ def test_load_features_labels_surfaces_original_exception_type(tmp_path):
             str(missing),
             target_column="pIC50",
         )
+
+
+def test_load_features_labels_retains_duplicate_rows_when_requested(tmp_path, caplog):
+    features_path = tmp_path / "features.csv"
+    labels_path = tmp_path / "labels.csv"
+
+    pd.DataFrame(
+        {
+            data_preprocessing.ROW_INDEX_COL: [10, 11, 12],
+            "feature_a": [1.0, 1.0, 2.0],
+        }
+    ).to_csv(features_path, index=False)
+    pd.DataFrame(
+        {
+            data_preprocessing.ROW_INDEX_COL: [10, 11, 12],
+            "FP Exp.": [288.0, 288.0, 300.0],
+        }
+    ).to_csv(labels_path, index=False)
+
+    with caplog.at_level(logging.WARNING):
+        X, y = data_preprocessing.load_features_labels(
+            str(features_path),
+            str(labels_path),
+            target_column="FP Exp.",
+            drop_duplicate_rows=False,
+            fail_on_duplicate_rows=False,
+        )
+
+    assert X.index.tolist() == [10, 11, 12]
+    assert y.index.tolist() == [10, 11, 12]
+    assert "Retaining 1 duplicate aligned feature/label row" in caplog.text
