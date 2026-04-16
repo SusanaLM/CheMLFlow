@@ -2538,6 +2538,15 @@ def run_node_explain(context: dict) -> None:
             consumer="explain",
         )
 
+    logging.info(
+        "Explain node start: model=%s task=%s feature_method=%s features=%s labels=%s model_path=%s",
+        model_type,
+        context.get("task_type", "regression"),
+        feature_method,
+        features_file,
+        labels_file,
+        model_path,
+    )
     X, y = data_preprocessing.load_features_labels(
         features_file,
         labels_file,
@@ -2557,6 +2566,15 @@ def run_node_explain(context: dict) -> None:
     X_train = X.loc[train_idx]
     X_test = X.loc[test_idx]
     y_test = y.loc[test_idx]
+    logging.info(
+        "Explain node data ready: model=%s X=%s X_train=%s X_test=%s y_test=%s",
+        model_type,
+        X.shape,
+        X_train.shape,
+        X_test.shape,
+        y_test.shape,
+    )
+    logging.info("Explain node loading estimator: model=%s path=%s", model_type, model_path)
     estimator = train_models.load_model(
         model_path, 
         model_type, 
@@ -2564,6 +2582,7 @@ def run_node_explain(context: dict) -> None:
     )
 
     train_models.run_explainability(estimator, X_train, X_test, y_test, model_type, output_dir, task_type=context.get("task_type", "regression"))
+    logging.info("Explain node complete: model=%s output_dir=%s", model_type, output_dir)
 
     validate_contract(
         bind_output_path(EXPLAIN_OUTPUT_CONTRACT, output_dir),
