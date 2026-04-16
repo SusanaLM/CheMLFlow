@@ -16,6 +16,7 @@ from . import (
     persistence,
     plots,
     sklearn_models,
+    train_helpers,
     torch_models,
 )
 
@@ -31,5 +32,6 @@ __all__ = [
     "persistence",
     "plots",
     "sklearn_models",
+    "train_helpers",
     "torch_models",
 ]

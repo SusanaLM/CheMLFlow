@@ -29,6 +29,8 @@ This package contains modular training utilities used by `MLModels/train_models.
   - Core `train_model` orchestration (runtime options, fit/predict, metrics/artifact persistence).
 - `model_loader.py`
   - Core `load_model` implementation for DL/ML/CatBoost reload paths.
+- `train_helpers.py`
+  - Shared utility helpers (label coercion, feature-name sanitization, split-index mapping, classification output shaping).
 - `chemprop_models.py`
   - Chemprop/Chemeleon training implementation used by the compatibility facade.
 - `explainability.py`
