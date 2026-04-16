@@ -19,6 +19,12 @@ This package contains modular training utilities used by `MLModels/train_models.
   - Model/metrics/params persistence helpers (`joblib`, JSON, torch state dict).
 - `torch_models.py`
   - PyTorch DL helpers for device selection, deterministic seeding, training, prediction, and Optuna tuning.
+- `sklearn_models.py`
+  - Tabular model constructors and hyperparameter-search wrappers (RF/SVM/DT/XGBoost/ensemble).
+- `dl_registry.py`
+  - DL model registry for `DLSearchConfig` builders (`dl_simple`, `dl_deep`, `dl_gru`, etc.).
+- `model_factory.py`
+  - Unified model initialization dispatcher used by `train_models.py`.
 - `__init__.py`
   - Package exports for the modules above.
 
