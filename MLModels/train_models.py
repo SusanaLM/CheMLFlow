@@ -11,15 +11,13 @@ import pandas as pd
 from MLModels.training import config as training_config
 from MLModels.training import chemprop_models as training_chemprop_models
 from MLModels.training import explainability as training_explainability
+from MLModels.training import model_loader as training_model_loader
 from MLModels.training import model_factory as training_model_factory
 from MLModels.training import metrics as training_metrics
+from MLModels.training import orchestrator as training_orchestrator
 from MLModels.training import persistence as training_persistence
 from MLModels.training import plots as training_plots
 from MLModels.training import torch_models as training_torch_models
-from sklearn.metrics import (
-    r2_score,
-    mean_absolute_error,
-)
 
 _ROW_INDEX_COL = "__row_index"
 
@@ -657,398 +655,59 @@ def train_model(
     X_val: pd.DataFrame | None = None,
     y_val: pd.Series | None = None,
 ) -> Tuple[object, TrainResult]:
-    _ensure_dir(output_dir)
-    is_dl = _is_dl_model(model_type)
-    runtime_options = _parse_runtime_training_options(model_config)
-    model_config = runtime_options.model_config
-    plot_split_performance = runtime_options.plot_split_performance
-    debug_logging = runtime_options.debug_logging
-    n_jobs = runtime_options.n_jobs
-    tuning_method = runtime_options.tuning_method
-    model_params = runtime_options.model_params
-
-    logging.info(
-        "Training start: model=%s task=%s tuning=%s X_train=%s X_test=%s",
-        model_type,
-        task_type,
-        tuning_method,
-        X_train.shape,
-        X_test.shape,
-    )
-    X_train, X_test, X_val, feature_name_map_path = _maybe_sanitize_xgboost_feature_frames(
-        model_type=model_type,
+    return training_orchestrator.train_model(
         X_train=X_train,
+        y_train=y_train,
         X_test=X_test,
-        X_val=X_val,
+        y_test=y_test,
+        model_type=model_type,
         output_dir=output_dir,
-    )
-
-    if task_type == "classification":
-        y_train = _ensure_binary_labels(y_train)
-        y_test = _ensure_binary_labels(y_test)
-        if y_val is not None:
-            y_val = _ensure_binary_labels(y_val)
-
-    if task_type == "regression" and model_type == "catboost_classifier":
-        raise ValueError("Model type 'catboost_classifier' only supports classification tasks.")
-
-    if task_type == "classification" and model_type == "catboost_classifier":
-        from catboost import CatBoostClassifier
-
-        params = {
-            "loss_function": "Logloss",
-            "eval_metric": "AUC",
-            "random_seed": random_state,
-            "verbose": False,
-        }
-        params.update(model_config.get("params", {}))
-        if not debug_logging:
-            if any(key in params for key in ("verbose", "verbose_eval", "logging_level", "silent")):
-                logging.info("Global debug logging is off; forcing quiet CatBoost training output.")
-            params.pop("verbose_eval", None)
-            params.pop("logging_level", None)
-            params.pop("silent", None)
-            params["verbose"] = False
-        estimator = CatBoostClassifier(**params)
-        eval_set = None
-        if X_val is not None and y_val is not None and len(y_val) > 0:
-            eval_set = (X_val, y_val)
-        fit_kwargs = {}
-        if eval_set:
-            fit_kwargs["eval_set"] = eval_set
-            fit_kwargs["use_best_model"] = True
-        estimator.fit(X_train, y_train, **fit_kwargs)
-        y_pred_proba = estimator.predict_proba(X_test)[:, 1]
-        y_pred = estimator.predict(X_test)
-        model_path = os.path.join(output_dir, f"{model_type}_best_model.cbm")
-        estimator.save_model(model_path)
-        best_params = estimator.get_params()
-        y_test_arr, y_pred_proba, y_pred, metrics = _classification_metrics_from_outputs(
-            y_test,
-            y_pred_proba,
-            y_pred,
-            context=f"{model_type} test scoring",
-        )
-        if plot_split_performance:
-            train_proba = estimator.predict_proba(X_train)[:, 1]
-            train_pred = estimator.predict(X_train)
-            y_train_arr, train_proba, train_pred, train_metrics = _classification_metrics_from_outputs(
-                y_train,
-                train_proba,
-                train_pred,
-                context=f"{model_type} train scoring",
-            )
-            split_metrics: Dict[str, Dict[str, float | None]] = {
-                "train": train_metrics,
-                "test": metrics.copy(),
-            }
-            split_outputs: Dict[str, Dict[str, Any]] = {
-                "train": {
-                    "y_true": y_train_arr,
-                    "y_proba": train_proba,
-                    "y_pred": train_pred,
-                },
-                "test": {
-                    "y_true": y_test_arr,
-                    "y_proba": y_pred_proba,
-                    "y_pred": y_pred,
-                },
-            }
-            if X_val is not None and y_val is not None and len(y_val) > 0:
-                y_val_proba = estimator.predict_proba(X_val)[:, 1]
-                y_val_pred = estimator.predict(X_val)
-                y_val_arr, y_val_proba, y_val_pred, val_metrics = _classification_metrics_from_outputs(
-                    y_val,
-                    y_val_proba,
-                    y_val_pred,
-                    context=f"{model_type} val scoring",
-                )
-                split_metrics["val"] = val_metrics
-                split_outputs["val"] = {
-                    "y_true": y_val_arr,
-                    "y_proba": y_val_proba,
-                    "y_pred": y_val_pred,
-                }
-            split_metrics_path, split_plot_path = _save_split_metrics_artifacts(
-                output_dir,
-                model_type,
-                split_metrics,
-            )
-            if split_metrics_path:
-                metrics["split_metrics_path"] = split_metrics_path
-            if split_plot_path:
-                metrics["split_metrics_plot_path"] = split_plot_path
-            metrics.update(_save_classification_split_plots(output_dir, model_type, split_outputs))
-
-        roc_path = _save_roc_curve(output_dir, model_type, y_test, y_pred_proba)
-        if roc_path:
-            metrics["roc_curve_path"] = roc_path
-        params_path = os.path.join(output_dir, f"{model_type}_best_params.pkl")
-        metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")
-        training_persistence.save_params(best_params, params_path)
-        training_persistence.save_metrics_series(metrics, metrics_path)
-        logging.info("Training complete (classification): metrics=%s", metrics)
-        logging.info("Artifacts: model=%s metrics=%s params=%s", model_path, metrics_path, params_path)
-        return estimator, TrainResult(model_path, params_path, metrics_path)
-
-    classification_model_types = {
-        "catboost_classifier",
-        "random_forest",
-        "decision_tree",
-        "xgboost",
-        "svm",
-        "ensemble",
-    }
-
-    if task_type == "classification" and not (model_type in classification_model_types or is_dl):
-        raise ValueError(f"Unsupported classification model type: {model_type}")
-
-    model = _initialize_model(
-        model_type,
-        random_state,
-        cv_folds,
-        search_iters,
-        input_dim=X_train.shape[1] if is_dl else None,
-        n_jobs=n_jobs,
-        tuning_method=tuning_method,
-        model_params=model_params,
+        random_state=random_state,
+        cv_folds=cv_folds,
+        search_iters=search_iters,
+        use_hpo=use_hpo,
+        hpo_trials=hpo_trials,
+        patience=patience,
         task_type=task_type,
+        model_config=model_config,
+        X_val=X_val,
+        y_val=y_val,
+        dl_search_config_cls=DLSearchConfig,
+        train_result_cls=TrainResult,
+        ensure_dir=_ensure_dir,
+        is_dl_model=_is_dl_model,
+        parse_runtime_training_options=_parse_runtime_training_options,
+        maybe_sanitize_xgboost_feature_frames=_maybe_sanitize_xgboost_feature_frames,
+        ensure_binary_labels=_ensure_binary_labels,
+        initialize_model=_initialize_model,
+        run_optuna=_run_optuna,
+        seed_dl_runtime=_seed_dl_runtime,
+        train_dl=_train_dl,
+        predict_dl=_predict_dl,
+        classification_metrics_from_outputs=_classification_metrics_from_outputs,
+        save_split_metrics_artifacts=_save_split_metrics_artifacts,
+        save_classification_split_plots=_save_classification_split_plots,
+        save_regression_parity_plots=_save_regression_parity_plots,
+        save_roc_curve=_save_roc_curve,
+        predict_classification_outputs=_predict_classification_outputs,
+        validate_regression_metric_inputs=_validate_regression_metric_inputs,
+        safe_r2=_safe_r2,
+        safe_mae=_safe_mae,
+        save_model_pickle=training_persistence.save_model_pickle,
+        save_torch_state_dict=training_persistence.save_torch_state_dict,
+        save_params=training_persistence.save_params,
+        save_metrics_series=training_persistence.save_metrics_series,
     )
-    if isinstance(model, DLSearchConfig):
-        # ── DL Training ──
-        if X_val is None or y_val is None or len(y_val) == 0:
-            raise ValueError(
-                "DL models require a validation split for early stopping/HPO. "
-                "Ensure the pipeline includes the split node and set split.val_size > 0."
-            )
-        if use_hpo:
-            logging.info(f"Running optuna for {model_type} ({hpo_trials} evals)")
-            estimator, best_params = _run_optuna(
-                model,
-                X_train.values,
-                y_train.values,
-                X_val.values,
-                y_val.values,
-                hpo_trials,
-                random_state,
-                patience,
-                task_type=task_type,
-            )
-        else:
-            effective_params = {**model.default_params, **model_params}
-            logging.info(f"Training DL model: {model_type} (fixed params)")
-            _seed_dl_runtime(int(random_state))
-            nn_model = model.model_class(effective_params)
-            result = _train_dl(
-                nn_model,
-                X_train.values,
-                y_train.values,
-                X_val.values,
-                y_val.values,
-                epochs=effective_params["epochs"],
-                batch_size=effective_params["batch_size"],
-                learning_rate=effective_params["learning_rate"],
-                patience=patience,
-                random_state=random_state,
-                task_type=task_type,
-            )
-            estimator = result["model"]
-            # Persist the full effective DL config so downstream reload/explain
-            # rebuilds the same architecture instead of falling back to defaults.
-            best_params = {**effective_params, **result["best_params"]}
-        
-        model_path = os.path.join(output_dir, f"{model_type}_best_model.pth")
-        y_pred = _predict_dl(estimator, X_test.values)
-    else:
 
-        logging.info(f"Training ML model: {model_type}")
-        model.fit(X_train, y_train)
-
-        estimator = model.best_estimator_ if hasattr(model, "best_estimator_") else model
-        y_pred = estimator.predict(X_test)
-        model_path = os.path.join(output_dir, f"{model_type}_best_model.pkl")
-        training_persistence.save_model_pickle(estimator, model_path)
-        best_params = model.best_params_ if hasattr(model, "best_params_") else {}
-
-    if task_type == "classification":
-        y_pred_proba, y_pred_label, y_pred_score = _predict_classification_outputs(
-            estimator=estimator,
-            model_type=model_type,
-            X=X_test,
-        )
-        y_true, y_pred_proba, y_pred_label, metrics = _classification_metrics_from_outputs(
-            y_test,
-            y_pred_proba,
-            y_pred_label,
-            context=f"{model_type} test scoring",
-        )
-        roc_path = _save_roc_curve(output_dir, model_type, y_true, y_pred_proba)
-        if roc_path:
-            metrics["roc_curve_path"] = roc_path
-
-        pred_path = os.path.join(output_dir, f"{model_type}_predictions.csv")
-        pd.DataFrame({
-            "y_true": y_true,
-            "y_score": np.asarray(y_pred_score).reshape(-1),
-            "y_proba": y_pred_proba,
-            "y_pred": y_pred_label,
-        }).to_csv(pred_path, index=False)
-    else:
-        y_true, y_pred = _validate_regression_metric_inputs(
-            y_test,
-            y_pred,
-            context=f"{model_type} test scoring",
-        )
-        metrics = {
-            "r2": float(r2_score(y_true, y_pred)),
-            "mae": float(mean_absolute_error(y_true, y_pred)),
-        }
-    if feature_name_map_path:
-        metrics["feature_name_map_path"] = feature_name_map_path
-
-    if plot_split_performance:
-        split_metrics: Dict[str, Dict[str, float | None]] = {}
-
-        if task_type == "classification":
-            split_outputs: Dict[str, Dict[str, Any]] = {}
-            # --- TRAIN predictions ---
-            tr_proba, tr_pred, _ = _predict_classification_outputs(
-                estimator=estimator,
-                model_type=model_type,
-                X=X_train,
-            )
-            y_tr, tr_proba, tr_pred, train_metrics = _classification_metrics_from_outputs(
-                y_train,
-                tr_proba,
-                tr_pred,
-                context=f"{model_type} train scoring",
-            )
-            split_metrics["train"] = train_metrics
-            split_outputs["train"] = {
-                "y_true": y_tr,
-                "y_proba": tr_proba,
-                "y_pred": tr_pred,
-            }
-
-            # --- TEST predictions ---
-            te_proba, te_pred, _ = _predict_classification_outputs(
-                estimator=estimator,
-                model_type=model_type,
-                X=X_test,
-            )
-            y_te, te_proba, te_pred, test_metrics = _classification_metrics_from_outputs(
-                y_test,
-                te_proba,
-                te_pred,
-                context=f"{model_type} test scoring",
-            )
-            split_metrics["test"] = test_metrics
-            split_outputs["test"] = {
-                "y_true": y_te,
-                "y_proba": te_proba,
-                "y_pred": te_pred,
-            }
-
-            # --- VAL predictions  ---
-            if X_val is not None and y_val is not None and len(y_val) > 0:
-                va_proba, va_pred, _ = _predict_classification_outputs(
-                    estimator=estimator,
-                    model_type=model_type,
-                    X=X_val,
-                )
-                y_va, va_proba, va_pred, val_metrics = _classification_metrics_from_outputs(
-                    y_val,
-                    va_proba,
-                    va_pred,
-                    context=f"{model_type} val scoring",
-                )
-                split_metrics["val"] = val_metrics
-                split_outputs["val"] = {
-                    "y_true": y_va,
-                    "y_proba": va_proba,
-                    "y_pred": va_pred,
-                }
-
-        else:
-            # --- regression ---
-            if is_dl:
-                y_train_pred = _predict_dl(estimator, X_train.values)
-                y_test_pred = _predict_dl(estimator, X_test.values)
-                y_val_pred = _predict_dl(estimator, X_val.values) if X_val is not None else None
-            else:
-                y_train_pred = estimator.predict(X_train)
-                y_test_pred = estimator.predict(X_test)
-                y_val_pred = estimator.predict(X_val) if X_val is not None else None
-
-            split_metrics = {
-                "train": {"r2": _safe_r2(y_train, y_train_pred), "mae": _safe_mae(y_train, y_train_pred)},
-                "test": {"r2": _safe_r2(y_test, y_test_pred), "mae": _safe_mae(y_test, y_test_pred)},
-            }
-            if X_val is not None and y_val is not None and len(y_val) > 0 and y_val_pred is not None:
-                split_metrics["val"] = {"r2": _safe_r2(y_val, y_val_pred), "mae": _safe_mae(y_val, y_val_pred)}
-
-        split_metrics_path, split_plot_path = _save_split_metrics_artifacts(output_dir, model_type, split_metrics)
-        if split_metrics_path:
-            metrics["split_metrics_path"] = split_metrics_path
-        if split_plot_path:
-            metrics["split_metrics_plot_path"] = split_plot_path
-
-        if task_type == "classification":
-            metrics.update(_save_classification_split_plots(output_dir, model_type, split_outputs))
-        else:
-            parity_paths = _save_regression_parity_plots(
-                output_dir,
-                model_type,
-                {
-                    "train": (y_train, y_train_pred),
-                    "test": (y_test, y_test_pred),
-                    "val": (y_val, y_val_pred),
-                },
-            )
-            for split_name, path in parity_paths.items():
-                metrics[f"parity_plot_{split_name}_path"] = path
-
-    params_path = os.path.join(output_dir, f"{model_type}_best_params.pkl")
-    metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")
-    if is_dl:
-        training_persistence.save_torch_state_dict(estimator, model_path)
-    training_persistence.save_params(best_params, params_path)
-    training_persistence.save_metrics_series(metrics, metrics_path)
-    logging.info("Training complete (%s): metrics=%s", task_type, metrics)
-    logging.info("Artifacts: model=%s metrics=%s params=%s", model_path, metrics_path, params_path)
-
-    return estimator, TrainResult(model_path, params_path, metrics_path)
-
-def load_model(model_path: str, model_type: str, input_dim: int = None) -> object:
-    is_dl = _is_dl_model(model_type)
-    
-    if is_dl:
-        import torch
-        if input_dim is None:
-            raise ValueError("input_dim required to load DL models")
-        
-        params_path = model_path.replace("_best_model.pth", "_best_params.pkl")
-        if os.path.exists(params_path):
-            saved_params = training_persistence.load_pickle(params_path)
-        else:
-            saved_params = {}
-
-        config = _initialize_model(model_type, random_state=42, cv_folds=5, 
-                                   search_iters=100, input_dim=input_dim)
-        
-        model_params = {**config.default_params, **saved_params}
-        
-        model = config.model_class(model_params)
-        model.load_state_dict(torch.load(model_path, weights_only=True))
-        model.eval()
-        return model
-    if model_type == "catboost_classifier":
-        from catboost import CatBoostClassifier
-
-        model = CatBoostClassifier()
-        model.load_model(model_path)
-        return model
-    return training_persistence.load_pickle(model_path)
+def load_model(model_path: str, model_type: str, input_dim: int | None = None) -> object:
+    return training_model_loader.load_model(
+        model_path=model_path,
+        model_type=model_type,
+        input_dim=input_dim,
+        is_dl_model=_is_dl_model,
+        initialize_model=_initialize_model,
+        load_pickle=training_persistence.load_pickle,
+    )
 
 def run_explainability(
     estimator: object,
