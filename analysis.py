@@ -48,7 +48,6 @@ class ChildJob:
 class GeneralizationRecord:
     case_name: str
     model_type: str | None
-    scaler: str | None
     split_mode: str | None
     split_strategy: str | None
     feature_input: str | None
@@ -62,6 +61,7 @@ class GeneralizationRecord:
     underfit_flag: bool
     config_path: str | None
     run_dir: str | None
+    scaler: str | None = None
     parent_case_id: str | None = None
     scientific_config_id: str | None = None
     execution_label: str | None = None

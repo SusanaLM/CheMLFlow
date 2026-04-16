@@ -2327,10 +2327,8 @@ def train_model(
             # rebuilds the same architecture instead of falling back to defaults.
             best_params = {**effective_params, **result["best_params"]}
         
-        y_pred = _predict_dl(estimator, X_test.values)
-        import torch
         model_path = os.path.join(output_dir, f"{model_type}_best_model.pth")
-        torch.save(estimator.state_dict(), model_path)
+        y_pred = _predict_dl(estimator, X_test.values)
     else:
 
         logging.info(f"Training ML model: {model_type}")
@@ -2482,6 +2480,9 @@ def train_model(
 
     params_path = os.path.join(output_dir, f"{model_type}_best_params.pkl")
     metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")
+    if is_dl:
+        import torch
+        torch.save(estimator.state_dict(), model_path)
     joblib.dump(best_params, params_path)   
     pd.Series(metrics).to_json(metrics_path)
     logging.info("Training complete (%s): metrics=%s", task_type, metrics)
