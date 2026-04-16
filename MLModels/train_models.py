@@ -8,12 +8,13 @@ import re
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any, Callable
 
-import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from MLModels.training import config as training_config
 from MLModels.training import metrics as training_metrics
+from MLModels.training import persistence as training_persistence
 from MLModels.training import plots as training_plots
 from sklearn.model_selection import RandomizedSearchCV, GridSearchCV
 from sklearn.ensemble import (
@@ -48,7 +49,7 @@ class DLSearchConfig:
     default_params: Dict[str, Any]
 
 def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+    training_persistence.ensure_dir(path)
 
 
 _XGBOOST_INVALID_FEATURE_CHARS = re.compile(r"[\[\]<>]")
@@ -173,49 +174,7 @@ def _maybe_apply_xgboost_feature_map_for_explain(
     return X_train_s, X_test_s
 
 def _resolve_n_jobs(model_config: Dict[str, Any] | None = None) -> int:
-    """Resolve parallelism level for scikit-learn/joblib.
-
-    Default to single-thread under pytest (subprocesses inherit PYTEST_CURRENT_TEST),
-    since some sandboxes/CI environments disallow the syscalls loky uses to size its pool.
-    """
-    model_config = model_config or {}
-
-    value = model_config.get("n_jobs")
-    if value is None:
-        env = os.environ.get("CHEMLFLOW_N_JOBS")
-        if env:
-            try:
-                value = int(env)
-            except ValueError:
-                logging.warning("Invalid CHEMLFLOW_N_JOBS=%r; falling back to defaults.", env)
-
-    if value is None:
-        value = 1 if os.environ.get("PYTEST_CURRENT_TEST") else -1
-
-    try:
-        value_int = int(value)
-    except (TypeError, ValueError):
-        logging.warning("Invalid n_jobs=%r; using 1.", value)
-        return 1
-    if value_int == 0:
-        logging.warning("n_jobs=0 is invalid; using 1.")
-        return 1
-
-    # Some environments (notably sandboxed macOS setups) raise PermissionError on
-    # os.sysconf("SC_SEM_NSEMS_MAX"), which joblib/loky calls when starting a
-    # process pool. Fall back to single-thread execution to keep pipelines runnable.
-    if value_int != 1:
-        try:
-            os.sysconf("SC_SEM_NSEMS_MAX")
-        except PermissionError:
-            logging.warning(
-                "Parallel joblib backend is not permitted in this environment; forcing n_jobs=1."
-            )
-            return 1
-        except Exception:
-            # If sysconf is unavailable/unsupported, let joblib decide.
-            pass
-    return value_int
+    return training_config.resolve_n_jobs(model_config)
 
 
 def _validate_classification_score_values(
@@ -325,13 +284,11 @@ def _save_classification_split_plots(
 
 
 def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
+    return training_config.as_bool(value)
+
+
+def _parse_runtime_training_options(model_config: Dict[str, Any] | None):
+    return training_config.parse_runtime_training_options(model_config)
 
 
 def _validate_regression_metric_inputs(
@@ -452,33 +409,7 @@ def _require_chemprop() -> None:
 
 
 def _resolve_chemprop_foundation_config(model_config: Dict[str, Any]) -> tuple[str, str | None, bool]:
-    foundation = str(model_config.get("foundation", "none")).strip().lower()
-    if foundation in {"", "none"}:
-        foundation = "none"
-    if foundation not in {"none", "chemeleon"}:
-        raise ValueError(
-            "model.foundation must be one of: 'none', 'chemeleon'."
-        )
-
-    freeze_encoder = _as_bool(model_config.get("freeze_encoder", False))
-    checkpoint_path: str | None = None
-    if foundation == "chemeleon":
-        raw_path = model_config.get("foundation_checkpoint")
-        if not raw_path or not str(raw_path).strip():
-            raise ValueError(
-                "model.foundation_checkpoint is required when model.foundation='chemeleon'."
-            )
-        checkpoint_path = os.path.expanduser(str(raw_path).strip())
-        if not os.path.isfile(checkpoint_path):
-            raise ValueError(
-                f"model.foundation_checkpoint does not exist or is not a file: {checkpoint_path}"
-            )
-    elif freeze_encoder:
-        raise ValueError(
-            "model.freeze_encoder=true requires model.foundation='chemeleon'."
-        )
-
-    return foundation, checkpoint_path, freeze_encoder
+    return training_config.resolve_chemprop_foundation_config(model_config)
 
 
 def _resolve_chemprop_split_positions(
@@ -1032,9 +963,8 @@ def train_chemprop_model(
         "foundation_checkpoint": foundation_checkpoint,
         "freeze_encoder": bool(freeze_encoder),
     }
-    joblib.dump(best_params, params_path)
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
+    training_persistence.save_params(best_params, params_path)
+    training_persistence.save_metrics_json(metrics, metrics_path, indent=2)
 
     pred_path = os.path.join(output_dir, "chemprop_predictions.csv")
     out_pred = df.loc[te_idx, ["_row_id", smiles_column, target_column]].copy()
@@ -1777,18 +1707,13 @@ def train_model(
 ) -> Tuple[object, TrainResult]:
     _ensure_dir(output_dir)
     is_dl = _is_dl_model(model_type)
-    model_config = model_config or {}
-    plot_split_performance = _as_bool(model_config.get("plot_split_performance", False))
-    debug_logging = _as_bool(model_config.get("_debug_logging", False))
-    n_jobs = _resolve_n_jobs(model_config)
-    tuning_cfg = model_config.get("tuning", {}) if isinstance(model_config.get("tuning"), dict) else {}
-    tuning_method = str(
-        tuning_cfg.get(
-            "method",
-            model_config.get("tuning_method", "fixed"),
-        )
-    ).strip().lower() or "fixed"
-    model_params = model_config.get("params", {}) if isinstance(model_config.get("params"), dict) else {}
+    runtime_options = _parse_runtime_training_options(model_config)
+    model_config = runtime_options.model_config
+    plot_split_performance = runtime_options.plot_split_performance
+    debug_logging = runtime_options.debug_logging
+    n_jobs = runtime_options.n_jobs
+    tuning_method = runtime_options.tuning_method
+    model_params = runtime_options.model_params
 
     logging.info(
         "Training start: model=%s task=%s tuning=%s X_train=%s X_test=%s",
@@ -1908,8 +1833,8 @@ def train_model(
             metrics["roc_curve_path"] = roc_path
         params_path = os.path.join(output_dir, f"{model_type}_best_params.pkl")
         metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")
-        joblib.dump(best_params, params_path)
-        pd.Series(metrics).to_json(metrics_path)
+        training_persistence.save_params(best_params, params_path)
+        training_persistence.save_metrics_series(metrics, metrics_path)
         logging.info("Training complete (classification): metrics=%s", metrics)
         logging.info("Artifacts: model=%s metrics=%s params=%s", model_path, metrics_path, params_path)
         return estimator, TrainResult(model_path, params_path, metrics_path)
@@ -1990,7 +1915,7 @@ def train_model(
         estimator = model.best_estimator_ if hasattr(model, "best_estimator_") else model
         y_pred = estimator.predict(X_test)
         model_path = os.path.join(output_dir, f"{model_type}_best_model.pkl")
-        joblib.dump(estimator, model_path)
+        training_persistence.save_model_pickle(estimator, model_path)
         best_params = model.best_params_ if hasattr(model, "best_params_") else {}
 
     if task_type == "classification":
@@ -2134,10 +2059,9 @@ def train_model(
     params_path = os.path.join(output_dir, f"{model_type}_best_params.pkl")
     metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")
     if is_dl:
-        import torch
-        torch.save(estimator.state_dict(), model_path)
-    joblib.dump(best_params, params_path)   
-    pd.Series(metrics).to_json(metrics_path)
+        training_persistence.save_torch_state_dict(estimator, model_path)
+    training_persistence.save_params(best_params, params_path)
+    training_persistence.save_metrics_series(metrics, metrics_path)
     logging.info("Training complete (%s): metrics=%s", task_type, metrics)
     logging.info("Artifacts: model=%s metrics=%s params=%s", model_path, metrics_path, params_path)
 
@@ -2153,7 +2077,7 @@ def load_model(model_path: str, model_type: str, input_dim: int = None) -> objec
         
         params_path = model_path.replace("_best_model.pth", "_best_params.pkl")
         if os.path.exists(params_path):
-            saved_params = joblib.load(params_path)
+            saved_params = training_persistence.load_pickle(params_path)
         else:
             saved_params = {}
 
@@ -2172,7 +2096,7 @@ def load_model(model_path: str, model_type: str, input_dim: int = None) -> objec
         model = CatBoostClassifier()
         model.load_model(model_path)
         return model
-    return joblib.load(model_path)
+    return training_persistence.load_pickle(model_path)
 
 def run_explainability(
     estimator: object,
