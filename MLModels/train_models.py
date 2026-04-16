@@ -3,7 +3,6 @@ import os
 import logging
 import shutil
 import inspect
-import random
 import re
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any, Callable
@@ -16,6 +15,7 @@ from MLModels.training import config as training_config
 from MLModels.training import metrics as training_metrics
 from MLModels.training import persistence as training_persistence
 from MLModels.training import plots as training_plots
+from MLModels.training import torch_models as training_torch_models
 from sklearn.model_selection import RandomizedSearchCV, GridSearchCV
 from sklearn.ensemble import (
     RandomForestRegressor,
@@ -995,122 +995,20 @@ def _run_optuna(
     patience: int,
     task_type: str = "regression",
 ) -> Tuple[object, dict]:
-    try:
-        import optuna
-    except Exception as exc:
-        raise ImportError("optuna is required for DL hyperparameter search.") from exc
-    
-    if X_val is None or y_val is None or len(y_val) == 0:
-        raise ValueError("DL hyperparameter search requires an explicit validation split (X_val/y_val).")
-    
-    best_model = None
-    best_score = float("-inf")
-    pruned_reasons: list[str] = []
-    
-    def objective(trial: optuna.Trial) -> float:
-        nonlocal best_model, best_score
-        
-        # Sample hyperparameters from search space
-        params = {}
-        for name, spec in config.search_space.items():
-            if spec["type"] == "categorical":
-                params[name] = trial.suggest_categorical(name, spec["choices"])
-            elif spec["type"] == "float":
-                params[name] = trial.suggest_float(
-                    name, spec["low"], spec["high"], log=spec.get("log", False)
-                )
-            elif spec["type"] == "int":
-                params[name] = trial.suggest_int(
-                    name, spec["low"], spec["high"], log=spec.get("log", False)
-                )
-        
-        trial_seed = int(random_state) + int(trial.number) + 1
-        _seed_dl_runtime(trial_seed)
-        model = config.model_class(params)
-
-        # Train
-        result = _train_dl(
-            model=model,
-            X_train=X_train,
-            y_train=y_train,
-            X_val=X_val,
-            y_val=y_val,
-            epochs=int(params.get("epochs", 100)),
-            batch_size=int(params.get("batch_size", 32)),
-            learning_rate=float(params.get("learning_rate", 1e-3)),
-            patience=patience,
-            random_state=trial_seed,
-            task_type=task_type
-        )
-        
-        # Evaluate on validation set
-        trained_model = result["model"]
-
-        # Predict
-        y_pred = _predict_dl(trained_model, X_val)
-
-        if task_type == "classification":
-            try:
-                y_true, y_score = _validate_classification_metric_inputs(
-                    y_val,
-                    np.asarray(y_pred).reshape(-1),
-                    context="optuna validation scoring",
-                )
-            except ValueError as exc:
-                pruned_reasons.append(str(exc))
-                raise optuna.exceptions.TrialPruned(str(exc)) from exc
-            y_proba = 1.0 / (1.0 + np.exp(-y_score))
-            score = _safe_auc(y_true, y_proba)
-            if score is None:
-                message = "AUC undefined (single-class val set)"
-                pruned_reasons.append(message)
-                raise optuna.exceptions.TrialPruned(message)
-        else:
-            try:
-                y_true, y_hat = _validate_regression_metric_inputs(
-                    y_val,
-                    y_pred,
-                    context="optuna validation scoring",
-                )
-            except ValueError as exc:
-                pruned_reasons.append(str(exc))
-                raise optuna.exceptions.TrialPruned(str(exc)) from exc
-            score = float(r2_score(y_true, y_hat))
-
-        # Track best
-        if score > best_score:
-            best_score = score
-            best_model = trained_model
-            logging.info(f"New best score={score:.4f} with params: {params}")
-        
-        import gc
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-        del model, result, y_pred
-        gc.collect()
-        
-        return score # Optuna maximizes by default when direction="maximize"
-    
-    # Create and run study
-    sampler = optuna.samplers.TPESampler(seed=random_state)
-    study = optuna.create_study(direction="maximize", sampler=sampler)
-    study.optimize(objective, n_trials=max_evals, show_progress_bar=True)
-
-    if best_model is None:
-        detail = pruned_reasons[-1] if pruned_reasons else "no completed trials"
-        raise ValueError(
-            "DL hyperparameter search completed no valid trials; "
-            f"last prune reason: {detail}"
-        )
-
-    best_params = study.best_params
-    logging.info(f"Optuna complete. Best score={best_score:.4f}, params={best_params}")
-    
-    return best_model, best_params
+    return training_torch_models.run_optuna(
+        config=config,
+        X_train=X_train,
+        y_train=y_train,
+        X_val=X_val,
+        y_val=y_val,
+        max_evals=max_evals,
+        random_state=random_state,
+        patience=patience,
+        task_type=task_type,
+        seed_fn=_seed_dl_runtime,
+        train_fn=_train_dl,
+        predict_fn=_predict_dl,
+    )
 
 def _initialize_model(
     model_type: str,
@@ -1558,27 +1456,11 @@ def _initialize_model(
 
 # DL training helper functions
 def _get_device():
-    import torch
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return training_torch_models.get_device()
 
 
 def _seed_dl_runtime(seed: int) -> None:
-    """Seed Python/NumPy/PyTorch for deterministic DL training."""
-    random.seed(int(seed))
-    np.random.seed(int(seed))
-    import torch
-
-    torch.manual_seed(int(seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
-    if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    if hasattr(torch, "use_deterministic_algorithms"):
-        try:
-            torch.use_deterministic_algorithms(True, warn_only=True)
-        except TypeError:
-            torch.use_deterministic_algorithms(True)
+    training_torch_models.seed_dl_runtime(seed)
 
 
 def _is_dl_model(model_type: str) -> bool:
@@ -1596,95 +1478,22 @@ def _train_dl(
     random_state: int = 42,
     task_type: str = "regression",
     ) -> Dict[str, Any]:
-    """Train a PyTorch model. Returns dict with model and best_params."""
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import TensorDataset, DataLoader
-    device = _get_device()
-    model = model.to(device)
-    
-    X_t = torch.tensor(X_train, dtype=torch.float32, device=device)
-    # y_t = torch.tensor(np.asarray(y_train).reshape(-1, 1), dtype=torch.float32, device=device)
-
-    if X_val is None or y_val is None:
-        raise ValueError("DL training requires X_val/y_val for early stopping.")
-    X_val_t = torch.tensor(X_val, dtype=torch.float32, device=device)
-    # y_val_t = torch.tensor(np.asarray(y_val).reshape(-1, 1), dtype=torch.float32, device=device)
-
-    if task_type == "classification":
-        y_t = torch.tensor(np.asarray(y_train).reshape(-1), dtype=torch.float32, device=device)
-        y_val_t = torch.tensor(np.asarray(y_val).reshape(-1), dtype=torch.float32, device=device)
-        criterion = nn.BCEWithLogitsLoss()
-    else:
-        y_t = torch.tensor(np.asarray(y_train).reshape(-1, 1), dtype=torch.float32, device=device)
-        y_val_t = torch.tensor(np.asarray(y_val).reshape(-1, 1), dtype=torch.float32, device=device)
-        criterion = nn.MSELoss()
-    
-    dl_generator = torch.Generator()
-    dl_generator.manual_seed(int(random_state))
-    loader = DataLoader(
-        TensorDataset(X_t, y_t),
+    return training_torch_models.train_dl(
+        model=model,
+        X_train=X_train,
+        y_train=y_train,
+        X_val=X_val,
+        y_val=y_val,
+        epochs=epochs,
         batch_size=batch_size,
-        shuffle=True,
-        generator=dl_generator,
+        learning_rate=learning_rate,
+        patience=patience,
+        random_state=random_state,
+        task_type=task_type,
     )
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    # criterion = nn.MSELoss()
-    
-    best_loss, best_state, wait = float('inf'), None, 0
-    
-    for epoch in range(1, epochs + 1):
-        model.train()
-        for bx, by in loader:
-            optimizer.zero_grad()
-            # loss = criterion(model(bx).view(-1, 1), by)
-            out = model(bx)
-            if task_type == "classification":
-                loss = criterion(out.view(-1), by.view(-1))
-            else:
-                loss = criterion(out.view(-1, 1), by)
-            loss.backward()
-            optimizer.step()
-        
-        model.eval()
-        with torch.no_grad():
-            # val_loss = criterion(model(X_val_t).view(-1, 1), y_val_t).item()
-            outv = model(X_val_t)
-            if task_type == "classification":
-                val_loss = criterion(outv.view(-1), y_val_t.view(-1)).item()
-            else:
-                val_loss = criterion(outv.view(-1, 1), y_val_t).item()
-        
-        if val_loss < best_loss - 1e-6:
-            best_loss = val_loss
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            wait = 0
-            if epoch % 20 == 0:
-                logging.info(f"[Epoch {epoch}] New best val_loss={val_loss:.4f}")
-        else:
-            wait += 1
-            if wait >= patience:
-                logging.info(f"Early stopping at epoch {epoch}")
-                break
-    
-    if best_state:
-        model.load_state_dict(best_state)
-    
-    return {"model": model, "best_params": {"epochs": epochs, "batch_size": batch_size, "learning_rate": learning_rate}}
 
 def _predict_dl(model, X: np.ndarray, batch_size: int = 64) -> np.ndarray:
-    """Predict with a PyTorch model."""
-    import torch
-    device = _get_device()
-    model = model.to(device).eval()
-    X_t = torch.tensor(X, dtype=torch.float32, device=device)
-    
-    preds = []
-    with torch.no_grad():
-        for i in range(0, len(X_t), batch_size):
-            out = model(X_t[i:i + batch_size]).cpu().numpy().flatten()
-            preds.append(out)
-    return np.concatenate(preds)
+    return training_torch_models.predict_dl(model=model, X=X, batch_size=batch_size)
 
 
 def train_model(

@@ -17,6 +17,8 @@ This package contains modular training utilities used by `MLModels/train_models.
   - Plot and artifact writers for ROC/PR/confusion/split-metrics/parity plots.
 - `persistence.py`
   - Model/metrics/params persistence helpers (`joblib`, JSON, torch state dict).
+- `torch_models.py`
+  - PyTorch DL helpers for device selection, deterministic seeding, training, prediction, and Optuna tuning.
 - `__init__.py`
   - Package exports for the modules above.
 
