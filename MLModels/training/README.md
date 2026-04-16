@@ -44,6 +44,37 @@ This package contains modular training utilities used by `MLModels/train_models.
 
 Current workflows still call through `MLModels.train_models`. You can also call the package API directly:
 
+### Quickstart (CLI)
+
+Use the bundled CLI for a Chemprop-style workflow:
+
+```bash
+python -m MLModels.training.cli train \
+  --data-path tests/fixtures/data/training_cli_quickstart_regression.csv \
+  --target-column target \
+  --model-type random_forest \
+  --task-type regression \
+  --output-dir runs/cli_quickstart
+```
+
+```bash
+python -m MLModels.training.cli predict \
+  --test-path tests/fixtures/data/training_cli_quickstart_regression.csv \
+  --target-column target \
+  --model-path runs/cli_quickstart/random_forest_best_model.pkl \
+  --model-type random_forest \
+  --task-type regression \
+  --preds-path runs/cli_quickstart/predictions.csv
+```
+
+Top-level CLI help:
+
+```bash
+python -m MLModels.training.cli --help
+```
+
+### Usage (Python API)
+
 ```python
 from MLModels.training.api import DatasetSplit, TrainSpec, train
 

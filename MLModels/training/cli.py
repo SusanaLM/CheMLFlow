@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,10 @@ from sklearn.model_selection import train_test_split
 
 from MLModels import train_models
 from MLModels.training import api as training_api
+
+
+class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
+    pass
 
 
 def _resolve_target_column(df: pd.DataFrame, target_column: str) -> str:
@@ -246,11 +251,30 @@ def _cmd_explain(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="chemlflow-training",
-        description="CheMLFlow training CLI (thin wrapper over MLModels.training API).",
+        description=(
+            "Train, predict, and explain models with CheMLFlow.\n"
+            "This CLI is a thin wrapper over MLModels.training.api."
+        ),
+        formatter_class=_HelpFormatter,
+        epilog=textwrap.dedent(
+            """\
+            Quickstart examples:
+              python -m MLModels.training.cli train --data-path tests/fixtures/data/training_cli_quickstart_regression.csv --target-column target --model-type random_forest --task-type regression --output-dir runs/cli_quickstart
+              python -m MLModels.training.cli predict --test-path tests/fixtures/data/training_cli_quickstart_regression.csv --target-column target --model-path runs/cli_quickstart/random_forest_best_model.pkl --model-type random_forest --task-type regression --preds-path runs/cli_quickstart/predictions.csv
+            """
+        ),
     )
-    subparsers = parser.add_subparsers(dest="command")
+    subparsers = parser.add_subparsers(dest="command", metavar="{train,predict,explain}")
 
-    train_parser = subparsers.add_parser("train", help="Train a model from a CSV file.")
+    train_parser = subparsers.add_parser(
+        "train",
+        help="Train a model from a CSV file.",
+        description=(
+            "Train a model from one CSV. The target column is removed from features.\n"
+            "For chemprop, this command uses row-index split IDs and forwards to train_chemprop_model."
+        ),
+        formatter_class=_HelpFormatter,
+    )
     train_parser.add_argument("--data-path", required=True, help="Input CSV path.")
     train_parser.add_argument("--target-column", required=True, help="Target column name.")
     train_parser.add_argument("--model-type", required=True, help="Model type (e.g., random_forest, dl_simple, chemprop).")
@@ -272,7 +296,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train_parser.set_defaults(func=_cmd_train)
 
-    predict_parser = subparsers.add_parser("predict", help="Run prediction using a saved model.")
+    predict_parser = subparsers.add_parser(
+        "predict",
+        help="Run prediction using a saved model.",
+        description="Load a saved model and write predictions for a CSV file.",
+        formatter_class=_HelpFormatter,
+    )
     predict_parser.add_argument("--test-path", required=True, help="CSV file for inference.")
     predict_parser.add_argument("--model-path", required=True, help="Saved model path.")
     predict_parser.add_argument("--model-type", required=True, help="Model type used during training.")
@@ -282,7 +311,12 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--input-dim", type=int, default=None, help="Optional input dimension override for DL models.")
     predict_parser.set_defaults(func=_cmd_predict)
 
-    explain_parser = subparsers.add_parser("explain", help="Generate explainability artifacts.")
+    explain_parser = subparsers.add_parser(
+        "explain",
+        help="Generate explainability artifacts.",
+        description="Generate permutation importance and SHAP artifacts using a saved model.",
+        formatter_class=_HelpFormatter,
+    )
     explain_parser.add_argument("--train-path", required=True, help="Training CSV path for background/features.")
     explain_parser.add_argument("--test-path", required=True, help="Test CSV path for explainability.")
     explain_parser.add_argument("--target-column", required=True, help="Target column name.")
