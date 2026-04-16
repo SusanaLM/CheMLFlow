@@ -1,17 +1,16 @@
 import json
 import os
 import logging
-import shutil
-import inspect
 import re
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any, Callable
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 from MLModels.training import config as training_config
+from MLModels.training import chemprop_models as training_chemprop_models
+from MLModels.training import explainability as training_explainability
 from MLModels.training import model_factory as training_model_factory
 from MLModels.training import metrics as training_metrics
 from MLModels.training import persistence as training_persistence
@@ -20,9 +19,7 @@ from MLModels.training import torch_models as training_torch_models
 from sklearn.metrics import (
     r2_score,
     mean_absolute_error,
-    accuracy_score,
 )
-from sklearn.inspection import permutation_importance
 
 _ROW_INDEX_COL = "__row_index"
 
@@ -520,460 +517,35 @@ def train_chemprop_model(
     task_type: str = "classification",
     model_config: Dict[str, Any] | None = None,
 ) -> Tuple[object, TrainResult]:
-    """Train a Chemprop D-MPNN model in-process (no CLI/subprocess).
-
-    This path is intentionally SMILES-native. It supports both classification and
-    regression tasks and expects the curated dataset to include a `canonical_smiles`
-    column (or an override via model_config.smiles_column).
-
-    Artifacts written (consistent with other trainers):
-    - <output_dir>/chemprop_best_model.ckpt
-    - <output_dir>/chemprop_best_params.pkl
-    - <output_dir>/chemprop_metrics.json
-    - <output_dir>/chemprop_predictions.csv
-    """
-    _ensure_dir(output_dir)
-    _require_chemprop()
-    model_config = model_config or {}
-    foundation_mode, foundation_checkpoint, freeze_encoder = _resolve_chemprop_foundation_config(model_config)
-
-    smiles_column = model_config.get("smiles_column", "canonical_smiles")
-    if smiles_column not in curated_df.columns:
-        raise ValueError(
-            f"chemprop requires smiles_column={smiles_column!r} in curated_df. "
-            "Ensure curate emits canonical_smiles or override model.smiles_column."
-        )
-    if target_column not in curated_df.columns:
-        raise ValueError(f"Target column {target_column!r} not found in curated_df.")
-
-    df = curated_df.reset_index(drop=True).copy()
-    allow_legacy_split_positions = _as_bool(model_config.get("allow_legacy_split_positions", False))
-    tr_idx, va_idx, te_idx, row_ids = _resolve_chemprop_split_positions(
-        df,
-        split_indices,
+    return training_chemprop_models.train_chemprop_model(
+        curated_df=curated_df,
+        target_column=target_column,
+        split_indices=split_indices,
+        output_dir=output_dir,
+        random_state=random_state,
+        task_type=task_type,
+        model_config=model_config,
         row_index_col=_ROW_INDEX_COL,
-        allow_legacy_positions=allow_legacy_split_positions,
+        ensure_dir=_ensure_dir,
+        require_chemprop=_require_chemprop,
+        resolve_chemprop_foundation_config=_resolve_chemprop_foundation_config,
+        as_bool=_as_bool,
+        resolve_chemprop_split_positions=_resolve_chemprop_split_positions,
+        ensure_binary_labels=_ensure_binary_labels,
+        resolve_chemprop_predictor_ctor=_resolve_chemprop_predictor_ctor,
+        validate_classification_score_values=_validate_classification_score_values,
+        sigmoid=_sigmoid,
+        classification_metrics_from_outputs=_classification_metrics_from_outputs,
+        validate_regression_metric_inputs=_validate_regression_metric_inputs,
+        safe_r2=_safe_r2,
+        safe_mae=_safe_mae,
+        save_split_metrics_artifacts=_save_split_metrics_artifacts,
+        save_classification_split_plots=_save_classification_split_plots,
+        save_regression_parity_plots=_save_regression_parity_plots,
+        save_params=training_persistence.save_params,
+        save_metrics_json=lambda metrics, path: training_persistence.save_metrics_json(metrics, path, indent=2),
+        train_result_cls=TrainResult,
     )
-    if not tr_idx or not te_idx:
-        raise ValueError("chemprop training requires non-empty train and test splits.")
-    if not va_idx:
-        raise ValueError(
-            "chemprop training requires an explicit validation split from the split node. "
-            "Set split.val_size > 0."
-        )
-    if task_type == "classification":
-        y_all = _ensure_binary_labels(df[target_column]).astype(int)
-    else:
-        y_all = pd.to_numeric(df[target_column], errors="coerce")
-        if y_all.isna().any():
-            raise ValueError(
-                "chemprop regression requires numeric target values; "
-                f"found non-numeric entries in target_column={target_column!r}."
-            )
-    # Keep stable row identifiers for prediction joins/debugging.
-    df["_row_id"] = row_ids
-    df["_label"] = y_all.reset_index(drop=True)
-
-    # Hyperparameters.
-    params = dict(model_config.get("params", {}))
-    batch_size = int(params.get("batch_size", 64))
-    max_epochs = int(params.get("max_epochs", 30))
-    max_lr = float(params.get("max_lr", params.get("lr", 1e-3)))
-    init_lr = float(params.get("init_lr", max_lr / 10.0))
-    final_lr = float(params.get("final_lr", max_lr / 10.0))
-    ff_hidden = int(params.get("ffn_hidden_dim", 300))
-    mp_hidden = int(params.get("mp_hidden_dim", 300))
-    depth = int(params.get("mp_depth", 3))
-    plot_split_performance = _as_bool(model_config.get("plot_split_performance", False))
-
-    # Under pytest we aggressively shrink runtime unless explicitly overridden.
-    if os.environ.get("PYTEST_CURRENT_TEST") and "max_epochs" not in params:
-        max_epochs = 2
-
-    logging.info(
-        "Training start (chemprop): task=%s N=%s train=%s val=%s test=%s",
-        task_type,
-        len(df),
-        len(tr_idx),
-        len(va_idx),
-        len(te_idx),
-    )
-
-    # Chemprop python API (v2). Keep imports local so base installs don't require chemprop deps.
-    import numpy as _np
-    import torch
-    from lightning import pytorch as pl
-    from lightning.pytorch import Trainer
-    from lightning.pytorch.callbacks import ModelCheckpoint
-
-    from chemprop import data, featurizers, models, nn
-
-    pl.seed_everything(int(random_state), workers=True)
-
-    def _to_datapoints(rows: pd.DataFrame) -> list:
-        points = []
-        for smi, y in zip(rows[smiles_column].astype(str).tolist(), rows["_label"].tolist()):
-            points.append(data.MoleculeDatapoint.from_smi(smi, y=_np.array([float(y)], dtype=_np.float32)))
-        return points
-
-    all_points = _to_datapoints(df)
-    # Avoid chemprop split API differences by slicing datapoints directly with pipeline indices.
-    train_points = [all_points[i] for i in tr_idx]
-    val_points = [all_points[i] for i in va_idx]
-    test_points = [all_points[i] for i in te_idx]
-
-    mol_featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
-    train_data = data.MoleculeDataset(train_points, featurizer=mol_featurizer)
-    val_data = data.MoleculeDataset(val_points, featurizer=mol_featurizer)
-    test_data = data.MoleculeDataset(test_points, featurizer=mol_featurizer)
-    if hasattr(data, "build_dataloader"):
-        train_loader = data.build_dataloader(
-            train_data,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=0,
-        )
-        train_eval_loader = data.build_dataloader(
-            train_data,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,
-        )
-        val_loader = data.build_dataloader(
-            val_data,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,
-        )
-        test_loader = data.build_dataloader(
-            test_data,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,
-        )
-    else:
-        train_loader = data.MolGraphDataLoader(
-            train_data, mol_featurizer, batch_size=batch_size, shuffle=True, num_workers=0
-        )
-        train_eval_loader = data.MolGraphDataLoader(
-            train_data, mol_featurizer, batch_size=batch_size, shuffle=False, num_workers=0
-        )
-        val_loader = data.MolGraphDataLoader(
-            val_data, mol_featurizer, batch_size=batch_size, shuffle=False, num_workers=0
-        )
-        test_loader = data.MolGraphDataLoader(
-            test_data, mol_featurizer, batch_size=batch_size, shuffle=False, num_workers=0
-        )
-
-    import inspect
-
-    foundation_hparams: Dict[str, Any] | None = None
-    if foundation_mode == "chemeleon":
-        assert foundation_checkpoint is not None  # validated by _resolve_chemprop_foundation_config
-        payload = torch.load(foundation_checkpoint, map_location="cpu", weights_only=True)
-        if not isinstance(payload, dict):
-            raise ValueError(
-                f"Invalid CheMeleon checkpoint payload in {foundation_checkpoint}: expected dict."
-            )
-        if "hyper_parameters" not in payload or "state_dict" not in payload:
-            raise ValueError(
-                f"Invalid CheMeleon checkpoint payload in {foundation_checkpoint}: expected keys 'hyper_parameters' and 'state_dict'."
-            )
-        hyper_parameters = payload["hyper_parameters"]
-        state_dict = payload["state_dict"]
-        if not isinstance(hyper_parameters, dict):
-            raise ValueError(
-                f"Invalid CheMeleon checkpoint payload in {foundation_checkpoint}: 'hyper_parameters' must be a dict."
-            )
-        foundation_hparams = hyper_parameters
-        mp = nn.BondMessagePassing(**hyper_parameters)
-        mp.load_state_dict(state_dict)
-        if freeze_encoder:
-            for param in mp.parameters():
-                param.requires_grad = False
-            # Keep frozen encoder layers in eval mode to avoid stochastic behavior.
-            mp.eval()
-        logging.info(
-            "Chemprop foundation init: mode=%s checkpoint=%s freeze_encoder=%s",
-            foundation_mode,
-            foundation_checkpoint,
-            freeze_encoder,
-        )
-    else:
-        mp = nn.BondMessagePassing(d_h=mp_hidden, depth=depth)
-
-    mp_output_dim = int(getattr(mp, "output_dim", mp_hidden))
-    configured_or_ckpt_depth = (
-        foundation_hparams.get("depth")
-        if isinstance(foundation_hparams, dict) and "depth" in foundation_hparams
-        else depth
-    )
-    mp_depth_effective = int(getattr(mp, "depth", configured_or_ckpt_depth))
-    agg = nn.MeanAggregation()
-
-    predictor_ctor = _resolve_chemprop_predictor_ctor(nn, task_type)
-
-    # Chemprop FFN constructors changed across versions:
-    # - older: *(..., d_mp=..., d_h=...)
-    # - newer: *(..., input_dim=..., hidden_dim=...)
-    ffn_sig = inspect.signature(predictor_ctor.__init__)
-    ffn_kwargs: Dict[str, Any] = {"n_tasks": 1}
-    if "d_mp" in ffn_sig.parameters:
-        ffn_kwargs["d_mp"] = mp_output_dim
-    if "input_dim" in ffn_sig.parameters:
-        ffn_kwargs["input_dim"] = mp_output_dim
-    if "d_h" in ffn_sig.parameters:
-        ffn_kwargs["d_h"] = ff_hidden
-    if "hidden_dim" in ffn_sig.parameters:
-        ffn_kwargs["hidden_dim"] = ff_hidden
-    ffn = predictor_ctor(**ffn_kwargs)
-    mpnn = models.MPNN(
-        message_passing=mp,
-        agg=agg,
-        predictor=ffn,
-        batch_norm=False,
-        metrics=None,
-        init_lr=init_lr,
-        max_lr=max_lr,
-        final_lr=final_lr,
-    )
-
-    checkpointing = ModelCheckpoint(
-        dirpath=output_dir,
-        filename="chemprop-best-{epoch:02d}-{val_loss:.4f}",
-        monitor="val_loss",
-        mode="min",
-        save_top_k=1,
-        save_last=True,
-    )
-    callbacks = [checkpointing]
-    if foundation_mode == "chemeleon" and freeze_encoder:
-        from lightning.pytorch.callbacks import Callback
-
-        class _FrozenEncoderEvalCallback(Callback):
-            """Keep frozen encoder modules in eval mode across Lightning train/eval toggles."""
-
-            def on_train_epoch_start(self, trainer, pl_module) -> None:  # type: ignore[override]
-                for attr_name in ("message_passing", "mp", "encoder"):
-                    module = getattr(pl_module, attr_name, None)
-                    if isinstance(module, torch.nn.Module):
-                        module.eval()
-
-        callbacks.append(_FrozenEncoderEvalCallback())
-    trainer = Trainer(
-        max_epochs=max_epochs,
-        logger=False,
-        enable_checkpointing=True,
-        enable_progress_bar=False,
-        deterministic=True,
-        accelerator="auto",
-        devices=1,
-        callbacks=callbacks,
-    )
-    trainer.fit(mpnn, train_dataloaders=train_loader, val_dataloaders=val_loader)
-
-    # Predict outputs from the best checkpoint.
-    def _extract_tensor(obj):
-        if isinstance(obj, torch.Tensor):
-            return obj
-        if isinstance(obj, (list, tuple)) and obj:
-            return _extract_tensor(obj[0])
-        if isinstance(obj, dict) and obj:
-            # Best-effort: common key, else first value.
-            if "preds" in obj:
-                return _extract_tensor(obj["preds"])
-            return _extract_tensor(next(iter(obj.values())))
-        raise TypeError(f"Unsupported prediction batch type: {type(obj)!r}")
-
-    def _predict_batches(loader):
-        try:
-            return trainer.predict(dataloaders=loader, ckpt_path="best", weights_only=False)
-        except TypeError:
-            # Backward compatibility with older Lightning signatures.
-            return trainer.predict(dataloaders=loader, ckpt_path="best")
-
-    def _predict_values(loader, *, context: str) -> np.ndarray:
-        pred_batches = _predict_batches(loader)
-        if isinstance(pred_batches, list):
-            preds_t = torch.cat(
-                [_extract_tensor(p).detach().cpu().reshape(-1, 1) for p in pred_batches],
-                dim=0,
-            )
-            preds = preds_t.numpy().reshape(-1)
-        else:
-            preds = _extract_tensor(pred_batches).detach().cpu().numpy().reshape(-1)
-        preds = preds.astype(float)
-        if task_type == "classification":
-            preds = _validate_classification_score_values(
-                preds,
-                context=f"{context}: raw classification scores",
-            )
-            if preds.size > 0 and (np.nanmin(preds) < 0.0 or np.nanmax(preds) > 1.0):
-                # Some configs may emit logits; convert to probabilities for metrics.
-                preds = _sigmoid(preds)
-            preds = _validate_classification_score_values(
-                preds,
-                context=f"{context}: classification probabilities",
-            )
-        return preds
-
-    preds = _predict_values(test_loader, context="chemprop test scoring")
-
-    metrics = {
-        "max_epochs": int(max_epochs),
-        "batch_size": int(batch_size),
-        "init_lr": float(init_lr),
-        "max_lr": float(max_lr),
-        "final_lr": float(final_lr),
-        "mp_hidden_dim": int(mp_output_dim),
-        "mp_depth": int(mp_depth_effective),
-        "ffn_hidden_dim": int(ff_hidden),
-        "foundation": foundation_mode,
-        "foundation_checkpoint": foundation_checkpoint,
-        "freeze_encoder": bool(freeze_encoder),
-    }
-    if task_type == "classification":
-        y_true, preds, y_pred, classification_metrics = _classification_metrics_from_outputs(
-            df.loc[te_idx, "_label"].to_numpy(dtype=int),
-            preds,
-            (preds >= 0.5).astype(int),
-            context="chemprop test scoring",
-        )
-        metrics.update(classification_metrics)
-    else:
-        y_true, y_pred = _validate_regression_metric_inputs(
-            df.loc[te_idx, "_label"].to_numpy(dtype=float),
-            preds.astype(float),
-            context="chemprop test scoring",
-        )
-        metrics.update(
-            {
-                "r2": float(r2_score(y_true, y_pred)),
-                "mae": float(mean_absolute_error(y_true, y_pred)),
-            }
-        )
-    if plot_split_performance:
-        train_preds = _predict_values(train_eval_loader, context="chemprop train scoring")
-        val_preds = _predict_values(val_loader, context="chemprop val scoring")
-        if task_type == "classification":
-            train_y, train_preds, train_pred_labels, train_metrics = _classification_metrics_from_outputs(
-                df.loc[tr_idx, "_label"].to_numpy(dtype=int),
-                train_preds,
-                (train_preds >= 0.5).astype(int),
-                context="chemprop train scoring",
-            )
-            val_y, val_preds, val_pred_labels, val_metrics = _classification_metrics_from_outputs(
-                df.loc[va_idx, "_label"].to_numpy(dtype=int),
-                val_preds,
-                (val_preds >= 0.5).astype(int),
-                context="chemprop val scoring",
-            )
-            split_metrics: Dict[str, Dict[str, float | None]] = {
-                "train": train_metrics,
-                "val": val_metrics,
-                "test": {
-                    "auc": metrics["auc"],
-                    "auprc": metrics["auprc"],
-                    "accuracy": metrics["accuracy"],
-                    "f1": metrics["f1"],
-                },
-            }
-        else:
-            train_y = df.loc[tr_idx, "_label"].to_numpy(dtype=float)
-            val_y = df.loc[va_idx, "_label"].to_numpy(dtype=float)
-            split_metrics = {
-                "train": {"r2": _safe_r2(train_y, train_preds), "mae": _safe_mae(train_y, train_preds)},
-                "val": {"r2": _safe_r2(val_y, val_preds), "mae": _safe_mae(val_y, val_preds)},
-                "test": {"r2": metrics["r2"], "mae": metrics["mae"]},
-            }
-        split_metrics_path, split_plot_path = _save_split_metrics_artifacts(
-            output_dir,
-            "chemprop",
-            split_metrics,
-        )
-        if split_metrics_path:
-            metrics["split_metrics_path"] = split_metrics_path
-        if split_plot_path:
-            metrics["split_metrics_plot_path"] = split_plot_path
-        if task_type == "classification":
-            metrics.update(
-                _save_classification_split_plots(
-                    output_dir,
-                    "chemprop",
-                    {
-                        "train": {
-                            "y_true": train_y,
-                            "y_proba": train_preds,
-                            "y_pred": train_pred_labels,
-                        },
-                        "val": {
-                            "y_true": val_y,
-                            "y_proba": val_preds,
-                            "y_pred": val_pred_labels,
-                        },
-                        "test": {
-                            "y_true": y_true,
-                            "y_proba": preds,
-                            "y_pred": y_pred,
-                        },
-                    },
-                )
-            )
-        else:
-            parity_paths = _save_regression_parity_plots(
-                output_dir,
-                "chemprop",
-                {
-                    "train": (train_y, train_preds),
-                    "val": (val_y, val_preds),
-                    "test": (y_true, y_pred),
-                },
-            )
-            for split_name, path in parity_paths.items():
-                metrics[f"parity_plot_{split_name}_path"] = path
-
-    # Save artifacts.
-    model_path = os.path.join(output_dir, "chemprop_best_model.ckpt")
-    best_model_path = checkpointing.best_model_path
-    if best_model_path and os.path.isfile(best_model_path):
-        shutil.copyfile(best_model_path, model_path)
-    else:
-        trainer.save_checkpoint(model_path)
-    params_path = os.path.join(output_dir, "chemprop_best_params.pkl")
-    metrics_path = os.path.join(output_dir, "chemprop_metrics.json")
-    best_params = {
-        "batch_size": batch_size,
-        "max_epochs": max_epochs,
-        "init_lr": init_lr,
-        "max_lr": max_lr,
-        "final_lr": final_lr,
-        "mp_hidden_dim": mp_output_dim,
-        "mp_depth": mp_depth_effective,
-        "ffn_hidden_dim": ff_hidden,
-        "foundation": foundation_mode,
-        "foundation_checkpoint": foundation_checkpoint,
-        "freeze_encoder": bool(freeze_encoder),
-    }
-    training_persistence.save_params(best_params, params_path)
-    training_persistence.save_metrics_json(metrics, metrics_path, indent=2)
-
-    pred_path = os.path.join(output_dir, "chemprop_predictions.csv")
-    out_pred = df.loc[te_idx, ["_row_id", smiles_column, target_column]].copy()
-    out_pred.rename(columns={target_column: "y_true", smiles_column: "smiles"}, inplace=True)
-    out_pred["y_pred"] = y_pred
-    if task_type == "classification":
-        out_pred["y_proba"] = preds
-    out_pred.to_csv(pred_path, index=False)
-
-    report_keys = ["auc", "auprc", "accuracy", "f1"] if task_type == "classification" else ["r2", "mae"]
-    logging.info(
-        "Training complete (chemprop): task=%s metrics=%s",
-        task_type,
-        {k: metrics[k] for k in report_keys},
-    )
-    logging.info("Artifacts: model=%s metrics=%s params=%s preds=%s", model_path, metrics_path, params_path, pred_path)
-
-    return mpnn, TrainResult(model_path, params_path, metrics_path)
 
 def _run_optuna(
     config: DLSearchConfig,
@@ -1488,143 +1060,23 @@ def run_explainability(
     background_samples: int = 100,
     task_type: str = "regression",
 ) -> None:
-    _ensure_dir(output_dir)
-    if task_type == "classification":
-        y_test = _ensure_binary_labels(y_test)
-    is_dl = model_type.startswith("dl_")
-    n_jobs = _resolve_n_jobs()
-    X_train, X_test = _maybe_apply_xgboost_feature_map_for_explain(
-        model_type=model_type,
-        output_dir=output_dir,
+    training_explainability.run_explainability(
+        estimator=estimator,
         X_train=X_train,
         X_test=X_test,
+        y_test=y_test,
+        model_type=model_type,
+        output_dir=output_dir,
+        background_samples=background_samples,
+        task_type=task_type,
+        ensure_dir=_ensure_dir,
+        ensure_binary_labels=_ensure_binary_labels,
+        resolve_n_jobs=_resolve_n_jobs,
+        maybe_apply_xgboost_feature_map_for_explain=_maybe_apply_xgboost_feature_map_for_explain,
+        get_device=_get_device,
+        predict_dl=_predict_dl,
+        validate_classification_score_values=_validate_classification_score_values,
+        sigmoid=_sigmoid,
+        safe_auc=_safe_auc,
+        validate_regression_metric_inputs=_validate_regression_metric_inputs,
     )
-
-    try:
-        import shap
-    except Exception as exc:
-        logging.warning("SHAP is not available; skipping SHAP explainability. %s", exc)
-        return
-
-    if is_dl:
-        import torch
-        class _SklearnWrapper:
-            def __init__(self, model, task_type: str):
-                self.model = model
-                self.task_type = task_type
-
-            def fit(self, X, y):
-                return self
-
-            def predict(self, X):
-                y_out = _predict_dl(self.model, X.values if hasattr(X, "values") else X)
-                if self.task_type == "classification":
-                    scores = _validate_classification_score_values(
-                        y_out,
-                        context="dl explainability prediction",
-                    )
-                    proba = _sigmoid(scores)
-                    return (proba >= 0.5).astype(int)
-                return y_out
-
-            def predict_proba(self, X):
-                y_out = _predict_dl(self.model, X.values if hasattr(X, "values") else X)
-                scores = _validate_classification_score_values(
-                    y_out,
-                    context="dl explainability prediction",
-                )
-                proba = _sigmoid(scores)
-                return np.vstack([1.0 - proba, proba]).T
-
-            def score(self, X, y):
-                y_true = np.asarray(y).reshape(-1)
-                if self.task_type == "classification":
-                    y_true = _ensure_binary_labels(pd.Series(y_true)).to_numpy(dtype=int)
-                    proba = self.predict_proba(X)[:, 1]
-                    auc = _safe_auc(y_true, proba)
-                    if auc is None:
-                        pred = (proba >= 0.5).astype(int)
-                        return float(accuracy_score(y_true, pred))
-                    return float(auc)
-                y_pred = _predict_dl(self.model, X.values if hasattr(X, "values") else X)
-                y_true, y_pred = _validate_regression_metric_inputs(
-                    y_true,
-                    y_pred,
-                    context="dl permutation importance scoring",
-                )
-                return float(r2_score(y_true, y_pred))
-        
-        wrapped_estimator = _SklearnWrapper(estimator, task_type=task_type)
-        result = permutation_importance(
-            wrapped_estimator, X_test, y_test, n_repeats=10, random_state=42, n_jobs=1
-        )
-    else:
-        scoring = "roc_auc" if task_type == "classification" else None
-        result = permutation_importance(
-            estimator, X_test, y_test, n_repeats=10, random_state=42, n_jobs=n_jobs, scoring=scoring
-        )
-
-
-    importance_df = pd.DataFrame(
-        {"feature": X_test.columns, "importance": result.importances_mean}
-    ).sort_values(by="importance", ascending=False)
-    importance_path = os.path.join(output_dir, f"{model_type}_permutation_importance.csv")
-    importance_df.to_csv(importance_path, index=False)
-
-    plt.figure(figsize=(10, 6))
-    importance_df.head(20).plot.bar(x="feature", y="importance")
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"{model_type}_permutation_importance.png"))
-    plt.close()
-
-    try:
-        if model_type in ["random_forest", "decision_tree", "xgboost", "catboost_classifier"]:
-            explainer = shap.TreeExplainer(estimator)
-            shap_values = explainer.shap_values(X_test)
-            if task_type == "classification" and isinstance(shap_values, list) and len(shap_values) == 2:
-                shap_values = shap_values[1]
-        
-        elif model_type == "ensemble":
-            explainer = shap.Explainer(estimator.predict, X_test.iloc[:background_samples])
-            shap_values = explainer(X_test)
-        
-        elif model_type == "svm":
-            background = shap.sample(X_test, min(background_samples, len(X_test)))
-            explainer = shap.KernelExplainer(estimator.predict, background)
-            X_explain = X_test.iloc[:min(100, len(X_test))]
-            shap_values = explainer.shap_values(X_explain)
-            X_test = X_explain 
-        
-        elif model_type.startswith("dl_"): 
-            device = _get_device()
-            estimator.to(device).eval()
-            
-            n_bg = min(background_samples, len(X_train))
-            n_ex = min(100, len(X_test))
-            
-            # Convert to numpy arrays for SHAP
-            # X_bg_np = X_train.iloc[:n_bg].values.astype(np.float32)
-            X_bg_np = X_train.sample(n=n_bg, random_state=42).values.astype(np.float32)
-            X_ex_np = X_test.iloc[:n_ex].values.astype(np.float32)
-            
-            # Use KernelExplainer
-            def model_predict(X):
-                out = _predict_dl(estimator, X) 
-                out = np.asarray(out).reshape(-1)
-                if task_type == "classification":
-                    return out  # <-- logits
-                return out      
-            
-            explainer = shap.KernelExplainer(model_predict, X_bg_np)
-            shap_values = explainer.shap_values(X_ex_np, nsamples=100)
-            
-            X_test = X_test.iloc[:n_ex]
-
-        if hasattr(shap_values, 'values'):
-            shap_values = shap_values.values
-        plt.figure(figsize=(10, 6))
-        shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
-        plt.savefig(os.path.join(output_dir, f"{model_type}_shap_summary.png"), bbox_inches="tight")
-        plt.close()
-    except Exception as exc:
-        logging.warning("SHAP explainability failed: %s", exc)

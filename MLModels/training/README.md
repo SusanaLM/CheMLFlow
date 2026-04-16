@@ -25,6 +25,10 @@ This package contains modular training utilities used by `MLModels/train_models.
   - DL model registry for `DLSearchConfig` builders (`dl_simple`, `dl_deep`, `dl_gru`, etc.).
 - `model_factory.py`
   - Unified model initialization dispatcher used by `train_models.py`.
+- `chemprop_models.py`
+  - Chemprop/Chemeleon training implementation used by the compatibility facade.
+- `explainability.py`
+  - Permutation importance and SHAP explainability implementation.
 - `__init__.py`
   - Package exports for the modules above.
 
