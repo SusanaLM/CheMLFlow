@@ -7,6 +7,8 @@ This package contains modular training utilities used by `MLModels/train_models.
 - `api.py`
   - Public API wrappers for training workflows.
   - Provides `DatasetSplit`, `TrainSpec`, `train`, `train_from_frames`, `load`, and `run_explainability`.
+- `cli.py`
+  - Command-line interface for standalone use (`train`, `predict`, `explain`) built on top of the API.
 - `config.py`
   - Runtime config parsing and normalization helpers.
   - Includes `RuntimeTrainingOptions`, `as_bool`, `resolve_n_jobs`, and Chemprop foundation config parsing.
