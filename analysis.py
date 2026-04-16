@@ -33,6 +33,7 @@ class ChildJob:
     config_path: str | None
     profile: str | None
     model_type: str | None
+    scaler: str | None
     split_mode: str | None
     split_strategy: str | None
     scientific_config_id: str | None
@@ -47,6 +48,7 @@ class ChildJob:
 class GeneralizationRecord:
     case_name: str
     model_type: str | None
+    scaler: str | None
     split_mode: str | None
     split_strategy: str | None
     feature_input: str | None
@@ -119,6 +121,7 @@ RUN_METRIC_CSV_FIELDS = [
     "failure_reason",
     "profile",
     "model_type",
+    "scaler",
     "feature_input",
     "split_mode",
     "split_strategy",
@@ -409,6 +412,26 @@ def _infer_feature_input(config: dict[str, Any]) -> str | None:
     return "none" if "train" in nodes else None
 
 
+def _infer_scaler(config: dict[str, Any]) -> str | None:
+    scaler = str(_get_dotted(config, "preprocess.scaler", "")).strip()
+    return scaler or None
+
+
+def _infer_scaler_from_config_path(config_path: str | None) -> str | None:
+    if not config_path or yaml is None:
+        return None
+    path = Path(config_path)
+    if not path.exists():
+        return None
+    try:
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    return _infer_scaler(cfg)
+
+
 def _is_chemprop_like_model_type(model_type: str) -> bool:
     return str(model_type).strip().lower() in {"chemprop", "chemeleon"}
 
@@ -573,6 +596,7 @@ def _build_generalization_records(
         split_mode = str(_get_dotted(cfg, "split.mode", job.split_mode or "")).strip() or None
         split_strategy = str(_get_dotted(cfg, "split.strategy", job.split_strategy or "")).strip() or None
         feature_input = _infer_feature_input(cfg)
+        scaler = _infer_scaler(cfg)
         scientific_config_id = job.scientific_config_id or _scientific_config_id(cfg)
         execution_label = job.execution_label or _execution_label(cfg)
         train = split_metrics.get("train") or {}
@@ -594,6 +618,7 @@ def _build_generalization_records(
             GeneralizationRecord(
                 case_name=job.case_name or cfg_path.stem,
                 model_type=job.model_type or (model_type or None),
+                scaler=job.scaler or scaler,
                 split_mode=split_mode,
                 split_strategy=split_strategy,
                 feature_input=feature_input,
@@ -680,6 +705,7 @@ def _aggregate_generalization_records(
             GeneralizationRecord(
                 case_name=representative.case_name,
                 model_type=representative.model_type,
+                scaler=representative.scaler,
                 split_mode=representative.split_mode,
                 split_strategy=representative.split_strategy,
                 feature_input=representative.feature_input,
@@ -718,6 +744,7 @@ def _write_generalization_csv(path: Path, records: list[GeneralizationRecord]) -
                 "parent_case_id",
                 "scientific_config_id",
                 "model_type",
+                "scaler",
                 "feature_input",
                 "split_mode",
                 "split_strategy",
@@ -750,6 +777,7 @@ def _write_generalization_csv(path: Path, records: list[GeneralizationRecord]) -
                     "parent_case_id": r.parent_case_id or "",
                     "scientific_config_id": r.scientific_config_id or "",
                     "model_type": r.model_type or "",
+                    "scaler": r.scaler or "",
                     "feature_input": r.feature_input or "",
                     "split_mode": r.split_mode or "",
                     "split_strategy": r.split_strategy or "",
@@ -807,14 +835,15 @@ def _write_generalization_plot(path: Path, records: list[GeneralizationRecord], 
 
 
 def _write_model_gap_summary(path: Path, records: list[GeneralizationRecord]) -> None:
-    by_model: dict[str, list[GeneralizationRecord]] = defaultdict(list)
+    by_model: dict[tuple[str, str], list[GeneralizationRecord]] = defaultdict(list)
     for r in records:
-        by_model[r.model_type or "unknown"].append(r)
+        by_model[(r.model_type or "unknown", r.scaler or "")].append(r)
     with path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(
             fh,
             fieldnames=[
                 "model_type",
+                "scaler",
                 "n_cases",
                 "mean_gap",
                 "median_gap",
@@ -824,20 +853,22 @@ def _write_model_gap_summary(path: Path, records: list[GeneralizationRecord]) ->
             ],
         )
         writer.writeheader()
-        for model in sorted(by_model):
-            vals = sorted(r.gap_train_minus_test for r in by_model[model])
+        for model, scaler in sorted(by_model):
+            records_for_group = by_model[(model, scaler)]
+            vals = sorted(r.gap_train_minus_test for r in records_for_group)
             n = len(vals)
             mean_gap = sum(vals) / n if n else 0.0
             median_gap = vals[n // 2] if n % 2 == 1 else (vals[n // 2 - 1] + vals[n // 2]) / 2.0
             writer.writerow(
                 {
                     "model_type": model,
+                    "scaler": scaler,
                     "n_cases": n,
                     "mean_gap": mean_gap,
                     "median_gap": median_gap,
                     "max_gap": max(vals) if vals else 0.0,
-                    "overfit_count": sum(1 for r in by_model[model] if r.overfit_flag),
-                    "underfit_count": sum(1 for r in by_model[model] if r.underfit_flag),
+                    "overfit_count": sum(1 for r in records_for_group if r.overfit_flag),
+                    "underfit_count": sum(1 for r in records_for_group if r.underfit_flag),
                 }
             )
 
@@ -864,6 +895,7 @@ def _build_all_runs_metric_rows(jobs: list[ChildJob]) -> list[dict[str, Any]]:
         profile = job.profile or ""
         split_mode = job.split_mode or ""
         split_strategy = job.split_strategy or ""
+        scaler = job.scaler or ""
         feature_input = ""
         parent_case_id = job.parent_case_id or ""
         scientific_config_id = job.scientific_config_id or ""
@@ -886,6 +918,7 @@ def _build_all_runs_metric_rows(jobs: list[ChildJob]) -> list[dict[str, Any]]:
         if cfg:
             split_mode = str(_get_dotted(cfg, "split.mode", split_mode)).strip() or split_mode
             split_strategy = str(_get_dotted(cfg, "split.strategy", split_strategy)).strip() or split_strategy
+            scaler = _infer_scaler(cfg) or ""
             feature_input = _infer_feature_input(cfg) or ""
             if not scientific_config_id:
                 scientific_config_id = _scientific_config_id(cfg)
@@ -924,6 +957,7 @@ def _build_all_runs_metric_rows(jobs: list[ChildJob]) -> list[dict[str, Any]]:
                 "failure_reason": job.failure_reason or "",
                 "profile": profile,
                 "model_type": model_type,
+                "scaler": scaler,
                 "feature_input": feature_input,
                 "split_mode": split_mode,
                 "split_strategy": split_strategy,
@@ -1027,6 +1061,7 @@ def _aggregate_all_runs_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str
             "failure_reason": failure_reason,
             "profile": representative.get("profile", ""),
             "model_type": representative.get("model_type", ""),
+            "scaler": representative.get("scaler", ""),
             "feature_input": representative.get("feature_input", ""),
             "split_mode": representative.get("split_mode", ""),
             "split_strategy": representative.get("split_strategy", ""),
@@ -1213,6 +1248,7 @@ def _write_csv(path: Path, jobs: list[ChildJob]) -> None:
                 "parent_case_id",
                 "profile",
                 "model_type",
+                "scaler",
                 "split_mode",
                 "split_strategy",
                 "scientific_config_id",
@@ -1233,6 +1269,7 @@ def _write_csv(path: Path, jobs: list[ChildJob]) -> None:
                     "parent_case_id": j.parent_case_id or "",
                     "profile": j.profile or "",
                     "model_type": j.model_type or "",
+                    "scaler": j.scaler or "",
                     "split_mode": j.split_mode or "",
                     "split_strategy": j.split_strategy or "",
                     "scientific_config_id": j.scientific_config_id or "",
@@ -1361,6 +1398,7 @@ def main() -> int:
                     config_path=(manifest_by_job_id.get(job_id) or {}).get("config_path"),
                     profile=None,
                     model_type=None,
+                    scaler=_infer_scaler_from_config_path((manifest_by_job_id.get(job_id) or {}).get("config_path")),
                     split_mode=None,
                     split_strategy=None,
                     scientific_config_id=str((manifest_by_job_id.get(job_id) or {}).get("scientific_config_id", "")).strip() or None,
@@ -1376,6 +1414,7 @@ def main() -> int:
         cfg = manifest_record.get("config_path")
         case_name = _parse_case_name(cfg)
         profile, model_type, split_mode, split_strategy = _extract_case_fields(case_name)
+        scaler = _infer_scaler_from_config_path(cfg)
         state = row["state"]
         failure_reason = _derive_failure_reason(state, step_states_by_root.get(job_id, []))
         jobs.append(
@@ -1386,6 +1425,7 @@ def main() -> int:
                 config_path=cfg,
                 profile=profile,
                 model_type=model_type,
+                scaler=scaler,
                 split_mode=split_mode,
                 split_strategy=split_strategy,
                 scientific_config_id=str(manifest_record.get("scientific_config_id", "")).strip() or None,
