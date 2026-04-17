@@ -110,6 +110,11 @@ Troubleshooting:
 
     make clean
 
+## Quickstart
+
+See [docs/quickstart.md](docs/quickstart.md) for a short train-and-predict workflow using the
+standalone CheMLFlow training CLI.
+
 
 ## Running tests
 

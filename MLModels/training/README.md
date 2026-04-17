@@ -50,7 +50,7 @@ Use the bundled CLI for a Chemprop-style workflow:
 
 ```bash
 python -m MLModels.training.cli train \
-  --data-path tests/fixtures/data/training_cli_quickstart_regression.csv \
+  --data-path MLModels/training/examples/regression.csv \
   --target-column target \
   --model-type random_forest \
   --task-type regression \
@@ -59,7 +59,7 @@ python -m MLModels.training.cli train \
 
 ```bash
 python -m MLModels.training.cli predict \
-  --test-path tests/fixtures/data/training_cli_quickstart_regression.csv \
+  --test-path MLModels/training/examples/regression.csv \
   --target-column target \
   --model-path runs/cli_quickstart/random_forest_best_model.pkl \
   --model-type random_forest \
