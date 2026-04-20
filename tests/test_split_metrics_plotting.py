@@ -13,6 +13,7 @@ from analysis import (
     _infer_feature_input,
     _resolve_metrics_path,
     _resolve_split_metrics,
+    _scientific_config_id,
 )
 
 
@@ -373,6 +374,28 @@ def test_analysis_infers_smiles_native_for_historical_chemprop_runs() -> None:
     }
 
     assert _infer_feature_input(config) == "smiles_native"
+
+
+def test_analysis_scientific_config_id_ignores_artifact_retention() -> None:
+    base_config = {
+        "global": {
+            "pipeline_type": "pgp",
+            "base_dir": "/tmp/data",
+            "run_dir": "/tmp/run",
+            "artifact_retention": "full",
+            "runs": {"enabled": True, "id": "case_001"},
+        },
+        "pipeline": {
+            "nodes": ["get_data", "curate", "split", "train"],
+            "feature_input": "featurize.morgan",
+        },
+        "train": {"model": {"type": "random_forest"}},
+        "split": {"mode": "cv", "cv": {"repeat_index": 0, "fold_index": 1}},
+    }
+    audit_config = json.loads(json.dumps(base_config))
+    audit_config["global"]["artifact_retention"] = "audit_light"
+
+    assert _scientific_config_id(base_config) == _scientific_config_id(audit_config)
 
 
 def test_analysis_uses_chemprop_artifacts_for_chemeleon(tmp_path: Path) -> None:

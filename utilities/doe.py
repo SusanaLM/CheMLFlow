@@ -351,6 +351,7 @@ def _hashable_config_payload(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(global_cfg, dict):
         global_cfg.pop("base_dir", None)
         global_cfg.pop("run_dir", None)
+        global_cfg.pop("artifact_retention", None)
         runs_cfg = global_cfg.get("runs")
         if isinstance(runs_cfg, dict):
             runs_cfg.pop("id", None)
@@ -928,6 +929,10 @@ def _build_case_config(
         global_cfg["runs"]["id"] = str(merged["global.runs.id"])
     if "global.run_dir" in merged:
         global_cfg["run_dir"] = str(merged["global.run_dir"])
+    if "global.artifact_retention" in merged:
+        artifact_retention = str(merged["global.artifact_retention"]).strip()
+        if artifact_retention:
+            global_cfg["artifact_retention"] = artifact_retention
 
     config: dict[str, Any] = {
         "global": global_cfg,

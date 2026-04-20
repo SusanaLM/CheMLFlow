@@ -24,6 +24,14 @@ def test_strict_rejects_unknown_top_level_block() -> None:
         validate_config_strict(cfg, ["train"])
 
 
+def test_strict_rejects_invalid_global_artifact_retention() -> None:
+    cfg = _base_config(["train"])
+    cfg["train"] = {"model": {"type": "decision_tree"}}
+    cfg["global"]["artifact_retention"] = "tiny"
+    with pytest.raises(ConfigValidationError, match="CFG_GLOBAL_ARTIFACT_RETENTION_INVALID"):
+        validate_config_strict(cfg, ["train"])
+
+
 def test_strict_allows_analyze_block_for_analyze_node() -> None:
     cfg = _base_config(["get_data", "analyze.eda"])
     cfg["global"]["task_type"] = "classification"

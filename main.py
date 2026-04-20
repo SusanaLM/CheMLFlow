@@ -1,11 +1,13 @@
 # an example workflow that uses ChemBL bioactivty data
 import csv
+import glob
 import hashlib
 import json
 import logging
 import os
 import subprocess
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 
@@ -160,6 +162,137 @@ def _resolve_seed(global_seed: int, override: object | None = None) -> int:
     return int(override)
 
 
+def _resolve_artifact_retention(global_config: dict) -> str:
+    retention = str(
+        global_config.get("artifact_retention", _ARTIFACT_RETENTION_FULL)
+    ).strip().lower()
+    if not retention:
+        return _ARTIFACT_RETENTION_FULL
+    if retention not in _SUPPORTED_ARTIFACT_RETENTION:
+        supported = ", ".join(sorted(_SUPPORTED_ARTIFACT_RETENTION))
+        raise ValueError(f"global.artifact_retention must be one of: {supported}")
+    return retention
+
+
+def _track_heavy_artifact(context: dict, path: str) -> None:
+    if not isinstance(path, str):
+        return
+    clean = path.strip()
+    if not clean:
+        return
+    heavy = context.setdefault("_heavy_artifacts", set())
+    if not isinstance(heavy, set):
+        return
+    heavy.add(os.path.abspath(clean))
+
+
+def _track_heavy_artifact_glob(context: dict, pattern: str) -> None:
+    if not isinstance(pattern, str):
+        return
+    clean = pattern.strip()
+    if not clean:
+        return
+    globs = context.setdefault("_heavy_artifact_globs", set())
+    if not isinstance(globs, set):
+        return
+    globs.add(os.path.abspath(clean))
+
+
+def _path_is_within(path: str, roots: list[str]) -> bool:
+    abs_path = os.path.abspath(path)
+    for root in roots:
+        try:
+            if os.path.commonpath([abs_path, root]) == root:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _apply_artifact_retention(context: dict, *, run_status: str) -> None:
+    retention = str(
+        context.get("artifact_retention", _ARTIFACT_RETENTION_FULL)
+    ).strip().lower()
+    summary = {
+        "retention": retention,
+        "run_status": run_status,
+        "candidate_count": 0,
+        "deleted_count": 0,
+        "skipped_preexisting_count": 0,
+        "failed_delete_count": 0,
+        "failed_deletes": [],
+    }
+    if retention != _ARTIFACT_RETENTION_AUDIT_LIGHT:
+        context["artifact_retention_summary"] = summary
+        return
+
+    run_dir = str(context.get("run_dir", "")).strip()
+    base_dir = str(context.get("base_dir", "")).strip()
+    run_start_epoch: float | None
+    try:
+        run_start_epoch = float(context.get("run_start_epoch"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        run_start_epoch = None
+    allowed_roots = [
+        os.path.abspath(root)
+        for root in (base_dir, run_dir)
+        if isinstance(root, str) and root.strip()
+    ]
+    heavy_paths = context.get("_heavy_artifacts", set())
+    heavy_globs = context.get("_heavy_artifact_globs", set())
+    candidate_paths: set[str] = set()
+
+    if isinstance(heavy_paths, set):
+        candidate_paths.update(path for path in heavy_paths if isinstance(path, str) and path.strip())
+    if isinstance(heavy_globs, set):
+        for pattern in heavy_globs:
+            if not isinstance(pattern, str) or not pattern.strip():
+                continue
+            candidate_paths.update(glob.glob(pattern, recursive=True))
+
+    deleted_count = 0
+    skipped_preexisting_count = 0
+    failed_deletes: list[dict[str, str]] = []
+    summary["candidate_count"] = len(candidate_paths)
+    for path in sorted(candidate_paths):
+        if not os.path.isfile(path):
+            continue
+        if allowed_roots and not _path_is_within(path, allowed_roots):
+            failed_deletes.append({"path": path, "reason": "outside_allowed_roots"})
+            continue
+        if run_start_epoch is not None:
+            try:
+                if os.path.getmtime(path) + 1e-6 < run_start_epoch:
+                    skipped_preexisting_count += 1
+                    continue
+            except OSError as exc:
+                failed_deletes.append({"path": path, "reason": str(exc)})
+                continue
+        try:
+            os.remove(path)
+            deleted_count += 1
+        except OSError as exc:
+            failed_deletes.append({"path": path, "reason": str(exc)})
+
+    summary["deleted_count"] = deleted_count
+    summary["skipped_preexisting_count"] = skipped_preexisting_count
+    summary["failed_delete_count"] = len(failed_deletes)
+    summary["failed_deletes"] = failed_deletes
+    logging.info(
+        "Artifact retention '%s' applied after %s run: removed %d heavy artifact files.",
+        retention,
+        run_status,
+        deleted_count,
+    )
+    for failure in failed_deletes:
+        logging.warning(
+            "artifact retention could not remove '%s': %s",
+            failure["path"],
+            failure["reason"],
+        )
+    context["artifact_retention_summary"] = summary
+
+
 def _configure_logging(run_dir: str, level: int = logging.INFO) -> None:
     """Configure root logger to emit to stdout and to <run_dir>/run.log.
 
@@ -207,6 +340,7 @@ def _hashable_config_payload(config: dict) -> dict:
     if isinstance(global_cfg, dict):
         global_cfg.pop("base_dir", None)
         global_cfg.pop("run_dir", None)
+        global_cfg.pop("artifact_retention", None)
         runs_cfg = global_cfg.get("runs")
         if isinstance(runs_cfg, dict):
             runs_cfg.pop("id", None)
@@ -217,6 +351,12 @@ _PIPELINE_NODE_ALIASES = {
     "use.curated_features": "featurize.none",
 }
 _CHEMPROP_LIKE_MODELS = {"chemprop", "chemeleon"}
+_ARTIFACT_RETENTION_FULL = "full"
+_ARTIFACT_RETENTION_AUDIT_LIGHT = "audit_light"
+_SUPPORTED_ARTIFACT_RETENTION = {
+    _ARTIFACT_RETENTION_FULL,
+    _ARTIFACT_RETENTION_AUDIT_LIGHT,
+}
 
 
 def _canonicalize_pipeline_nodes(nodes: list[str]) -> list[str]:
@@ -514,6 +654,8 @@ def run_node_featurize_rdkit(context: dict) -> None:
     input_file = context.get("curated_path", context["paths"]["curated"])
     output_file = context["paths"]["rdkit_descriptors"]
     labeled_output_file = context["paths"]["rdkit_labeled"]
+    _track_heavy_artifact(context, output_file)
+    _track_heavy_artifact(context, labeled_output_file)
     _run_subprocess(
         [
             sys.executable,
@@ -556,6 +698,8 @@ def run_node_featurize_morgan(context: dict) -> None:
     input_file = context.get("curated_path", context["paths"]["curated"])
     output_file = context["paths"]["morgan_fingerprints"]
     labeled_output = context["paths"]["morgan_labeled"]
+    _track_heavy_artifact(context, output_file)
+    _track_heavy_artifact(context, labeled_output)
     featurize_config = context.get("featurize_config", {})
     radius = featurize_config.get("radius", 2)
     n_bits = featurize_config.get("n_bits", 2048)
@@ -1687,6 +1831,7 @@ def run_node_preprocess_features(context: dict) -> None:
 
     preprocessed_features = context["paths"]["preprocessed_features"]
     preprocessed_labels = context["paths"]["preprocessed_labels"]
+    _track_heavy_artifact(context, preprocessed_features)
     X_preprocessed = X_preprocessed.copy()
     X_preprocessed[data_preprocessing.ROW_INDEX_COL] = X_preprocessed.index
     X_preprocessed.to_csv(preprocessed_features, index=False)
@@ -1785,6 +1930,7 @@ def run_node_select_features(context: dict) -> None:
     data_preprocessing.check_data_leakage(X_train, X_test)
 
     selected_features = context["paths"]["selected_features"]
+    _track_heavy_artifact(context, selected_features)
     X_selected_out = X_selected.copy()
     X_selected_out[data_preprocessing.ROW_INDEX_COL] = X_selected_out.index
     X_selected_out.to_csv(selected_features, index=False)
@@ -2020,6 +2166,10 @@ def run_node_train_tdc(context: dict) -> None:
             bench_slug = canonical_name.lower().replace(" ", "_")
             bench_out_dir = os.path.join(seed_dir, bench_slug)
             os.makedirs(bench_out_dir, exist_ok=True)
+            _track_heavy_artifact(
+                context,
+                os.path.join(bench_out_dir, f"{model_type}_best_model.cbm"),
+            )
 
             estimator, train_result = train_models.train_model(
                 X_train=X_train,
@@ -2038,6 +2188,11 @@ def run_node_train_tdc(context: dict) -> None:
                 model_config=model_config,
                 X_val=X_val,
                 y_val=y_val,
+            )
+            _track_heavy_artifact(context, train_result.model_path)
+            _track_heavy_artifact_glob(
+                context,
+                os.path.join(bench_out_dir, "**", "*_best_model.*"),
             )
 
             y_pred_test = estimator.predict_proba(X_test)[:, 1].astype(float)
@@ -2173,6 +2328,9 @@ def run_node_train(context: dict) -> None:
         chemprop_model_config = dict(model_config)
         if str(model_type).strip().lower() == "chemeleon":
             chemprop_model_config["foundation"] = "chemeleon"
+        _track_heavy_artifact(context, os.path.join(output_dir, "chemprop_best_model.ckpt"))
+        _track_heavy_artifact_glob(context, os.path.join(output_dir, "**", "chemprop-best-*.ckpt"))
+        _track_heavy_artifact_glob(context, os.path.join(output_dir, "**", "last.ckpt"))
         _, train_result = train_models.train_chemprop_model(
             curated_df=curated_df,
             target_column=target_column,
@@ -2183,6 +2341,7 @@ def run_node_train(context: dict) -> None:
             model_config=chemprop_model_config,
         )
         context["trained_model_path"] = train_result.model_path
+        _track_heavy_artifact(context, train_result.model_path)
 
         validate_contract(
             bind_output_path(TRAIN_OUTPUT_CONTRACT, output_dir),
@@ -2275,6 +2434,13 @@ def run_node_train(context: dict) -> None:
 
     train_model_config = dict(model_config)
     train_model_config["_debug_logging"] = context.get("debug_logging", False)
+    if model_type == "catboost_classifier":
+        expected_model_path = os.path.join(output_dir, f"{model_type}_best_model.cbm")
+    elif str(model_type).startswith("dl_"):
+        expected_model_path = os.path.join(output_dir, f"{model_type}_best_model.pth")
+    else:
+        expected_model_path = os.path.join(output_dir, f"{model_type}_best_model.pkl")
+    _track_heavy_artifact(context, expected_model_path)
 
     estimator, train_result = train_models.train_model(
         X_train,
@@ -2295,6 +2461,7 @@ def run_node_train(context: dict) -> None:
         y_val=y_val,
     )
     context["trained_model_path"] = train_result.model_path
+    _track_heavy_artifact(context, train_result.model_path)
 
     validate_contract(
         bind_output_path(TRAIN_OUTPUT_CONTRACT, output_dir),
@@ -2371,6 +2538,15 @@ def run_node_explain(context: dict) -> None:
             consumer="explain",
         )
 
+    logging.info(
+        "Explain node start: model=%s task=%s feature_method=%s features=%s labels=%s model_path=%s",
+        model_type,
+        context.get("task_type", "regression"),
+        feature_method,
+        features_file,
+        labels_file,
+        model_path,
+    )
     X, y = data_preprocessing.load_features_labels(
         features_file,
         labels_file,
@@ -2390,6 +2566,15 @@ def run_node_explain(context: dict) -> None:
     X_train = X.loc[train_idx]
     X_test = X.loc[test_idx]
     y_test = y.loc[test_idx]
+    logging.info(
+        "Explain node data ready: model=%s X=%s X_train=%s X_test=%s y_test=%s",
+        model_type,
+        X.shape,
+        X_train.shape,
+        X_test.shape,
+        y_test.shape,
+    )
+    logging.info("Explain node loading estimator: model=%s path=%s", model_type, model_path)
     estimator = train_models.load_model(
         model_path, 
         model_type, 
@@ -2397,6 +2582,7 @@ def run_node_explain(context: dict) -> None:
     )
 
     train_models.run_explainability(estimator, X_train, X_test, y_test, model_type, output_dir, task_type=context.get("task_type", "regression"))
+    logging.info("Explain node complete: model=%s output_dir=%s", model_type, output_dir)
 
     validate_contract(
         bind_output_path(EXPLAIN_OUTPUT_CONTRACT, output_dir),
@@ -2508,6 +2694,7 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
     _configure_logging(run_dir, level=log_level)
     debug_logging = _as_bool(global_config.get("debug", False)) or log_level <= logging.DEBUG
     global_random_state = int(global_config.get("random_state", 42))
+    artifact_retention = _resolve_artifact_retention(global_config)
     start_time = _utc_now_iso()
     config_hash = _stable_hash(runtime_config)
     config_fingerprint = _stable_hash(_hashable_config_payload(runtime_config))
@@ -2559,9 +2746,11 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
         "debug_logging": debug_logging,
         "config_hash": config_hash,
         "config_fingerprint": config_fingerprint,
+        "run_start_epoch": time.time(),
         "feature_method": None,
         "pipeline_feature_input": (runtime_config.get("pipeline", {}) or {}).get("feature_input"),
         "pipeline_nodes": list(nodes),
+        "artifact_retention": artifact_retention,
     }
 
     with open(run_config_path, "w", encoding="utf-8") as f:
@@ -2579,6 +2768,7 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
             "config_hash": config_hash,
             "config_fingerprint": config_fingerprint,
             "git_sha": _git_sha(),
+            "artifact_retention": artifact_retention,
         },
     )
 
@@ -2591,6 +2781,8 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
                 raise ValueError(f"Unknown pipeline node: {node_name}")
             node_fn(context)
     except BaseException as exc:
+        _apply_artifact_retention(context, run_status="failed")
+        artifact_retention_summary = context.get("artifact_retention_summary")
         _write_json_atomic(
             run_status_path,
             {
@@ -2608,10 +2800,14 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
                 "config_hash": config_hash,
                 "config_fingerprint": config_fingerprint,
                 "git_sha": _git_sha(),
+                "artifact_retention": artifact_retention,
+                "artifact_retention_summary": artifact_retention_summary,
             },
         )
         raise
 
+    _apply_artifact_retention(context, run_status="success")
+    artifact_retention_summary = context.get("artifact_retention_summary")
     _write_json_atomic(
         run_status_path,
         {
@@ -2625,6 +2821,8 @@ def run_configured_pipeline_nodes(config: dict, config_path: str) -> bool:
             "config_hash": config_hash,
             "config_fingerprint": config_fingerprint,
             "git_sha": _git_sha(),
+            "artifact_retention": artifact_retention,
+            "artifact_retention_summary": artifact_retention_summary,
         },
     )
     return True
