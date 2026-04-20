@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from typing import Any, Callable
@@ -7,6 +8,27 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, r2_score
+
+
+def _predict_dl_with_batch(
+    predict_dl: Callable[..., np.ndarray],
+    estimator: object,
+    X: np.ndarray,
+    *,
+    batch_size: int,
+) -> np.ndarray:
+    try:
+        signature = inspect.signature(predict_dl)
+    except (TypeError, ValueError):
+        return predict_dl(estimator, X, batch_size=batch_size)
+
+    parameters = signature.parameters.values()
+    supports_batch_size = "batch_size" in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters
+    )
+    if supports_batch_size:
+        return predict_dl(estimator, X, batch_size=batch_size)
+    return predict_dl(estimator, X)
 
 
 def train_model(
@@ -251,7 +273,13 @@ def train_model(
             best_params = {**effective_params, **result["best_params"]}
 
         model_path = os.path.join(output_dir, f"{model_type}_best_model.pth")
-        y_pred = predict_dl(estimator, X_test.values)
+        dl_batch_size = max(1, int(best_params.get("batch_size", 64)))
+        y_pred = _predict_dl_with_batch(
+            predict_dl,
+            estimator,
+            X_test.values,
+            batch_size=dl_batch_size,
+        )
     else:
         logging.info("Training ML model: %s", model_type)
         model.fit(X_train, y_train)
@@ -362,9 +390,29 @@ def train_model(
 
         else:
             if is_dl:
-                y_train_pred = predict_dl(estimator, X_train.values)
-                y_test_pred = predict_dl(estimator, X_test.values)
-                y_val_pred = predict_dl(estimator, X_val.values) if X_val is not None else None
+                dl_batch_size = max(1, int(best_params.get("batch_size", 64)))
+                y_train_pred = _predict_dl_with_batch(
+                    predict_dl,
+                    estimator,
+                    X_train.values,
+                    batch_size=dl_batch_size,
+                )
+                y_test_pred = _predict_dl_with_batch(
+                    predict_dl,
+                    estimator,
+                    X_test.values,
+                    batch_size=dl_batch_size,
+                )
+                y_val_pred = (
+                    _predict_dl_with_batch(
+                        predict_dl,
+                        estimator,
+                        X_val.values,
+                        batch_size=dl_batch_size,
+                    )
+                    if X_val is not None
+                    else None
+                )
             else:
                 y_train_pred = estimator.predict(X_train)
                 y_test_pred = estimator.predict(X_test)

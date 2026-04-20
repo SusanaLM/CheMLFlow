@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import logging
 import random
 from typing import Any, Callable
@@ -40,6 +41,27 @@ def seed_dl_runtime(seed: int) -> None:
             torch.use_deterministic_algorithms(True)
 
 
+def _call_predict_fn(
+    predict_fn: Callable[..., np.ndarray],
+    model: object,
+    X: np.ndarray,
+    *,
+    batch_size: int,
+) -> np.ndarray:
+    try:
+        signature = inspect.signature(predict_fn)
+    except (TypeError, ValueError):
+        return predict_fn(model, X, batch_size=batch_size)
+
+    parameters = signature.parameters.values()
+    supports_batch_size = "batch_size" in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters
+    )
+    if supports_batch_size:
+        return predict_fn(model, X, batch_size=batch_size)
+    return predict_fn(model, X)
+
+
 def train_dl(
     model,
     X_train: np.ndarray,
@@ -60,6 +82,7 @@ def train_dl(
 
     device = get_device()
     model = model.to(device)
+    batch_size = max(1, int(batch_size))
 
     X_t = torch.tensor(X_train, dtype=torch.float32, device=device)
 
@@ -102,11 +125,20 @@ def train_dl(
 
         model.eval()
         with torch.no_grad():
-            outv = model(X_val_t)
-            if task_type == "classification":
-                val_loss = criterion(outv.view(-1), y_val_t.view(-1)).item()
-            else:
-                val_loss = criterion(outv.view(-1, 1), y_val_t).item()
+            total_loss = 0.0
+            total_n = 0
+            for i in range(0, len(X_val_t), batch_size):
+                bx_val = X_val_t[i : i + batch_size]
+                by_val = y_val_t[i : i + batch_size]
+                outv = model(bx_val)
+                if task_type == "classification":
+                    batch_loss = criterion(outv.view(-1), by_val.view(-1))
+                else:
+                    batch_loss = criterion(outv.view(-1, 1), by_val)
+                batch_n = int(bx_val.shape[0])
+                total_loss += float(batch_loss.item()) * batch_n
+                total_n += batch_n
+            val_loss = total_loss / total_n if total_n else float("inf")
 
         if val_loss < best_loss - 1e-6:
             best_loss = val_loss
@@ -135,12 +167,16 @@ def predict_dl(model, X: np.ndarray, batch_size: int = 64) -> np.ndarray:
 
     device = get_device()
     model = model.to(device).eval()
-    X_t = torch.tensor(X, dtype=torch.float32, device=device)
+    X_arr = np.asarray(X, dtype=np.float32)
+    if not X_arr.flags.writeable:
+        X_arr = X_arr.copy()
+    batch_size = max(1, int(batch_size))
 
     preds = []
     with torch.no_grad():
-        for i in range(0, len(X_t), batch_size):
-            out = model(X_t[i : i + batch_size]).cpu().numpy().flatten()
+        for i in range(0, len(X_arr), batch_size):
+            bx = torch.as_tensor(X_arr[i : i + batch_size], dtype=torch.float32, device=device)
+            out = model(bx).cpu().numpy().flatten()
             preds.append(out)
     if not preds:
         return np.array([], dtype=float)
@@ -160,7 +196,7 @@ def run_optuna(
     *,
     seed_fn: Callable[[int], None] | None = None,
     train_fn: Callable[..., dict[str, Any]] | None = None,
-    predict_fn: Callable[[object, np.ndarray], np.ndarray] | None = None,
+    predict_fn: Callable[..., np.ndarray] | None = None,
 ) -> tuple[object, dict[str, Any]]:
     try:
         import optuna
@@ -213,7 +249,12 @@ def run_optuna(
         )
 
         trained_model = result["model"]
-        y_pred = predict_fn(trained_model, X_val)
+        y_pred = _call_predict_fn(
+            predict_fn,
+            trained_model,
+            X_val,
+            batch_size=max(1, int(params.get("batch_size", 32))),
+        )
 
         if task_type == "classification":
             try:
