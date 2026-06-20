@@ -1,10 +1,10 @@
 # ======================================================================
 # DOE spec for the time-series Adaptive NVAR pipeline.
 #
-# DOE cases here are SCIENTIFICALLY DISTINCT EXPERIMENTS (different
-# measurement-noise levels, different training-time noise levels, etc.).
-# Hyperparameter candidates (k, hidden_dim, lr_adam, lr_lbfgs) are expanded
-# as DOE parent cases via model_search. Runtime child configs stay fixed.
+# This spec mirrors the 10% Mackey-Glass Adaptive NVAR notebooks while keeping
+# CheMLFlow's Optuna model_search instead of the notebook grid search.
+# Hyperparameter candidates (k, hidden_dim, lr_adam, lr_lbfgs) are expanded as
+# DOE parent cases via model_search. Runtime child configs stay fixed.
 #
 # Generate concrete case configs:
 #   python scripts/generate_doe.py --doe config/doe_timeseries.yaml
@@ -37,6 +37,7 @@ defaults:
   train.model.params.num_windows: 10
   train.model.params.horizons: [25, 50, 75, 100]
   train.model.params.test_num_runs: 25       # final independent test trainings; report mean ± std
+  train.model.params.selection_segment: val  # notebook grid search selected by validation RMSE@100
   train.model.params.adam_patience: 200
   train.model.params.lbfgs_patience: 200
   train.model.params.max_epochs_adam: 5000      # final-retrain budget
@@ -47,13 +48,11 @@ defaults:
   # or "cpu" to force CPU even on GPU nodes.
   train.model.params.device: cuda
 
-# Scientific factors: each combination produces a distinct experiment.
-#   - dataset_noise_scale: measurement noise added globally (clean vs 1% vs 5%).
+# Scientific factors for the 10% notebook case.
+#   - dataset_noise_scale: measurement noise added globally.
 #   - train_noise_scale:   training-time perturbation on the train segment.
 search_space:
-  # train.model.params.dataset_noise_scale: [0.0, 0.1, 0.2, 0.3]
-  train.model.params.dataset_noise_scale: [0.2, 0.3]
-  # train.model.params.train_noise_scale: [0.0, 0.05]
+  train.model.params.dataset_noise_scale: [0.10]
   train.model.params.train_noise_scale: [0.0]
 
 model_search:

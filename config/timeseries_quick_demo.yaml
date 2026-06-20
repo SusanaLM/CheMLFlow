@@ -44,7 +44,9 @@ train:
       lbfgs_patience: 5
       lbfgs_max_iter: 10
       weight_decay: 0.0
-      train_noise_scale: 0.05
-      dataset_noise_scale: 0.0
+      train_noise_scale: 0.0
+      dataset_noise_scale: 0.10
       horizons: [25, 50, 75, 100]
       num_windows: 10
+      test_num_runs: 1
+      selection_segment: val

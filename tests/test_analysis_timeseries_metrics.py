@@ -55,8 +55,7 @@ def test_horizon_sort_key():
 
 
 # ---------------------------------------------------------------------------
-# val-only runs (test_len=0, val_len>0) must be treated as complete
-# (matches trainer's `primary_target = test if test else val`)
+# val-only runs (test_len=0, val_len>0) must be treated as complete.
 # ---------------------------------------------------------------------------
 
 
@@ -100,6 +99,18 @@ def test_eval_segment_metrics_fallback_order():
     assert analysis._eval_segment_metrics({"test": {}, "val": {"a": 2}})[1] == "val"
     assert analysis._eval_segment_metrics({"val": {"a": 2}})[1] == "val"
     assert analysis._eval_segment_metrics({"test": {}, "val": {}}) == (None, None)
+
+
+def test_eval_segment_metrics_honors_selection_segment():
+    split = {
+        "selection_segment": "val",
+        "train": {"rmse_h100": 0.04},
+        "val": {"rmse_h100": 0.05},
+        "test": {"rmse_h100": 0.08},
+    }
+    eval_metrics, segment = analysis._eval_segment_metrics(split)
+    assert segment == "val"
+    assert eval_metrics == {"rmse_h100": 0.05}
 
 
 def test_val_only_tabular_run_also_recognized():

@@ -2,7 +2,7 @@
 Plotting helpers for the time-series (Adaptive NVAR) pipeline.
 
 Renders the windowed-rollout comparison plot from the notebook
-`Prediction_on_test_MG_Adaptive_NVAR_0percent_noise.ipynb`:
+`Prediction_on_test_MG_Adaptive_NVAR_10percent_noise.ipynb`:
 
     prediction vs ground-truth (clean) vs noisy observation, over the
     concatenated evaluation windows, with dotted window boundaries and a

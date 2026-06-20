@@ -26,7 +26,10 @@ if ROOT not in sys.path:
 # tests in this module on it. Torch-free tests (raw CSV persistence, plotting,
 # split parsing, the search-space registry) live in tests/test_timeseries_io.py
 # so they still run when torch is absent.
-torch = pytest.importorskip("torch", exc_type=ImportError)
+try:
+    import torch
+except ImportError:
+    pytest.skip("torch is required for timeseries_nvar tests", allow_module_level=True)
 
 from utilities import timeseries_io  # noqa: E402
 
@@ -80,6 +83,7 @@ def test_train_timeseries_nvar_writes_expected_artifacts(tmp_path):
         "num_windows": 2,
         "horizons": [5, 10],
         "weight_decay": 0.0,
+        "test_num_runs": 1,
     }
     split_block = {
         "warmup_len": 20,
@@ -115,6 +119,8 @@ def test_train_timeseries_nvar_writes_expected_artifacts(tmp_path):
     assert "rmse" in payload and payload["rmse"] is not None
     assert payload["primary_metric"] == "rmse_h10"
     assert payload["primary_horizon"] == 10
+    assert payload["selection_segment"] == "val"
+    assert "plot_paths" in payload
     assert "val_rmse_horizons" in payload
     assert "test_rmse_horizons" in payload
     assert payload["split_metrics_path"].endswith("dl_adaptive_nvar_split_metrics.json")
@@ -123,6 +129,7 @@ def test_train_timeseries_nvar_writes_expected_artifacts(tmp_path):
     split_metrics = json.loads(open(split_metrics_path).read())
     for segment in ("train", "val", "test"):
         assert segment in split_metrics, f"{segment} segment missing"
+    assert split_metrics["selection_segment"] == "val"
     assert "rmse_h5" in split_metrics["val"]
     assert "rmse_h10" in split_metrics["val"]
 

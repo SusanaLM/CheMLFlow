@@ -914,15 +914,19 @@ def _mark_missing_metric_jobs(jobs: list[ChildJob]) -> list[ChildJob]:
 
 
 def _eval_segment_metrics(split_metrics: dict[str, Any]) -> tuple[dict[str, Any], str] | tuple[None, None]:
-    """Return (eval_dict, segment_name) the way the trainer chooses it: test if
-    present and non-empty, otherwise val.
+    """Return (eval_dict, segment_name) for split-based model comparison.
 
-    Time-series runs may legitimately have test_len=0 with val_len>0 (the strict
-    validator and parse_split_config both allow this). In that case the trainer
-    scores on val and writes val metrics with an empty test dict, so analysis
-    must fall back to val to recognize the run as complete — mirroring
-    MLModels.training.timeseries_nvar's `primary_target = test if test else val`.
+    Time-series runs may set ``selection_segment`` to ``val`` so DOE/Optuna
+    comparisons match the notebooks: hyperparameters are selected on validation
+    RMSE, and the test split remains held out for the final fixed configuration.
+    Older metrics without this field keep the historical test-then-val fallback.
     """
+    preferred = str(split_metrics.get("selection_segment", "")).strip().lower()
+    if preferred in {"val", "test"}:
+        chosen = split_metrics.get(preferred)
+        if isinstance(chosen, dict) and chosen:
+            return chosen, preferred
+
     test = split_metrics.get("test")
     if isinstance(test, dict) and test:
         return test, "test"
@@ -936,8 +940,8 @@ def _extract_primary_metric(split_metrics: dict[str, Any]) -> str | None:
     train = split_metrics.get("train")
     if not isinstance(train, dict):
         return None
-    # Evaluation segment is test if present, else val (matches the trainer and
-    # the validator, which allow test_len=0 when val_len>0).
+    # Evaluation segment is the trainer's selection segment when provided,
+    # otherwise test if present, else val.
     eval_metrics, _segment = _eval_segment_metrics(split_metrics)
     if eval_metrics is None:
         return None
@@ -1028,10 +1032,9 @@ def _build_generalization_records(
             continue
         val = split_metrics.get("val") or {}
         train_v = _safe_float(train.get(metric_name))
-        # The "test" value in the generalization record is the eval segment the
-        # trainer actually used: test if present, else val (val-only runs have
-        # test_len=0). eval_segment records which one, so downstream readers
-        # aren't misled into thinking a val-only run had a held-out test set.
+        # The "test" value in the generalization record is the selected eval
+        # segment: the trainer may request val for notebook-faithful
+        # hyperparameter selection, otherwise analysis falls back to test/val.
         test_v = _safe_float(eval_metrics.get(metric_name))
         val_v = _safe_float(val.get(metric_name)) if isinstance(val, dict) else None
         if train_v is None or test_v is None:

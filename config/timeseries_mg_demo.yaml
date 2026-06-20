@@ -3,9 +3,9 @@
 #
 # This config trains an Adaptive NVAR forecaster on the user-supplied
 # Mackey-Glass series (`ground_truth.npy`). It mirrors the notebook
-# `Optuna_MG_Adaptive_NVAR_0percent_noise.ipynb`, but with a single fixed
-# hyperparameter set (no Optuna). Use the matching DOE (config/doe_timeseries.yaml)
-# to sweep configurations.
+# `Prediction_on_test_MG_Adaptive_NVAR_10percent_noise.ipynb`, but with a
+# single fixed hyperparameter set. Use the matching DOE
+# (config/doe_timeseries.yaml) for Optuna model_search over the notebook grid.
 #
 # To run a single fixed-config training:
 #   CHEMLFLOW_CONFIG=config/timeseries_mg_demo.yaml python main.py
@@ -65,10 +65,12 @@ train:
       num_epochs_lbfgs: 50000
       lbfgs_patience: 200
 
-      # Noise
-      train_noise_scale: 0.05
-      dataset_noise_scale: 0.0
+      # Noise: 10% measurement noise globally; no extra train-only noise.
+      train_noise_scale: 0.0
+      dataset_noise_scale: 0.10
 
       # Rollout (windowed multi-horizon RMSE)
       horizons: [25, 50, 75, 100]
       num_windows: 10
+      test_num_runs: 25
+      selection_segment: val

@@ -77,7 +77,7 @@ class TrainingConfig:
     tolerance: float = 1e-20
 
     # Noise
-    train_noise_scale: float = 0.05  # added to training segment only
+    train_noise_scale: float = 0.0   # added to training segment only
     dataset_noise_scale: float = 0.0 # added globally (then val_true is the clean series)
 
     # Rollout
@@ -86,6 +86,10 @@ class TrainingConfig:
 
     # Repeated stochastic runs
     test_num_runs: int = 25           # independent final trainings at one fixed hyperparameter point
+
+    # Hyperparameter-selection score. The notebook grid search selects on
+    # validation RMSE@max_horizon, then evaluates the fixed winner on test.
+    selection_segment: str = "val"    # "val", "test", or "auto"
 
     # Device selection. Values:
     #   "auto" - use CUDA if torch.cuda.is_available(), else CPU. No raise.
@@ -172,6 +176,15 @@ def parse_training_config(
     ):
         if key in model_params:
             setattr(cfg, key, int(model_params[key]))
+
+    if "selection_segment" in model_params:
+        segment = str(model_params["selection_segment"]).strip().lower()
+        if segment not in {"val", "test", "auto"}:
+            raise ValueError(
+                "train.model.params.selection_segment must be one of "
+                "'val', 'test', or 'auto'."
+            )
+        cfg.selection_segment = segment
 
     # Rollout ----------------------------------------------------------------
     horizons = model_params.get("horizons")
@@ -409,20 +422,22 @@ def _train_adaptive_nvar(
         scheduler.step(loss.item())
 
         adam_epochs_run = epoch + 1
-        if best_loss - loss.item() > cfg.tolerance:
-            best_loss = float(loss.item())
+        current_loss = float(loss.item())
+        if best_loss - current_loss > cfg.tolerance:
+            best_loss = current_loss
             epochs_no_improve = 0
-            torch.save(model.state_dict(), save_path)
         else:
             epochs_no_improve += 1
         if epochs_no_improve >= cfg.adam_patience:
             break
 
-    # If no checkpoint was written (rare but possible), persist current state.
-    if not os.path.exists(save_path):
-        torch.save(model.state_dict(), save_path)
+    # Notebook-faithful behavior: save the final Adam state, reload it, then
+    # start L-BFGS from that state. Early stopping decides when to stop; it does
+    # not restore the best intermediate epoch.
+    torch.save(model.state_dict(), save_path)
     model.load_state_dict(torch.load(save_path, map_location=device))
     adam_best_loss = best_loss
+    adam_final_loss = current_loss if adam_epochs_run else float("nan")
 
     # ---- Phase 2: L-BFGS ----
     optimizer = torch.optim.LBFGS(
@@ -453,18 +468,19 @@ def _train_adaptive_nvar(
         if best_loss - current_loss > cfg.tolerance:
             best_loss = current_loss
             epochs_no_improve = 0
-            torch.save(model.state_dict(), save_path)
         else:
             epochs_no_improve += 1
         if epochs_no_improve >= cfg.lbfgs_patience:
             break
 
-    model.load_state_dict(torch.load(save_path, map_location=device))
+    torch.save(model.state_dict(), save_path)
     return model, {
         "adam_epochs_run": int(adam_epochs_run),
         "adam_best_loss": float(adam_best_loss),
+        "adam_final_loss": float(adam_final_loss),
         "lbfgs_epochs_run": int(lbfgs_epochs_run),
         "lbfgs_best_loss": float(best_loss),
+        "lbfgs_final_loss": float(current_loss) if lbfgs_epochs_run else float("nan"),
     }
 
 
@@ -705,6 +721,20 @@ def _prefixed_horizon_mean_std(
     return _horizon_mean_std(normalized_rows, horizons)
 
 
+def _repeated_selection_means(
+    stats: dict[str, Any],
+    horizons: tuple[int, ...],
+) -> dict[str, float]:
+    """Convert repeated-run rmse_h*_mean fields back to canonical rmse_h* keys."""
+    out: dict[str, float] = {}
+    for h in horizons:
+        src = f"rmse_h{h}_mean"
+        value = stats.get(src)
+        if value is not None:
+            out[f"rmse_h{h}"] = float(value)
+    return out
+
+
 def _train_timeseries_nvar_repeated_final(
     *,
     model_type: str,
@@ -853,6 +883,15 @@ def _train_timeseries_nvar_repeated_final(
             snapshot["test_rmse_horizons_repeated"] = partial_test_stats
             snapshot["val_rmse_horizons_repeated"] = partial_val_stats
             snapshot["train_rmse_horizons_repeated"] = partial_train_stats
+            selection_stats = (
+                partial_test_stats
+                if snapshot.get("selection_segment") == "test"
+                else partial_val_stats
+            )
+            snapshot["selection_rmse_horizons"] = _repeated_selection_means(
+                selection_stats,
+                cfg0.horizons,
+            )
             # Convenience flat fields for benchmarking scripts.
             for h in cfg0.horizons:
                 for suffix in ("mean", "std"):
@@ -906,6 +945,15 @@ def _train_timeseries_nvar_repeated_final(
     main_metrics["test_rmse_horizons_repeated"] = test_stats
     main_metrics["val_rmse_horizons_repeated"] = val_stats
     main_metrics["train_rmse_horizons_repeated"] = train_stats
+    selection_stats = (
+        test_stats
+        if main_metrics.get("selection_segment") == "test"
+        else val_stats
+    )
+    main_metrics["selection_rmse_horizons"] = _repeated_selection_means(
+        selection_stats,
+        cfg0.horizons,
+    )
     for h in cfg0.horizons:
         for suffix in ("mean", "std"):
             k = f"rmse_h{h}_{suffix}"
@@ -1116,17 +1164,34 @@ def _train_timeseries_nvar_once(
         else {}
     )
 
-    # Primary metric: RMSE at the largest horizon, on val if test missing.
+    # Selection metric: notebook grid search ranks hyperparameters on
+    # validation RMSE@max_horizon, then the fixed winner is tested separately.
     primary_h = max(cfg.horizons)
     primary_key = f"rmse_h{primary_h}"
-    primary_target = test_rmse if test_rmse else val_rmse
+    if cfg.selection_segment == "val" and val_rmse:
+        selection_segment = "val"
+        primary_target = val_rmse
+    elif cfg.selection_segment == "test" and test_rmse:
+        selection_segment = "test"
+        primary_target = test_rmse
+    elif val_rmse:
+        selection_segment = "val"
+        primary_target = val_rmse
+    elif test_rmse:
+        selection_segment = "test"
+        primary_target = test_rmse
+    else:
+        selection_segment = "none"
+        primary_target = {}
     primary_value = primary_target.get(primary_key)
 
     # Persist metrics.json (CheMLFlow-shape, includes split_metrics_path) -----
-    split_metrics: dict[str, dict[str, Any]] = {
+    split_metrics: dict[str, Any] = {
         "train": train_rmse,
         "val": val_rmse,
         "test": test_rmse,
+        "selection_segment": selection_segment,
+        "selection_metric": primary_key,
     }
     split_metrics_path = os.path.join(output_dir, f"{model_type}_split_metrics.json")
     with open(split_metrics_path, "w", encoding="utf-8") as f:
@@ -1138,6 +1203,8 @@ def _train_timeseries_nvar_once(
         "rmse": float(primary_value) if primary_value is not None else None,
         "primary_horizon": int(primary_h),
         "primary_metric": primary_key,
+        "selection_segment": selection_segment,
+        "selection_rmse_horizons": primary_target,
         "split_metrics_path": split_metrics_path,
         "train_rmse_horizons": train_rmse,
         "val_rmse_horizons": val_rmse,
@@ -1153,8 +1220,6 @@ def _train_timeseries_nvar_once(
         "data_dim": int(d),
     }
     metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2, default=_json_default)
 
     # Per-window-per-horizon CSV --------------------------------------------
     rich_csv_path = os.path.join(
@@ -1195,6 +1260,28 @@ def _train_timeseries_nvar_once(
         npz_payload["train_noisy"] = train_noisy
     if npz_payload:
         np.savez(predictions_path, **npz_payload)
+
+    # Notebook-style rollout plots -------------------------------------------
+    plot_paths: list[str] = []
+    if npz_payload:
+        try:
+            from MLModels.training import timeseries_plots
+
+            plot_paths = timeseries_plots.plot_rollouts_from_npz(
+                predictions_path=predictions_path,
+                output_dir=output_dir,
+                model_type=model_type,
+                num_windows=cfg.num_windows,
+                dataset_noise_scale=cfg.dataset_noise_scale,
+                k=cfg.k,
+                hidden_dim=cfg.hidden_dim if model_type == ADAPTIVE_NVAR else None,
+            )
+        except Exception as exc:  # plotting must not fail a training run
+            LOGGER.warning("Failed to render time-series rollout plots: %s", exc)
+    metrics["plot_paths"] = plot_paths
+    metrics["predictions_path"] = predictions_path if npz_payload else None
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, default=_json_default)
 
     # Hyperparameters --------------------------------------------------------
     params_path = os.path.join(output_dir, f"{model_type}_best_params.pkl")
