@@ -5,9 +5,11 @@ import json
 import math
 import random
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import yaml
 
@@ -150,6 +152,47 @@ def _base_clf_doe(tmp_path: Path) -> dict:
             "train.reporting.plot_split_performance": True,
         },
         "output": {"dir": str(tmp_path / "generated")},
+    }
+
+
+def _base_timeseries_doe(tmp_path: Path) -> dict:
+    raw_path = tmp_path / "ground_truth.npy"
+    np.save(raw_path, np.linspace(0.0, 1.0, 128, dtype=np.float32).reshape(1, -1))
+    return {
+        "version": 1,
+        "dataset": {
+            "profile": "ts_forecast",
+            "name": "ts_small_doe",
+            "task_type": "regression",
+            "source": {
+                "type": "local_npy",
+                "path": str(raw_path),
+                "time_axis": "cols",
+            },
+            "split": {
+                "warmup_len": 5,
+                "train_len": 50,
+                "val_len": 30,
+                "test_len": 30,
+            },
+        },
+        "search_space": {
+            "train.model.params.dataset_noise_scale": [0.0],
+        },
+        "defaults": {
+            "global.base_dir": str(tmp_path / "data"),
+            "global.run_dir": str(tmp_path / "runs"),
+            "global.random_state": 42,
+            "pipeline.feature_input": "none",
+            "train.tuning.method": "fixed",
+            "train.model.type": "dl_adaptive_nvar",
+            "train.model.params.k": 2,
+            "train.model.params.hidden_dim": 4,
+            "train.model.params.num_windows": 1,
+            "train.model.params.horizons": [5],
+            "train.model.params.test_num_runs": 1,
+        },
+        "output": {"dir": str(tmp_path / "generated_ts")},
     }
 
 
@@ -858,6 +901,34 @@ def test_generate_doe_rejects_child_level_tuning_defaults(
         generate_doe(spec)
 
 
+def test_generate_doe_allows_timeseries_optuna_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "main",
+        SimpleNamespace(validate_pipeline_nodes=lambda nodes: None),
+    )
+    monkeypatch.setattr(doe_module, "validate_config_strict", lambda config, nodes: None)
+    spec = _base_timeseries_doe(tmp_path)
+    spec["defaults"]["train.tuning.method"] = "optuna"
+    spec["defaults"]["train.tuning.n_trials"] = 2
+    spec["defaults"]["train.tuning.metric"] = "rmse_h5"
+
+    result = generate_doe(spec)
+
+    assert result["summary"]["valid_cases"] == 1
+    config = yaml.safe_load(
+        Path(result["valid_cases"][0]["config_path"]).read_text(encoding="utf-8")
+    )
+    assert config["pipeline"]["nodes"] == ["get_data", "train.timeseries"]
+    assert config["train"]["model"]["type"] == "dl_adaptive_nvar"
+    assert config["train"]["tuning"]["method"] == "optuna"
+    assert config["train"]["tuning"]["n_trials"] == 2
+    assert config["train"]["tuning"]["metric"] == "rmse_h5"
+
+
 @pytest.mark.parametrize(
     "axis",
     [
@@ -872,6 +943,14 @@ def test_generate_doe_rejects_child_level_tuning_search_axes(
 ) -> None:
     spec = _base_clf_doe(tmp_path)
     spec["search_space"][axis] = ["fixed"]
+
+    with pytest.raises(DOEGenerationError, match="Runtime child-level tuning axes"):
+        generate_doe(spec)
+
+
+def test_generate_doe_rejects_timeseries_tuning_search_axis(tmp_path: Path) -> None:
+    spec = _base_timeseries_doe(tmp_path)
+    spec["search_space"]["train.tuning.method"] = ["fixed", "optuna"]
 
     with pytest.raises(DOEGenerationError, match="Runtime child-level tuning axes"):
         generate_doe(spec)

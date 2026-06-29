@@ -300,7 +300,11 @@ def _validate_search_space_axes(search_space_flat: dict[str, Any]) -> None:
         )
 
 
-def _validate_default_runtime_tuning(defaults_flat: dict[str, Any]) -> None:
+def _validate_default_runtime_tuning(
+    defaults_flat: dict[str, Any],
+    *,
+    allow_train_optuna: bool = False,
+) -> None:
     for key in sorted(defaults_flat):
         if not any(key.startswith(prefix) for prefix in _RUNTIME_TUNING_PREFIXES):
             continue
@@ -309,6 +313,8 @@ def _validate_default_runtime_tuning(defaults_flat: dict[str, Any]) -> None:
         if leaf == "method":
             method = str(value or "fixed").strip().lower()
             if method in {"", "fixed"}:
+                continue
+            if allow_train_optuna and key == "train.tuning.method" and method == "optuna":
                 continue
         elif leaf == "use_hpo":
             if not _as_bool(value):
@@ -2299,7 +2305,10 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
     defaults_flat = _flatten_dict(defaults_cfg)
     search_space_flat = _flatten_dict(search_space)
     _validate_search_space_axes(search_space_flat)
-    _validate_default_runtime_tuning(defaults_flat)
+    _validate_default_runtime_tuning(
+        defaults_flat,
+        allow_train_optuna=profile.train_node == "train.timeseries",
+    )
     declared_axes = set(defaults_flat) | set(search_space_flat)
     max_cases = constraints_cfg.get("max_cases")
     if max_cases is not None:

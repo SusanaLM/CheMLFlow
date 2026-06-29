@@ -185,7 +185,7 @@ def test_strict_rejects_child_level_train_hpo(tuning_cfg: dict, path: str) -> No
     )
 
 
-def test_strict_rejects_child_level_timeseries_optuna() -> None:
+def test_strict_allows_timeseries_optuna() -> None:
     cfg = _base_config(["train.timeseries"])
     cfg["train"] = {
         "model": {"type": "dl_adaptive_nvar"},
@@ -195,7 +195,7 @@ def test_strict_rejects_child_level_timeseries_optuna() -> None:
 
     issues = collect_config_issues(cfg, ["train.timeseries"])
 
-    assert any(
+    assert not any(
         issue.code == "CFG_CHILD_LEVEL_HPO_UNSUPPORTED"
         and issue.path == "train.tuning.method"
         for issue in issues

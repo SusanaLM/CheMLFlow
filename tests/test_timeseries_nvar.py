@@ -159,8 +159,8 @@ def test_train_timeseries_nvar_rejects_wrong_model_type(tmp_path):
         )
 
 
-def test_train_timeseries_rejects_child_level_optuna(tmp_path):
-    """tuning.method=optuna is rejected; parent-level DOE model_search owns HPO."""
+def test_train_timeseries_optuna_dispatches_to_validation_hpo_then_final(tmp_path, monkeypatch):
+    """tuning.method=optuna runs time-series HPO, then the fixed final path."""
     from MLModels.training import timeseries_nvar
 
     series = _make_synthetic_series(T=80, d=1, seed=0)
@@ -173,22 +173,54 @@ def test_train_timeseries_rejects_child_level_optuna(tmp_path):
     model_params = {
         "k": 2,
         "hidden_dim": 8,
+        "feature_dim_m": 4,
+        "max_epochs_adam": 1,
+        "adam_patience": 1,
+        "num_epochs_lbfgs": 1,
+        "lbfgs_patience": 1,
+        "lbfgs_max_iter": 1,
         "horizons": [5],
         "num_windows": 1,
+        "test_num_runs": 1,
     }
     train_block = {"tuning": {"method": "optuna", "n_trials": 3}}
     split_block = {"warmup_len": 5, "train_len": 30, "val_len": 20, "test_len": 20}
 
-    with pytest.raises(ValueError, match="DOE model_search"):
-        timeseries_nvar.train_timeseries_nvar(
-            model_type="dl_adaptive_nvar",
-            raw_path=str(raw_path),
-            output_dir=str(output_dir),
-            model_params=model_params,
-            train_block=train_block,
-            split_block=split_block,
-            global_random_state=0,
+    calls = {}
+
+    def fake_run_optuna_timeseries(**kwargs):
+        calls["kwargs"] = kwargs
+        assert kwargs["tuning_block"]["method"] == "optuna"
+        assert kwargs["split_block"] == split_block
+        return (
+            {"k": 2, "hidden_dim": 4, "feature_dim_m": 4},
+            {
+                "method": "optuna",
+                "objective": "validation_rmse",
+                "metric": "rmse_h5",
+                "best_value": 0.123,
+                "best_params": {"k": 2, "hidden_dim": 4, "feature_dim_m": 4},
+            },
         )
+
+    monkeypatch.setattr(timeseries_nvar, "_run_optuna_timeseries", fake_run_optuna_timeseries)
+
+    result = timeseries_nvar.train_timeseries_nvar(
+        model_type="dl_adaptive_nvar",
+        raw_path=str(raw_path),
+        output_dir=str(output_dir),
+        model_params=model_params,
+        train_block=train_block,
+        split_block=split_block,
+        global_random_state=0,
+    )
+
+    assert calls["kwargs"]["user_model_params"] == model_params
+    payload = json.loads(open(result.metrics_path).read())
+    assert payload["tuning"]["method"] == "optuna"
+    assert payload["tuning"]["objective"] == "validation_rmse"
+    assert payload["config"]["k"] == 2
+    assert payload["config"]["hidden_dim"] == 4
 
 
 # ---------------------------------------------------------------------------

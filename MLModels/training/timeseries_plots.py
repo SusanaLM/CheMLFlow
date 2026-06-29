@@ -134,17 +134,24 @@ def plot_rollout_vs_truth(
                     linewidth=2.0,
                     alpha=0.7,
                 )
-            y_label = float(np.max(true_1d)) * 1.05 if np.max(true_1d) > 0 else float(np.max(true_1d))
             for w in range(num_windows):
                 center = w * window_size + window_size // 2
                 ax.text(
                     center,
-                    y_label,
+                    1.015,
                     f"Window {w + 1}",
+                    transform=ax.get_xaxis_transform(),
                     ha="center",
                     va="bottom",
                     fontsize=9,
                     color="blue",
+                    clip_on=False,
+                    bbox={
+                        "facecolor": "white",
+                        "edgecolor": "none",
+                        "alpha": 0.85,
+                        "pad": 1.5,
+                    },
                 )
 
         # Title reflects the pipeline parameter that was actually applied.
@@ -155,7 +162,7 @@ def plot_rollout_vs_truth(
         ax.set_title(
             f"{segment.capitalize()} Predictions vs Ground Truth \u2014 {noise_phrase}",
             fontsize=13,
-            pad=20,
+            pad=30,
         )
         ax.set_xlabel("Time")
         ax.set_ylabel("x")

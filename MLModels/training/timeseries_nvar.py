@@ -135,7 +135,7 @@ def parse_training_config(
     # else is rejected loudly so a typo in YAML doesn't silently fall back.
     if "device" in model_params:
         dev = str(model_params["device"]).strip().lower()
-        if dev not in {"auto", "cuda", "cpu"}:
+        if dev not in {"auto", "cuda", "mps", "cpu"}:
             raise ValueError(
                 f"train.model.params.device must be one of "
                 f"'auto', 'cuda', 'cpu'; got {model_params['device']!r}."
@@ -331,8 +331,17 @@ def _resolve_device(requested: str):
                 "fall back."
             )
         device = torch.device("cuda")
+    elif req == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError("train.model.params.device='mps' was requested but MPS is unavailable.")
+        device = torch.device("mps")
     elif req == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
     else:  # pragma: no cover - parse_training_config already validates
         raise ValueError(f"unknown device {requested!r}")
 
@@ -398,6 +407,7 @@ def _train_adaptive_nvar(
 
     model = model.to(device)
     X_train = X_train.to(device)
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     H_lin = construct_H_lin(X_train, cfg.k)
     Y = X_train[cfg.k :] - X_train[cfg.k - 1 : -1]
 
@@ -624,6 +634,413 @@ class TimeSeriesTrainResult:
     metrics_path: str
 
 
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _trial_seed(base_seed: int, trial_number: int) -> int:
+    return int(base_seed) + int(trial_number) + 1
+
+
+def _optuna_metric_key(cfg: TrainingConfig, tuning_block: dict[str, Any]) -> str:
+    metric = str(tuning_block.get("metric", f"rmse_h{max(cfg.horizons)}")).strip().lower()
+    if metric in {"rmse", "val_rmse"}:
+        metric = f"rmse_h{max(cfg.horizons)}"
+    if not metric.startswith("rmse_h"):
+        raise ValueError(
+            "train.tuning.metric for time-series Optuna must be an RMSE horizon "
+            "such as 'rmse_h100'."
+        )
+    try:
+        horizon = int(metric.removeprefix("rmse_h"))
+    except ValueError as exc:
+        raise ValueError(
+            "train.tuning.metric for time-series Optuna must be an RMSE horizon "
+            "such as 'rmse_h100'."
+        ) from exc
+    if horizon not in set(int(h) for h in cfg.horizons):
+        raise ValueError(
+            f"train.tuning.metric={metric!r} requires horizon {horizon}, but "
+            f"train.model.params.horizons={list(cfg.horizons)!r}."
+        )
+    return metric
+
+
+def _suggest_optuna_param(trial: Any, name: str, spec: dict[str, Any]) -> Any:
+    stype = str(spec.get("type", "")).strip().lower()
+    if stype == "categorical":
+        choices = spec.get("choices")
+        if not choices:
+            raise ValueError(f"Optuna search space for {name!r} must define non-empty choices.")
+        return trial.suggest_categorical(name, list(choices))
+    if stype == "float":
+        low = float(spec["low"])
+        high = float(spec["high"])
+        log = _boolish(spec.get("log", False))
+        if "step" in spec and spec["step"] is not None:
+            return trial.suggest_float(name, low, high, step=float(spec["step"]), log=log)
+        return trial.suggest_float(name, low, high, log=log)
+    if stype == "int":
+        low = int(spec["low"])
+        high = int(spec["high"])
+        log = _boolish(spec.get("log", False))
+        if "step" in spec and spec["step"] is not None:
+            return trial.suggest_int(name, low, high, step=int(spec["step"]), log=log)
+        return trial.suggest_int(name, low, high, log=log)
+    raise ValueError(f"Unknown Optuna search-space spec type for {name!r}: {stype!r}")
+
+
+def _is_checkpoint_storage_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "Parent directory" in message
+        or "No such file or directory" in message
+        or "FileNotFoundError" in message
+    )
+
+
+def _train_and_score_val(
+    *,
+    model_type: str,
+    cfg: TrainingConfig,
+    sliced_clean: timeseries_io.TimeSeriesSplit,
+    sliced_noisy: timeseries_io.TimeSeriesSplit,
+    data_noisy: np.ndarray,
+    split_cfg: timeseries_io.TimeSeriesSplitConfig,
+    connectome_adj: Optional[np.ndarray],
+    seed: int,
+    tmp_save_path: str,
+    metric_key: str,
+    num_runs: int = 1,
+) -> Optional[float]:
+    """Train trial model(s), roll out on validation only, and return val RMSE."""
+    d = int(sliced_clean.d)
+    device = _resolve_device(cfg.device)
+
+    np.random.seed(int(cfg.base_seed) + 1)
+    train_with_noise = _add_relative_gaussian_noise(sliced_noisy.train, cfg.train_noise_scale)
+
+    scores: list[float] = []
+    for run_idx in range(max(1, int(num_runs))):
+        run_seed = int(seed) + int(run_idx)
+        _seed_everything(run_seed)
+        run_save_path = (
+            tmp_save_path
+            if int(num_runs) <= 1
+            else f"{os.path.splitext(tmp_save_path)[0]}_run{run_idx:02d}.pth"
+        )
+
+        try:
+            model = _build_model(
+                model_type=model_type,
+                cfg=cfg,
+                d=d,
+                connectome_adj=connectome_adj,
+            )
+            X_train_t = _torchify(train_with_noise, device=device)
+            model, _ = _train_adaptive_nvar(
+                model=model,
+                X_train=X_train_t,
+                cfg=cfg,
+                save_path=run_save_path,
+                device=device,
+            )
+            X_full_t = _torchify(data_noisy, device=device)
+            val_offset = split_cfg.warmup_len + split_cfg.train_len
+            val_per_window, _, _, _ = _rollout_segment(
+                model=model,
+                X_full=X_full_t,
+                seg_offset=val_offset,
+                seg_true=sliced_clean.val,
+                seg_noisy=sliced_noisy.val,
+                cfg=cfg,
+                device=device,
+            )
+            val_rmse = _aggregate_horizon_rmse(val_per_window, cfg.horizons)
+            score = val_rmse.get(metric_key)
+            if score is not None and np.isfinite(score):
+                scores.append(float(score))
+        except ValueError as exc:
+            LOGGER.warning("Optuna trial pruned during validation scoring: %s", exc)
+            return None
+        except Exception as exc:
+            if _is_checkpoint_storage_error(exc):
+                raise RuntimeError(
+                    "Optuna trial checkpoint storage failed. This is an infrastructure "
+                    "error, not a bad hyperparameter trial."
+                ) from exc
+            LOGGER.warning("Optuna trial errored during validation scoring: %s", exc)
+            return None
+
+    if not scores:
+        return None
+    return float(np.mean(scores))
+
+
+def _run_optuna_timeseries(
+    *,
+    model_type: str,
+    raw_path: str,
+    output_dir: str,
+    user_model_params: dict[str, Any],
+    train_block: dict[str, Any],
+    split_block: dict[str, Any],
+    tuning_block: dict[str, Any],
+    global_random_state: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run real time-series HPO: Optuna objective returns validation RMSE."""
+    try:
+        import optuna
+    except ImportError as exc:
+        raise ImportError(
+            "train.tuning.method=optuna requires the optuna package. "
+            "Install optuna or use train.tuning.method=fixed."
+        ) from exc
+
+    from MLModels.train_models import DLSearchConfig
+    from MLModels.training.dl_registry import build_timeseries_dl_search_config
+
+    direction = str(tuning_block.get("direction", "minimize")).strip().lower()
+    if direction != "minimize":
+        raise ValueError(
+            "time-series Optuna currently minimizes validation RMSE, so "
+            "train.tuning.direction must be 'minimize'."
+        )
+
+    search_cfg = build_timeseries_dl_search_config(
+        model_type=model_type,
+        dl_search_config_cls=DLSearchConfig,
+    )
+    default_search_space = dict(search_cfg.search_space)
+    search_space_raw = (
+        tuning_block.get("search_space")
+        or tuning_block.get("params")
+        or default_search_space
+    )
+    if not isinstance(search_space_raw, dict) or not search_space_raw:
+        raise ValueError("train.tuning.search_space must be a non-empty mapping.")
+    search_space: dict[str, dict[str, Any]] = {
+        str(name): dict(spec) for name, spec in search_space_raw.items()
+    }
+    registry_defaults: dict[str, Any] = dict(search_cfg.default_params)
+
+    n_trials = int(tuning_block.get("n_trials", 30))
+    if n_trials <= 0:
+        raise ValueError("train.tuning.n_trials must be > 0 for time-series Optuna.")
+    timeout_raw = tuning_block.get("timeout")
+    timeout = float(timeout_raw) if timeout_raw is not None else None
+    sampler_seed = int(tuning_block.get("seed", global_random_state))
+    trial_epoch_cap_raw = tuning_block.get("trial_epoch_cap")
+    trial_epoch_cap = int(trial_epoch_cap_raw) if trial_epoch_cap_raw is not None else None
+    trial_num_runs = int(
+        tuning_block.get(
+            "optuna_num_runs",
+            tuning_block.get("trial_num_runs", user_model_params.get("optuna_num_runs", 1)),
+        )
+    )
+
+    data_clean, _raw_meta = timeseries_io.load_raw_timeseries(raw_path)
+    if data_clean.ndim != 2:
+        raise ValueError(f"Loaded series must be 2-D, got {data_clean.shape}.")
+    split_cfg = timeseries_io.parse_split_config(split_block)
+    np.random.seed(int(global_random_state))
+    dataset_noise_scale = float(user_model_params.get("dataset_noise_scale", 0.0))
+    data_noisy = _add_relative_gaussian_noise(data_clean, dataset_noise_scale)
+    sliced_clean = timeseries_io.slice_time_series(data_clean, split_cfg)
+    sliced_noisy = timeseries_io.slice_time_series(data_noisy, split_cfg)
+
+    sampler = optuna.samplers.TPESampler(seed=sampler_seed)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
+    if not _boolish(tuning_block.get("verbose", False)):
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    last_bundle_cache_key: Optional[tuple[Any, ...]] = None
+    last_bundle: Optional[connectome_loader.ConnectomeBundle] = None
+
+    def _resolve_connectome_for_trial(trial_params: dict[str, Any]) -> Optional[np.ndarray]:
+        nonlocal last_bundle_cache_key, last_bundle
+        if model_type != CONNECTOME_NVAR:
+            return None
+        effective = {**registry_defaults, **user_model_params, **trial_params}
+        if "connectome_xlsx" not in effective or not effective["connectome_xlsx"]:
+            raise ValueError(f"{CONNECTOME_NVAR} requires train.model.params.connectome_xlsx.")
+        key = (
+            effective["connectome_xlsx"],
+            effective.get("connectome_sheet"),
+            int(effective.get("n_connectome", 100)),
+            effective.get("connectome_selection_mode", "top_degree"),
+            int(effective.get("connectome_selection_seed", 2025)),
+            bool(effective.get("connectome_binarize", False)),
+            effective.get("connectome_mode", "connectome"),
+            int(effective.get("connectome_swap_factor", 10)),
+            int(effective.get("base_seed", global_random_state)),
+            str(effective.get("connectome_normalization", "maxabs")),
+        )
+        if key == last_bundle_cache_key and last_bundle is not None:
+            return last_bundle.adjacency
+        last_bundle = connectome_loader.build_connectome(
+            xlsx_path=str(effective["connectome_xlsx"]),
+            sheet_name=effective.get("connectome_sheet"),
+            n_select=int(effective.get("n_connectome", 100)),
+            selection_mode=str(effective.get("connectome_selection_mode", "top_degree")),
+            selection_seed=int(effective.get("connectome_selection_seed", 2025)),
+            binarize=bool(effective.get("connectome_binarize", False)),
+            randomize=(str(effective.get("connectome_mode", "connectome")) == "connectome_randomized"),
+            randomize_swap_factor=int(effective.get("connectome_swap_factor", 10)),
+            randomize_seed=int(effective.get("base_seed", global_random_state)),
+            normalization=str(effective.get("connectome_normalization", "maxabs")),
+        )
+        last_bundle_cache_key = key
+        return last_bundle.adjacency
+
+    tmp_dir = os.path.join(output_dir, "_optuna_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_save_path = os.path.join(tmp_dir, f"{model_type}_trial.pth")
+
+    def objective(trial: Any) -> float:
+        trial_params = {
+            name: _suggest_optuna_param(trial, name, spec)
+            for name, spec in search_space.items()
+        }
+        effective_params = {**registry_defaults, **user_model_params, **trial_params}
+        if trial_epoch_cap is not None:
+            effective_params["max_epochs_adam"] = min(
+                int(effective_params.get("max_epochs_adam", trial_epoch_cap)),
+                trial_epoch_cap,
+            )
+            effective_params["num_epochs_lbfgs"] = min(
+                int(effective_params.get("num_epochs_lbfgs", trial_epoch_cap)),
+                trial_epoch_cap,
+            )
+
+        LOGGER.info(
+            "[optuna trial %d/%d] start params=%s",
+            int(trial.number) + 1,
+            n_trials,
+            trial_params,
+        )
+        cfg = parse_training_config(
+            model_type=model_type,
+            model_params=effective_params,
+            train_block=train_block,
+            global_random_state=global_random_state,
+        )
+        metric_key = _optuna_metric_key(cfg, tuning_block)
+        connectome_adj = _resolve_connectome_for_trial(trial_params)
+        score = _train_and_score_val(
+            model_type=model_type,
+            cfg=cfg,
+            sliced_clean=sliced_clean,
+            sliced_noisy=sliced_noisy,
+            data_noisy=data_noisy,
+            split_cfg=split_cfg,
+            connectome_adj=connectome_adj,
+            seed=_trial_seed(global_random_state, trial.number),
+            tmp_save_path=tmp_save_path,
+            metric_key=metric_key,
+            num_runs=trial_num_runs,
+        )
+        if score is None or not np.isfinite(score):
+            LOGGER.info(
+                "[optuna trial %d/%d] pruned: invalid validation %s",
+                int(trial.number) + 1,
+                n_trials,
+                metric_key,
+            )
+            raise optuna.exceptions.TrialPruned("invalid validation RMSE")
+        LOGGER.info(
+            "[optuna trial %d/%d] complete: validation %s=%.6f",
+            int(trial.number) + 1,
+            n_trials,
+            metric_key,
+            float(score),
+        )
+        return float(score)
+
+    LOGGER.info(
+        "Starting time-series Optuna HPO for %s: n_trials=%d metric=%s axes=%s",
+        model_type,
+        n_trials,
+        tuning_block.get("metric", "rmse_h<max_horizon>"),
+        sorted(search_space.keys()),
+    )
+    try:
+        study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
+    finally:
+        try:
+            import shutil
+
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    completed = [t for t in study.trials if t.value is not None and np.isfinite(t.value)]
+    if not completed:
+        raise RuntimeError(
+            f"Optuna search for {model_type} produced no valid trials; every trial "
+            "was pruned or errored. Inspect logs for the validation-scoring warnings."
+        )
+
+    best = study.best_trial
+    trials_path = os.path.join(output_dir, f"{model_type}_optuna_trials.csv")
+    param_names = sorted({name for trial in study.trials for name in trial.params})
+    with open(trials_path, "w", newline="", encoding="utf-8") as f:
+        fieldnames = ["number", "state", "value"] + [f"param_{name}" for name in param_names]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for trial in study.trials:
+            row = {
+                "number": int(trial.number),
+                "state": getattr(trial.state, "name", str(trial.state)),
+                "value": trial.value if trial.value is not None else "",
+            }
+            for name in param_names:
+                row[f"param_{name}"] = trial.params.get(name, "")
+            writer.writerow(row)
+
+    metric_name = str(tuning_block.get("metric", "")).strip().lower() or None
+    if metric_name in {None, "", "rmse", "val_rmse"}:
+        best_cfg = parse_training_config(
+            model_type=model_type,
+            model_params={**registry_defaults, **user_model_params, **dict(best.params)},
+            train_block=train_block,
+            global_random_state=global_random_state,
+        )
+        metric_name = f"rmse_h{max(best_cfg.horizons)}"
+    summary = {
+        "method": "optuna",
+        "objective": "validation_rmse",
+        "direction": "minimize",
+        "metric": metric_name,
+        "n_trials_requested": int(n_trials),
+        "n_trials_completed": int(len(completed)),
+        "best_trial_number": int(best.number),
+        "best_value": float(best.value),
+        "best_params": dict(best.params),
+        "search_axes": sorted(search_space.keys()),
+        "trial_epoch_cap": trial_epoch_cap,
+        "optuna_num_runs": int(trial_num_runs),
+        "trials_path": trials_path,
+    }
+    summary_path = os.path.join(output_dir, f"{model_type}_optuna_summary.json")
+    summary["summary_path"] = summary_path
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, default=_json_default)
+
+    LOGGER.info(
+        "Time-series Optuna HPO complete: best validation RMSE=%.6f params=%s",
+        best.value,
+        best.params,
+    )
+    return dict(best.params), summary
+
+
 def train_timeseries_nvar(
     *,
     model_type: str,
@@ -637,12 +1054,9 @@ def train_timeseries_nvar(
     """Train an Adaptive NVAR model and write all artifacts under output_dir.
 
     Dispatch:
-      * `train.tuning.method == "fixed"` (default): train once with the
-        hyperparameters in `model_params`, fall back to dl_registry defaults
-        for anything not provided.
-
-    Runtime child-level Optuna search is disabled. Use DOE `model_search` when
-    time-series hyperparameter candidates should be scientific parent cases.
+      * `train.tuning.method == "fixed"` (default): current fixed behavior.
+      * `train.tuning.method == "optuna"`: real time-series HPO, where Optuna
+        minimizes validation rollout RMSE before the final test protocol runs.
     """
     if model_type not in SUPPORTED_MODEL_TYPES:
         raise ValueError(
@@ -654,11 +1068,35 @@ def train_timeseries_nvar(
     tuning_block = train_block.get("tuning", {}) if isinstance(train_block, dict) else {}
     tuning_method = str(tuning_block.get("method", "fixed")).strip().lower()
 
+    if tuning_method == "optuna":
+        best_params, optuna_summary = _run_optuna_timeseries(
+            model_type=model_type,
+            raw_path=raw_path,
+            output_dir=output_dir,
+            user_model_params=dict(model_params or {}),
+            train_block=train_block,
+            split_block=split_block,
+            tuning_block=tuning_block,
+            global_random_state=int(global_random_state),
+        )
+        merged_params = {**model_params, **best_params}
+        train_block_for_final = dict(train_block or {})
+        train_block_for_final["tuning"] = {"method": "fixed"}
+        return _train_timeseries_nvar_repeated_final(
+            model_type=model_type,
+            raw_path=raw_path,
+            output_dir=output_dir,
+            model_params=merged_params,
+            train_block=train_block_for_final,
+            split_block=split_block,
+            global_random_state=int(global_random_state),
+            optuna_summary=optuna_summary,
+        )
+
     if tuning_method not in {"fixed", ""}:
         raise ValueError(
             f"Unsupported tuning.method={tuning_method!r} for train.timeseries; "
-            "runtime child-level hyperparameter search is disabled. "
-            "Use DOE model_search to create parent-level fixed hyperparameter cases."
+            "expected 'fixed' or 'optuna'."
         )
 
     return _train_timeseries_nvar_repeated_final(
@@ -744,6 +1182,7 @@ def _train_timeseries_nvar_repeated_final(
     train_block: dict[str, Any],
     split_block: dict[str, Any],
     global_random_state: int,
+    optuna_summary: Optional[dict[str, Any]] = None,
 ) -> TimeSeriesTrainResult:
     """Run the fixed-param training/testing protocol, optionally repeated."""
     cfg0 = parse_training_config(
@@ -763,6 +1202,7 @@ def _train_timeseries_nvar_repeated_final(
             train_block=train_block,
             split_block=split_block,
             global_random_state=int(global_random_state),
+            optuna_summary=optuna_summary,
         )
 
     LOGGER.info(
@@ -821,6 +1261,7 @@ def _train_timeseries_nvar_repeated_final(
             train_block=train_block,
             split_block=split_block,
             global_random_state=run_seed,
+            optuna_summary=optuna_summary if run_idx == 0 else None,
         )
         wall_seconds = _time.time() - t_start
         if first_result is None:
@@ -903,6 +1344,8 @@ def _train_timeseries_nvar_repeated_final(
                     if k in partial_train_stats:
                         snapshot[f"train_{k}"] = partial_train_stats[k]
             snapshot["partial"] = True
+            if optuna_summary is not None:
+                snapshot["tuning"] = optuna_summary
             with open(first_result.metrics_path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, indent=2, default=_json_default)
         except Exception as exc:
@@ -964,6 +1407,8 @@ def _train_timeseries_nvar_repeated_final(
             if k in train_stats:
                 main_metrics[f"train_{k}"] = train_stats[k]
     main_metrics["partial"] = False
+    if optuna_summary is not None:
+        main_metrics["tuning"] = optuna_summary
     with open(first_result.metrics_path, "w", encoding="utf-8") as f:
         json.dump(main_metrics, f, indent=2, default=_json_default)
 
@@ -1017,6 +1462,7 @@ def _train_timeseries_nvar_once(
     train_block: dict[str, Any],
     split_block: dict[str, Any],
     global_random_state: int,
+    optuna_summary: Optional[dict[str, Any]] = None,
 ) -> TimeSeriesTrainResult:
     """Single-shot fixed-param train + evaluate + persist."""
 
@@ -1219,6 +1665,8 @@ def _train_timeseries_nvar_once(
         },
         "data_dim": int(d),
     }
+    if optuna_summary is not None:
+        metrics["tuning"] = optuna_summary
     metrics_path = os.path.join(output_dir, f"{model_type}_metrics.json")
 
     # Per-window-per-horizon CSV --------------------------------------------
