@@ -601,8 +601,11 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
             _as_dict(train_cfg.get("tuning")),
             "train.tuning",
             allow_optuna=(
-                "train.timeseries" in nodes
-                and ts_train_model_type in _TIMESERIES_MODELS
+                "train" in nodes
+                or (
+                    "train.timeseries" in nodes
+                    and ts_train_model_type in _TIMESERIES_MODELS
+                )
             ),
         )
 

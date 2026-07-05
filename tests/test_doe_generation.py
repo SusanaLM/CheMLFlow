@@ -885,7 +885,6 @@ def test_generate_doe_model_search_optuna_uses_real_optuna_package() -> None:
     ("default_key", "default_value"),
     [
         ("train.tuning.method", "train_cv"),
-        ("train.tuning.method", "optuna"),
         ("train.tuning.use_hpo", True),
     ],
 )
@@ -899,6 +898,29 @@ def test_generate_doe_rejects_child_level_tuning_defaults(
 
     with pytest.raises(DOEGenerationError, match="Runtime child-level tuning setting"):
         generate_doe(spec)
+
+
+def test_generate_doe_allows_runtime_optuna_default_without_parent_fanout(tmp_path: Path) -> None:
+    spec = _base_clf_doe(tmp_path)
+    spec["defaults"]["train.tuning.method"] = "optuna"
+    spec["defaults"]["train.tuning.n_trials"] = 2
+    spec["defaults"]["train.tuning.metric"] = "val_auc"
+    spec["defaults"]["train.tuning.direction"] = "maximize"
+    spec["defaults"]["train.tuning.params.max_depth"] = {
+        "type": "categorical",
+        "choices": [2, 4],
+    }
+
+    result = generate_doe(spec)
+
+    assert result["summary"]["valid_cases"] == 1
+    config = yaml.safe_load(
+        Path(result["valid_cases"][0]["config_path"]).read_text(encoding="utf-8")
+    )
+    assert config["train"]["tuning"]["method"] == "optuna"
+    assert config["train"]["tuning"]["n_trials"] == 2
+    assert config["train"]["tuning"]["metric"] == "val_auc"
+    assert config["train"]["tuning"]["params"]["max_depth"]["choices"] == [2, 4]
 
 
 def test_generate_doe_allows_timeseries_optuna_default(

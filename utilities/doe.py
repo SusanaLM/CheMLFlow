@@ -2390,7 +2390,7 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
     _validate_search_space_axes(search_space_flat)
     _validate_default_runtime_tuning(
         defaults_flat,
-        allow_train_optuna=profile.train_node == "train.timeseries",
+        allow_train_optuna=profile.train_node in {"train", "train.timeseries"},
     )
     declared_axes = set(defaults_flat) | set(search_space_flat)
     max_cases = constraints_cfg.get("max_cases")

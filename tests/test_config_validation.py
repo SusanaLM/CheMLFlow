@@ -185,6 +185,29 @@ def test_strict_rejects_child_level_train_hpo(tuning_cfg: dict, path: str) -> No
     )
 
 
+def test_strict_allows_train_optuna() -> None:
+    cfg = _base_config(["train"])
+    cfg["train"] = {
+        "model": {"type": "random_forest"},
+        "tuning": {
+            "method": "optuna",
+            "n_trials": 2,
+            "metric": "val_auc",
+            "params": {
+                "max_depth": {"type": "categorical", "choices": [2, 4]},
+            },
+        },
+    }
+
+    issues = collect_config_issues(cfg, ["train"])
+
+    assert not any(
+        issue.code == "CFG_CHILD_LEVEL_HPO_UNSUPPORTED"
+        and issue.path == "train.tuning.method"
+        for issue in issues
+    )
+
+
 def test_strict_allows_timeseries_optuna() -> None:
     cfg = _base_config(["train.timeseries"])
     cfg["train"] = {
