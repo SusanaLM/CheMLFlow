@@ -1,10 +1,10 @@
 # ======================================================================
 # DOE spec for the time-series Adaptive NVAR pipeline.
 #
-# This spec mirrors the 10% Mackey-Glass Adaptive NVAR notebooks while keeping
-# CheMLFlow's Optuna model_search instead of the notebook grid search.
-# Hyperparameter candidates (k, hidden_dim, lr_adam, lr_lbfgs) are expanded as
-# DOE parent cases via model_search. Runtime child configs stay fixed.
+# This spec mirrors the Mackey-Glass Adaptive NVAR notebooks using real
+# validation-based runtime Optuna HPO inside the time-series child job.
+# Optuna selects k, hidden_dim, lr_adam, and lr_lbfgs on validation RMSE@100;
+# the selected configuration is then evaluated with repeated final tests.
 #
 # Generate concrete case configs:
 #   python scripts/generate_doe.py --doe config/doe_timeseries.yaml
@@ -27,47 +27,51 @@ dataset:
 defaults:
   global.task_type: regression
   global.random_state: 2025
-  global.base_dir: artifacts/data/doe_timeseries
+  global.base_dir: artifacts/data/doe_timeseries_{timestamp}
+  global.run_dir: artifacts/runs/doe_timeseries_{timestamp}
   pipeline.feature_input: none
-  train.tuning.method: fixed
+  train.tuning.method: optuna
+  train.tuning.n_trials: 20
+  train.tuning.trial_epoch_cap: 50
+  train.tuning.seed: 2025
+  train.tuning.direction: minimize
+  train.tuning.metric: rmse_h100
+  train.tuning.params.k: {type: categorical, choices: [2, 10, 30, 50]}
+  train.tuning.params.hidden_dim: {type: categorical, choices: [10, 20, 50, 100, 200, 500, 1000]}
+  train.tuning.params.lr_adam: {type: float, low: 1.0e-4, high: 1.0e-2, log: true}
+  train.tuning.params.lr_lbfgs: {type: float, low: 0.1, high: 1.0, log: false}
   train.model.type: dl_adaptive_nvar
-  # Reasonable defaults; model_search emits concrete values for searched axes
-  # (k, hidden_dim, lr_adam, lr_lbfgs).
   train.model.params.weight_decay: 0.0
   train.model.params.num_windows: 10
   train.model.params.horizons: [25, 50, 75, 100]
-  train.model.params.test_num_runs: 25       # final independent test trainings; report mean ± std
-  train.model.params.selection_segment: val  # notebook grid search selected by validation RMSE@100
+  train.model.params.test_num_runs: 10
+  train.model.params.selection_segment: val
   train.model.params.adam_patience: 200
   train.model.params.lbfgs_patience: 200
-  train.model.params.max_epochs_adam: 5000      # final-retrain budget
-  train.model.params.num_epochs_lbfgs: 50000    # final-retrain budget
-  # Device selection. "cuda" is strict: the job fails fast if the env did
-  # not actually allocate a GPU (CUDA not available, CUDA-less PyTorch, no
-  # nodes with --gpus=1, etc.). Set to "auto" to fall back to CPU silently,
-  # or "cpu" to force CPU even on GPU nodes.
-  train.model.params.device: cuda
+  train.model.params.max_epochs_adam: 50
+  train.model.params.num_epochs_lbfgs: 50
+  train.model.params.device: auto
 
-# Scientific factors for the 10% notebook case.
+# Scientific factors for the notebook cases.
 #   - dataset_noise_scale: measurement noise added globally.
 #   - train_noise_scale:   training-time perturbation on the train segment.
 search_space:
-  train.model.params.dataset_noise_scale: [0.10]
-  train.model.params.train_noise_scale: [0.0]
+  train.model.params.dataset_noise_scale: [0.0, 0.10, 0.20, 0.30]
+  train.model.params.train_noise_scale: [0.05, 0.0]
 
-model_search:
-  dl_adaptive_nvar:
-    method: optuna
-    n_trials: 80
-    seed: 2025
-    params:
-      k: {type: categorical, choices: [2, 10, 30, 50]}
-      hidden_dim: {type: categorical, choices: [10, 20, 50, 100, 200, 500, 1000]}
-      lr_adam: {type: categorical, choices: [1.0e-4, 1.0e-3, 1.0e-2]}
-      lr_lbfgs: {type: categorical, choices: [1.0, 0.5, 0.1]}
+constraints:
+  allowed_combinations:
+    - train.model.params.dataset_noise_scale: 0.0
+      train.model.params.train_noise_scale: 0.05
+    - train.model.params.dataset_noise_scale: 0.10
+      train.model.params.train_noise_scale: 0.0
+    - train.model.params.dataset_noise_scale: 0.20
+      train.model.params.train_noise_scale: 0.0
+    - train.model.params.dataset_noise_scale: 0.30
+      train.model.params.train_noise_scale: 0.0
 
 selection:
   max_cases: null
 
 output:
-  dir: doe/timeseries
+  dir: doe/doe_timeseries_{timestamp}
