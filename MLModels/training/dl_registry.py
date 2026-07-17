@@ -268,7 +268,9 @@ def build_timeseries_dl_search_config(
         )
 
     if model_type == "dl_adaptive_nvar":
-        # Mirrors `Optuna_MG_Adaptive_NVAR_0percent_noise.ipynb` (notebook 2).
+        # Mirrors the Mackey-Glass Adaptive NVAR notebooks. DOE keeps Optuna
+        # sampling for these categorical axes; each sampled child uses the same
+        # training/rollout/test protocol as the grid-search reference.
         # Architectural axes:
         #   - k:          delay-embedding length. Small k underfits chaotic
         #                 dynamics; large k inflates dk = d*k.
@@ -281,7 +283,7 @@ def build_timeseries_dl_search_config(
             model_class=_unused_model_class,
             search_space={
                 # Notebook-faithful values from
-                # Optuna_MG_Adaptive_NVAR_0percent_noise.ipynb:
+                # Grid_search_MG_Adaptive_NVAR_10percent_noise.ipynb:
                 #   k_grid         = [2, 10, 30, 50]
                 #   hidden_dim_grid= [10, 20, 50, 100, 200, 500, 1000]
                 #   adam_lr_grid   = [1e-4, 1e-3, 1e-2]
@@ -309,10 +311,12 @@ def build_timeseries_dl_search_config(
                 "num_epochs_lbfgs": 50000,
                 "lbfgs_patience": 200,
                 "weight_decay": 0.0,
-                "train_noise_scale": 0.05,
-                "dataset_noise_scale": 0.0,
+                "train_noise_scale": 0.0,
+                "dataset_noise_scale": 0.10,
                 "horizons": [25, 50, 75, 100],
                 "num_windows": 10,
+                "test_num_runs": 25,
+                "selection_segment": "val",
             },
         )
 
@@ -358,7 +362,7 @@ def build_timeseries_dl_search_config(
                 "adam_patience": 200,
                 "num_epochs_lbfgs": 50000,
                 "lbfgs_patience": 200,
-                "train_noise_scale": 0.05,
+                "train_noise_scale": 0.0,
                 "dataset_noise_scale": 0.0,
                 "horizons": [25, 50, 75, 100],
                 "num_windows": 10,

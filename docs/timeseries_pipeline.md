@@ -15,13 +15,14 @@ chaotic dynamical systems (Mackey–Glass, etc.) using the user's
 | Data sources | `local_npy`, `local_ts_csv` |
 | DOE profile | `ts_forecast` (regression, source `local_npy`, models above) |
 | Trainer | Two-phase Adam → L-BFGS, windowed autoregressive rollout, multi-horizon RMSE |
-| Metrics | `<model>_metrics.json` + `<model>_split_metrics.json` + per-window-per-horizon CSV |
+| Metrics | `<model>_metrics.json` + `<model>_split_metrics.json` + per-window CSV + notebook-style PNG plots |
 
 Architectures are ported faithfully from the user's notebooks
-(`Optuna_MG_Adaptive_NVAR_0percent_noise.ipynb`,
- `Adaptive_NVAR_optuna_connectome.ipynb`); training, splitting, and rollout
-are isolated into pipeline-friendly modules so the same trainer can serve
-future autoregressive models.
+(`Grid_search_MG_Adaptive_NVAR_10percent_noise.ipynb`,
+ `Prediction_on_test_MG_Adaptive_NVAR_10percent_noise.ipynb`); CheMLFlow keeps
+Optuna for the hyperparameter search but matches the notebooks' training,
+validation-window selection, repeated test runs, rollout, and plotting
+protocol.
 
 ## Quickstart
 
@@ -49,6 +50,7 @@ artifacts/runs/ts_quick_demo/
   dl_adaptive_nvar_split_metrics.json                 # train/val/test horizon RMSEs
   dl_adaptive_nvar_rollout_per_window_per_horizon.csv # rich table
   dl_adaptive_nvar_predictions.npz                    # per-window pred/true/noisy
+  dl_adaptive_nvar_test_pred_vs_truth_*.png           # notebook-style rollout plots
   dl_adaptive_nvar_best_model.pth                     # torch state_dict
   dl_adaptive_nvar_best_params.pkl                    # hyperparameters
   run_config.yaml, run_status.json, run.log
@@ -145,8 +147,10 @@ train:
       lr_lbfgs: 1.0
       horizons: [25, 50, 75, 100]
       num_windows: 10
-      train_noise_scale: 0.05
-      dataset_noise_scale: 0.0
+      train_noise_scale: 0.0
+      dataset_noise_scale: 0.10
+      test_num_runs: 25
+      selection_segment: val
 ```
 
 Runtime `tuning.method: optuna` is disabled. To compare searched axes such as
@@ -154,6 +158,14 @@ k, hidden_dim, lr_adam, lr_lbfgs, n_connectome, input_scaling, or weight_decay,
 define them under DOE `model_search.method: optuna`. DOE generation writes each
 Optuna parent trial as concrete `train.model.params` before child execution
 fanout.
+
+For the Mackey-Glass Adaptive NVAR DOE, `model_search` uses Optuna over the
+same discrete choices as the notebook grid:
+`k=[2,10,30,50]`, `hidden_dim=[10,20,50,100,200,500,1000]`,
+`lr_adam=[1e-4,1e-3,1e-2]`, and `lr_lbfgs=[1.0,0.5,0.1]`.
+The trainer records `selection_segment: val` so summaries can rank search
+candidates by validation RMSE@100, while test RMSE remains available for the
+final fixed configuration.
 
 The full parameter list is documented in
 `MLModels/training/timeseries_nvar.py::TrainingConfig`.
@@ -180,6 +192,9 @@ config parsing, and time-series slicing. They run in <5 s on CPU.
   `(window, horizon)` pair, then averaged across windows for the
   aggregate metric. The number of windows is configurable via
   `train.model.params.num_windows`.
+* **Plots are generated from the saved rollout arrays.** The trainer writes
+  notebook-style prediction-vs-clean-vs-noisy PNGs for each available segment
+  and stores their paths in `<model>_metrics.json`.
 * **Training noise is applied only to the train segment.** A separate
   `dataset_noise_scale` adds noise globally before splitting; useful for
   measurement-noise robustness studies.

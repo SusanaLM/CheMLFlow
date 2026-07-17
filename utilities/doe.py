@@ -7,6 +7,7 @@ import math
 import os
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,8 @@ _SMILES_COLUMN_CANDIDATES = (
 )
 _DEFAULT_MAX_EXPANDED_CASES = 10000
 _DOE_SPEC_NAMESPACE_LEN = 8
+_DOE_RUN_NAMESPACE_FORMAT = "%Y%m%d_%H%M%S"
+_DOE_RUN_NAMESPACE_TOKENS = ("{timestamp}", "{run_timestamp}", "{run_namespace}")
 _FEATURE_INPUT_ALIASES = {
     "use.curated_features": "featurize.none",
 }
@@ -300,7 +303,11 @@ def _validate_search_space_axes(search_space_flat: dict[str, Any]) -> None:
         )
 
 
-def _validate_default_runtime_tuning(defaults_flat: dict[str, Any]) -> None:
+def _validate_default_runtime_tuning(
+    defaults_flat: dict[str, Any],
+    *,
+    allow_train_optuna: bool = False,
+) -> None:
     for key in sorted(defaults_flat):
         if not any(key.startswith(prefix) for prefix in _RUNTIME_TUNING_PREFIXES):
             continue
@@ -309,6 +316,8 @@ def _validate_default_runtime_tuning(defaults_flat: dict[str, Any]) -> None:
         if leaf == "method":
             method = str(value or "fixed").strip().lower()
             if method in {"", "fixed"}:
+                continue
+            if allow_train_optuna and key == "train.tuning.method" and method == "optuna":
                 continue
         elif leaf == "use_hpo":
             if not _as_bool(value):
@@ -457,19 +466,50 @@ def _scientific_config_payload(config: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _case_scoped_path(path_template: str, case_id: str, namespace: str | None = None) -> str:
+def _new_doe_run_namespace() -> str:
+    return datetime.now().strftime(_DOE_RUN_NAMESPACE_FORMAT)
+
+
+def _uses_run_namespace_token(value: object) -> bool:
+    text = str(value)
+    return any(token in text for token in _DOE_RUN_NAMESPACE_TOKENS)
+
+
+def _render_run_namespace_tokens(value: str, run_namespace: str | None) -> str:
+    rendered = str(value)
+    if not run_namespace:
+        return rendered
+    for token in _DOE_RUN_NAMESPACE_TOKENS:
+        rendered = rendered.replace(token, run_namespace)
+    return rendered
+
+
+def _case_scoped_path(
+    path_template: str,
+    case_id: str,
+    namespace: str | None = None,
+    run_namespace: str | None = None,
+    append_namespace: bool = True,
+) -> str:
     template = str(path_template).strip()
+    template = _render_run_namespace_tokens(template, run_namespace)
     if not template:
-        return os.path.join(namespace, case_id) if namespace else case_id
+        if namespace and append_namespace:
+            return os.path.join(namespace, case_id)
+        return case_id
 
     rendered = template
     if namespace and "{doe_spec_hash}" in rendered:
         rendered = rendered.replace("{doe_spec_hash}", namespace)
     if "{case_id}" in rendered:
-        scoped_case = os.path.join(namespace, case_id) if namespace and "{doe_spec_hash}" not in template else case_id
+        scoped_case = (
+            os.path.join(namespace, case_id)
+            if namespace and append_namespace and "{doe_spec_hash}" not in template
+            else case_id
+        )
         return rendered.replace("{case_id}", scoped_case)
 
-    if namespace:
+    if namespace and append_namespace:
         return os.path.join(rendered, namespace, case_id)
     return os.path.join(rendered, case_id)
 
@@ -479,6 +519,7 @@ def _apply_case_isolation(
     case_id: str,
     output_dir: str,
     spec_namespace: str | None = None,
+    run_namespace: str | None = None,
 ) -> None:
     global_cfg = config.setdefault("global", {})
     if not isinstance(global_cfg, dict):
@@ -487,12 +528,24 @@ def _apply_case_isolation(
     base_root = str(global_cfg.get("base_dir", os.path.join("data", "doe"))).strip() or os.path.join(
         "data", "doe"
     )
-    global_cfg["base_dir"] = _case_scoped_path(base_root, case_id, namespace=spec_namespace)
+    global_cfg["base_dir"] = _case_scoped_path(
+        base_root,
+        case_id,
+        namespace=spec_namespace,
+        run_namespace=run_namespace,
+        append_namespace=not _uses_run_namespace_token(base_root),
+    )
 
     run_root = str(global_cfg.get("run_dir", os.path.join(output_dir, "runs"))).strip() or os.path.join(
         output_dir, "runs"
     )
-    global_cfg["run_dir"] = _case_scoped_path(run_root, case_id, namespace=spec_namespace)
+    global_cfg["run_dir"] = _case_scoped_path(
+        run_root,
+        case_id,
+        namespace=spec_namespace,
+        run_namespace=run_namespace,
+        append_namespace=not _uses_run_namespace_token(run_root),
+    )
 
     runs_cfg = global_cfg.get("runs")
     if not isinstance(runs_cfg, dict):
@@ -501,7 +554,7 @@ def _apply_case_isolation(
     else:
         runs_cfg["enabled"] = _as_bool(runs_cfg.get("enabled", True))
 
-    configured_id = str(runs_cfg.get("id", "")).strip()
+    configured_id = _render_run_namespace_tokens(str(runs_cfg.get("id", "")).strip(), run_namespace)
     runs_cfg["id"] = configured_id.replace("{case_id}", case_id) if configured_id else case_id
 
 
@@ -779,6 +832,41 @@ def _expand_search_space(search_space: dict[str, Any], max_cases: int | None) ->
                 f"Expanded DOE produced more than constraints.max_cases={max_cases} combinations."
             )
     return combos
+
+
+def _normalize_allowed_combinations(raw: Any) -> list[dict[str, Any]]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise DOEGenerationError("constraints.allowed_combinations must be a list of mappings.")
+
+    allowed: list[dict[str, Any]] = []
+    for index, item in enumerate(raw, start=1):
+        if not isinstance(item, dict) or not item:
+            raise DOEGenerationError(
+                f"constraints.allowed_combinations[{index}] must be a non-empty mapping."
+            )
+        allowed.append(_flatten_dict(item))
+    return allowed
+
+
+def _constraint_value_matches(actual: Any, expected: Any) -> bool:
+    if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
+        return math.isclose(float(actual), float(expected), rel_tol=0.0, abs_tol=1e-12)
+    return actual == expected
+
+
+def _matches_allowed_combination(merged: dict[str, Any], allowed: dict[str, Any]) -> bool:
+    return all(
+        key in merged and _constraint_value_matches(merged.get(key), expected)
+        for key, expected in allowed.items()
+    )
+
+
+def _is_allowed_combination(merged: dict[str, Any], allowed_combinations: list[dict[str, Any]]) -> bool:
+    if not allowed_combinations:
+        return True
+    return any(_matches_allowed_combination(merged, allowed) for allowed in allowed_combinations)
 
 
 def _model_type_from_flat(merged: dict[str, Any], default_model_type: str = "") -> str:
@@ -2262,7 +2350,8 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
     else:
         raise DOEGenerationError("model_search must be a mapping of model type to search definition.")
 
-    output_dir = str(output_cfg.get("dir", "")).strip()
+    run_namespace = _new_doe_run_namespace()
+    output_dir = _render_run_namespace_tokens(str(output_cfg.get("dir", "")).strip(), run_namespace)
     if not output_dir:
         raise DOEGenerationError("output.dir is required.")
     os.makedirs(output_dir, exist_ok=True)
@@ -2299,12 +2388,16 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
     defaults_flat = _flatten_dict(defaults_cfg)
     search_space_flat = _flatten_dict(search_space)
     _validate_search_space_axes(search_space_flat)
-    _validate_default_runtime_tuning(defaults_flat)
+    _validate_default_runtime_tuning(
+        defaults_flat,
+        allow_train_optuna=profile.train_node in {"train", "train.timeseries"},
+    )
     declared_axes = set(defaults_flat) | set(search_space_flat)
     max_cases = constraints_cfg.get("max_cases")
     if max_cases is not None:
         max_cases = int(max_cases)
     isolate_case_artifacts = _as_bool(constraints_cfg.get("isolate_case_artifacts", True))
+    allowed_combinations = _normalize_allowed_combinations(constraints_cfg.get("allowed_combinations"))
     expanded = _expand_search_space(search_space_flat, max_cases=max_cases)
     expanded = _expand_model_search(
         expanded=expanded,
@@ -2393,6 +2486,14 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
                 probe=probe,
             )
             issues = _validate_case(profile=profile, config=base_config, probe=probe)
+            if not _is_allowed_combination(merged, allowed_combinations):
+                issues.append(
+                    DOEIssue(
+                        code="DOE_COMBINATION_NOT_ALLOWED",
+                        path="constraints.allowed_combinations",
+                        message="This factor combination is outside constraints.allowed_combinations.",
+                    )
+                )
 
             record: dict[str, Any] = {
                 "record_type": "execution_child",
@@ -2452,6 +2553,7 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
                     case_id=case_id,
                     output_dir=output_dir,
                     spec_namespace=spec_namespace,
+                    run_namespace=run_namespace,
                 )
             config_hash = _stable_hash(config)
 
@@ -2538,6 +2640,7 @@ def generate_doe(spec: dict[str, Any], doe_path: str | None = None) -> dict[str,
         },
         "constraints": {
             "isolate_case_artifacts": isolate_case_artifacts,
+            "allowed_combinations": len(allowed_combinations),
         },
     }
     summary_path = os.path.join(output_dir, "summary.json")

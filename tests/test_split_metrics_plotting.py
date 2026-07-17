@@ -17,6 +17,53 @@ from analysis import (
 )
 
 
+class _ScriptedRegressor:
+    events: list[str] = []
+
+    def __init__(self, quality: str):
+        self.quality = quality
+
+    def fit(self, X, y):
+        self.events.append(f"fit:{self.quality}")
+        return self
+
+    def predict(self, X):
+        split_name = str(X["split"].iloc[0])
+        self.events.append(f"predict_{split_name}:{self.quality}")
+        if split_name == "val":
+            return np.zeros(len(X), dtype=float) if self.quality == "val_good" else np.full(len(X), 10.0)
+        if split_name == "test":
+            return np.full(len(X), 10.0) if self.quality == "val_good" else np.zeros(len(X), dtype=float)
+        return np.zeros(len(X), dtype=float)
+
+
+class _ScriptedClassifier:
+    events: list[str] = []
+
+    def __init__(self, quality: str):
+        self.quality = quality
+
+    def fit(self, X, y):
+        self.events.append(f"fit:{self.quality}")
+        return self
+
+    def predict_proba(self, X):
+        split_name = str(X["split"].iloc[0])
+        self.events.append(f"predict_proba_{split_name}:{self.quality}")
+        good_scores = np.array([0.1, 0.9, 0.1, 0.9], dtype=float)
+        bad_scores = 1.0 - good_scores
+        if split_name == "val":
+            scores = good_scores if self.quality == "val_good" else bad_scores
+        elif split_name == "test":
+            scores = bad_scores if self.quality == "val_good" else good_scores
+        else:
+            scores = good_scores
+        return np.column_stack([1.0 - scores, scores])
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+
 def test_train_model_writes_split_metrics_artifacts(tmp_path):
     rng = np.random.default_rng(0)
     X = pd.DataFrame(rng.normal(size=(36, 5)), columns=[f"f{i}" for i in range(5)])
@@ -666,6 +713,194 @@ def test_train_model_rejects_model_config_use_hpo(tmp_path):
             output_dir=str(tmp_path),
             model_config={"tuning": {"method": "fixed", "use_hpo": True}},
         )
+
+
+def test_runtime_optuna_regression_uses_validation_rmse_not_test(monkeypatch, tmp_path):
+    pytest.importorskip("optuna")
+    _ScriptedRegressor.events = []
+
+    def _fake_initialize_model(*args, **kwargs):
+        return _ScriptedRegressor(kwargs["model_params"]["quality"])
+
+    monkeypatch.setattr(train_models, "_initialize_model", _fake_initialize_model)
+
+    X_train = pd.DataFrame({"split": ["train"] * 4})
+    y_train = pd.Series([0.0, 0.0, 0.0, 0.0])
+    X_val = pd.DataFrame({"split": ["val"] * 4})
+    y_val = pd.Series([0.0, 0.0, 0.0, 0.0])
+    X_test = pd.DataFrame({"split": ["test"] * 4})
+    y_test = pd.Series([0.0, 0.0, 0.0, 0.0])
+
+    _, train_result = train_models.train_model(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        model_type="random_forest",
+        output_dir=str(tmp_path),
+        task_type="regression",
+        model_config={
+            "n_jobs": 1,
+            "tuning": {
+                "method": "optuna",
+                "sampler": "grid",
+                "n_trials": 2,
+                "metric": "val_rmse",
+                "direction": "minimize",
+                "params": {
+                    "quality": {
+                        "type": "categorical",
+                        "choices": ["val_good", "test_good"],
+                    },
+                },
+            },
+        },
+        X_val=X_val,
+        y_val=y_val,
+    )
+
+    metrics = json.loads(Path(train_result.metrics_path).read_text(encoding="utf-8"))
+    tuning = metrics["tuning"]
+    assert tuning["metric"] == "val_rmse"
+    assert tuning["direction"] == "minimize"
+    assert tuning["best_params"]["quality"] == "val_good"
+    assert tuning["best_value"] == 0.0
+    assert "predict_test:val_good" in _ScriptedRegressor.events
+
+
+def test_runtime_optuna_classification_maximizes_validation_auc(monkeypatch, tmp_path):
+    pytest.importorskip("optuna")
+    _ScriptedClassifier.events = []
+
+    def _fake_initialize_model(*args, **kwargs):
+        return _ScriptedClassifier(kwargs["model_params"]["quality"])
+
+    monkeypatch.setattr(train_models, "_initialize_model", _fake_initialize_model)
+    monkeypatch.setattr(train_models, "_save_roc_curve", lambda *args, **kwargs: None)
+
+    X_train = pd.DataFrame({"split": ["train"] * 4})
+    y_train = pd.Series([0, 1, 0, 1])
+    X_val = pd.DataFrame({"split": ["val"] * 4})
+    y_val = pd.Series([0, 1, 0, 1])
+    X_test = pd.DataFrame({"split": ["test"] * 4})
+    y_test = pd.Series([0, 1, 0, 1])
+
+    _, train_result = train_models.train_model(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        model_type="random_forest",
+        output_dir=str(tmp_path),
+        task_type="classification",
+        model_config={
+            "n_jobs": 1,
+            "tuning": {
+                "method": "optuna",
+                "sampler": "grid",
+                "n_trials": 2,
+                "metric": "val_auc",
+                "direction": "maximize",
+                "params": {
+                    "quality": {
+                        "type": "categorical",
+                        "choices": ["val_good", "test_good"],
+                    },
+                },
+            },
+        },
+        X_val=X_val,
+        y_val=y_val,
+    )
+
+    metrics = json.loads(Path(train_result.metrics_path).read_text(encoding="utf-8"))
+    tuning = metrics["tuning"]
+    assert tuning["metric"] == "val_auc"
+    assert tuning["direction"] == "maximize"
+    assert tuning["best_params"]["quality"] == "val_good"
+    assert tuning["best_value"] == 1.0
+
+
+def test_runtime_optuna_final_test_metrics_after_best_params(monkeypatch, tmp_path):
+    pytest.importorskip("optuna")
+    _ScriptedRegressor.events = []
+
+    def _fake_initialize_model(*args, **kwargs):
+        return _ScriptedRegressor(kwargs["model_params"]["quality"])
+
+    monkeypatch.setattr(train_models, "_initialize_model", _fake_initialize_model)
+
+    X_train = pd.DataFrame({"split": ["train"] * 4})
+    y_train = pd.Series([0.0, 0.0, 0.0, 0.0])
+    X_val = pd.DataFrame({"split": ["val"] * 4})
+    y_val = pd.Series([0.0, 0.0, 0.0, 0.0])
+    X_test = pd.DataFrame({"split": ["test"] * 4})
+    y_test = pd.Series([0.0, 0.0, 0.0, 0.0])
+
+    _, train_result = train_models.train_model(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        model_type="random_forest",
+        output_dir=str(tmp_path),
+        task_type="regression",
+        model_config={
+            "n_jobs": 1,
+            "tuning": {
+                "method": "optuna",
+                "sampler": "grid",
+                "n_trials": 2,
+                "metric": "val_rmse",
+                "params": {
+                    "quality": {
+                        "type": "categorical",
+                        "choices": ["val_good", "test_good"],
+                    },
+                },
+            },
+        },
+        X_val=X_val,
+        y_val=y_val,
+    )
+
+    metrics = json.loads(Path(train_result.metrics_path).read_text(encoding="utf-8"))
+    assert metrics["tuning"]["best_params"]["quality"] == "val_good"
+    first_test_prediction = next(
+        index for index, event in enumerate(_ScriptedRegressor.events) if event.startswith("predict_test")
+    )
+    val_predictions_before_test = [
+        event
+        for event in _ScriptedRegressor.events[:first_test_prediction]
+        if event.startswith("predict_val")
+    ]
+    assert len(val_predictions_before_test) == 2
+    assert _ScriptedRegressor.events[first_test_prediction] == "predict_test:val_good"
+
+
+def test_train_model_fixed_no_hpo_behavior_unchanged(monkeypatch, tmp_path):
+    def _unexpected_optuna(*args, **kwargs):
+        raise AssertionError("fixed training should not invoke runtime Optuna")
+
+    monkeypatch.setattr("MLModels.training.orchestrator._run_runtime_optuna", _unexpected_optuna)
+
+    X = pd.DataFrame({"f0": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]})
+    y = pd.Series([0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+
+    _, train_result = train_models.train_model(
+        X_train=X.iloc[:4],
+        y_train=y.iloc[:4],
+        X_test=X.iloc[4:],
+        y_test=y.iloc[4:],
+        model_type="decision_tree",
+        output_dir=str(tmp_path),
+        task_type="regression",
+        model_config={"params": {"max_depth": 2}},
+    )
+
+    metrics = json.loads(Path(train_result.metrics_path).read_text(encoding="utf-8"))
+    assert "tuning" not in metrics
+    assert {"r2", "mae"}.issubset(metrics.keys())
 
 
 def test_initialize_model_builds_fixed_classification_estimator():

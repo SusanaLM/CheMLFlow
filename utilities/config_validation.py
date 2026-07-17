@@ -213,11 +213,16 @@ def _append_child_level_tuning_issues(
     issues: list[ValidationIssue],
     tuning_cfg: dict[str, Any],
     path_prefix: str,
+    *,
+    allow_optuna: bool = False,
 ) -> None:
     if not isinstance(tuning_cfg, dict):
         return
     method = str(tuning_cfg.get("method", "fixed")).strip().lower() or "fixed"
-    if method != "fixed":
+    allowed_methods = {"fixed"}
+    if allow_optuna:
+        allowed_methods.add("optuna")
+    if method not in allowed_methods:
         issues.append(_runtime_child_tuning_issue(f"{path_prefix}.method", method))
     if _is_truthy(tuning_cfg.get("use_hpo", False)):
         issues.append(_runtime_child_tuning_issue(f"{path_prefix}.use_hpo", tuning_cfg.get("use_hpo")))
@@ -595,6 +600,13 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
             issues,
             _as_dict(train_cfg.get("tuning")),
             "train.tuning",
+            allow_optuna=(
+                "train" in nodes
+                or (
+                    "train.timeseries" in nodes
+                    and ts_train_model_type in _TIMESERIES_MODELS
+                )
+            ),
         )
 
     pipeline_cfg = _as_dict(config.get("pipeline"))

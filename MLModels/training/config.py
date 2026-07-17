@@ -13,6 +13,7 @@ class RuntimeTrainingOptions:
     debug_logging: bool
     n_jobs: int
     tuning_method: str
+    tuning_config: dict[str, Any]
     model_params: dict[str, Any]
 
 
@@ -96,6 +97,7 @@ def parse_runtime_training_options(model_config: dict[str, Any] | None) -> Runti
         debug_logging=debug_logging,
         n_jobs=n_jobs,
         tuning_method=tuning_method,
+        tuning_config=tuning_cfg,
         model_params=model_params,
     )
 
