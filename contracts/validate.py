@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 from typing import Iterable
 
@@ -60,7 +61,38 @@ def validate_dir(path: str, contract: ContractSpec, warn_only: bool = True) -> b
             warn_only,
         )
         return False
-    return True
+    ok = True
+    for relative in contract.required_files:
+        required = os.path.join(path, relative)
+        if not os.path.isfile(required):
+            _warn_or_raise(
+                f"[{contract.name}] Missing required artifact: {required}.{_format_hint(contract)}",
+                warn_only,
+            )
+            ok = False
+    if contract.manifest_file:
+        manifest_path = os.path.join(path, contract.manifest_file)
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, encoding="utf-8") as handle:
+                    manifest = json.load(handle)
+            except Exception as exc:
+                _warn_or_raise(
+                    f"[{contract.name}] Invalid JSON manifest {manifest_path}: {exc}.{_format_hint(contract)}",
+                    warn_only,
+                )
+                ok = False
+            else:
+                if (
+                    contract.manifest_status is not None
+                    and manifest.get("status") != contract.manifest_status
+                ):
+                    _warn_or_raise(
+                        f"[{contract.name}] Manifest status is {manifest.get('status')!r}; expected {contract.manifest_status!r}.{_format_hint(contract)}",
+                        warn_only,
+                    )
+                    ok = False
+    return ok
 
 
 def validate_file(path: str, contract: ContractSpec, warn_only: bool = True) -> bool:

@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# Info for running plot_distribution.py  —  QED drug-likeness (CheMLFlow gap).
+# CheMLFlow computes no QED anywhere; this is a genuine addition.
+# Run:  python plot_distribution.py qed_distribution.yaml
+# ---------------------------------------------------------------------------
+
+input:
+  run_dir: ../outputs/curated_advanced_eda
+  molecule_table: eda/molecule_table.csv
+  property_column: QED                     # real RDKit QED, 0-1
+  cohort_flag_column: has_valid_property    # compounds with a measured activity class
+  class_column: activity_class              # stack real counts by class
+
+binning:
+  bin_width: 0.05                           # QED units per bar
+
+classes:
+  order: [active, intermediate, inactive]
+  colors:
+    active:       "#00E676"
+    intermediate: "#00B0FF"
+    inactive:     "#000000"
+
+labels:
+  property: "QED"
+  count: "Count"
+  title: ""
+
+layout:
+  orientation: vertical                     # QED on the x-axis
+  figsize: [6.8, 5.0]
+
+output:
+  stem: ../outputs/publication_figures/qed_distribution
+  formats: [pdf, svg, png]

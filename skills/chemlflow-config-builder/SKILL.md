@@ -1,6 +1,6 @@
 ---
 name: chemlflow-config-builder
-description: Create or review a single CheMLFlow runtime config YAML. Use when Codex is asked to build one config for a dataset, choose regression vs classification settings, handle SMILES or non-SMILES CSV inputs, choose curation/drop-row rules, set split/CV/random seed/scaler/model options, or explain when a single config should become DOE fanout.
+description: Create or review a single CheMLFlow runtime config YAML. Use when Codex is asked to build one config for a dataset, choose regression vs classification settings, handle SMILES or non-SMILES CSV inputs, choose curation/drop-row rules, set split/CV/random seed/scaler/model options, or explain when a single config should become DOE fanout. For an explicit request to use the opt-in `analyze.molecular_eda` or `analyze.publication_figures` nodes, also use `chemlflow-molecular-analysis`; never infer those nodes from dataset compatibility alone.
 ---
 
 # CheMLFlow Config Builder
@@ -8,6 +8,12 @@ description: Create or review a single CheMLFlow runtime config YAML. Use when C
 ## Scope
 
 Use this skill to create or audit one runnable CheMLFlow runtime config for `main.py`. Keep it separate from DOE design: a runtime config is one execution slice; DOE is for generating comparable sets of configs. Runtime configs should contain concrete `train.model.params` values, not DOE-only `model_search` blocks.
+
+Keep optional dataset analysis out of default configs. A SMILES, IC50, or pIC50
+column does not by itself justify adding `analyze.molecular_eda` or
+`analyze.publication_figures`. Add either node only for an explicit molecular
+analysis request and follow `skills/chemlflow-molecular-analysis`. Prefer a
+separate dataset-analysis config over extending a modelling config.
 
 ## Workflow
 

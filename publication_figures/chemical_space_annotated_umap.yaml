@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# Info for running plot_chemical_space_annotated.py — chemical-space map with the
+# real 2D structures of the molecules at the four corners + centre overlaid.
+# Run:  python plot_chemical_space_annotated.py chemical_space_annotated_umap.yaml
+# ---------------------------------------------------------------------------
+
+input:
+  run_dir: ../outputs/curated_advanced_eda
+  table: eda/molecule_table.csv
+  x_column: structure_umap_x          # structure-only UMAP (least-circular view)
+  y_column: structure_umap_y
+  color_column: pchembl_value         # colour points by potency
+  smiles_column: canonical_smiles
+  id_column: compound_id
+
+labels:
+  x: "UMAP 1"
+  y: "UMAP 2"
+  color: "pIC50"
+  title: ""
+
+layout:
+  figsize: [10.0, 9.0]
+  # Matches the potency class colours: low pIC50 -> black, mid -> blue, high -> green.
+  colormap: ["#000000", "#00B0FF", "#00E676"]
+  point_size: 14
+  alpha: 0.7
+  hide_ticks: true                    # axis units are arbitrary for UMAP/t-SNE
+  show_axis_labels: true               # keep "UMAP 1" / "UMAP 2" titles
+  mol_px: 700                          # high-res RDKit depiction (crisp in print)
+  mol_zoom: 0.20                       # on-figure size of each structure box
+  # Scatter occupies a central panel; structures live in the margins around it.
+  axes_rect: [0.30, 0.24, 0.46, 0.54] # [left, bottom, width, height] in figure fraction
+  cbar_rect: [0.78, 0.24, 0.018, 0.54]
+  # Structure box centres (figure fraction): TL, TR, BL, BR, centre. Three across the
+  # top, two at the bottom corners — leaving the bottom centre clear for the x title.
+  boxes:
+    - [0.13, 0.87]
+    - [0.66, 0.87]
+    - [0.13, 0.16]
+    - [0.66, 0.16]
+    - [0.40, 0.87]
+
+output:
+  stem: ../outputs/publication_figures/chemical_space_annotated_umap
+  formats: [pdf, svg, png]

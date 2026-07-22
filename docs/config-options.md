@@ -34,6 +34,7 @@ Your config file can contain these top-level blocks:
 | `preprocess` | When `preprocess.features` or `select.features` node is in pipeline |
 | `train` | When `train` node is in pipeline |
 | `train_tdc` | When `train.tdc` node is in pipeline |
+| `analyze` | When an `analyze.*` node is in pipeline |
 
 ## `global` Block
 
@@ -105,7 +106,7 @@ pipeline:
 | Featurization | `featurize.none`, `featurize.rdkit`, `featurize.rdkit_labeled`, `featurize.morgan` |
 | Preprocessing | `preprocess.features`, `select.features` |
 | Training | `train`, `train.tdc` |
-| Analysis | `analyze.stats`, `analyze.eda`, `explain` |
+| Analysis | `analyze.stats`, `analyze.eda`, `analyze.molecular_eda`, `analyze.publication_figures`, `explain` |
 
 **Order constraints:**
 
@@ -529,6 +530,15 @@ train_tdc:
 | `featurize.radius` | `2` | Morgan fingerprint radius. |
 | `featurize.n_bits` | `2048` | Morgan fingerprint bit count. |
 
+## Optional Molecular Dataset Analysis
+
+`analyze.molecular_eda` and `analyze.publication_figures` are separate,
+explicitly configured dataset-analysis nodes. They are not added to generated
+model DOE children. Publication rendering also requires an explicit `figures`
+selection. See [Optional Molecular Dataset Analysis](molecular-analysis.md) for
+the complete schema, scientific contract, outputs, and recommended execution
+model.
+
 ## Nodes Without Configuration
 
 These nodes run with fixed behavior and do not accept config blocks:
@@ -538,7 +548,6 @@ These nodes run with fixed behavior and do not accept config blocks:
 | `featurize.none` | Uses the curated CSV directly as features (no descriptor generation). |
 | `label.ic50` | Converts raw IC50 `standard_value` values to `pIC50` and emits 3-class / 2-class labeled outputs. |
 | `analyze.stats` | Runs statistical tests on the dataset. |
-| `analyze.eda` | Generates exploratory data analysis plots. |
 | `explain` | Generates feature importance and SHAP explanations. |
 
 ## Seed Inheritance

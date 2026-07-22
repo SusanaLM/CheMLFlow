@@ -24,6 +24,11 @@ Use this skill to prove a CheMLFlow analysis result is complete, balanced, and i
 11. Distinguish primary-metric completeness from split-diagnostic completeness. Missing split metrics limits overfit/underfit conclusions, but should not block ranking if every completed aggregate row has finite top-level primary metrics and the audit reports `ranking_ready: true`.
 12. Treat final benchmark/generalization claims as blocked unless the audit reports `final_claim_ready: true`.
 13. Identify the execution backend. Local DOE analysis should come from `analysis.py --backend local`, not fabricated Slurm logs or fake `sacct` rows.
+14. Do not launch `analyze.molecular_eda` or
+    `analyze.publication_figures` as part of an audit. If the user explicitly
+    asks for molecular inspection or named molecular figures after selecting a
+    dataset/result, route that separate request to
+    `skills/chemlflow-molecular-analysis`. Ranking alone is not a trigger.
 
 ## Standard Checks
 

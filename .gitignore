@@ -40,6 +40,9 @@ coverage.xml
 /data/
 /results/
 /runs/
+/artifacts/
+/outputs/
+/molecular_eda/
 /urease/
 /local_data/
 /config/

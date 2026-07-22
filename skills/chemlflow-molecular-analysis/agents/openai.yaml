@@ -1,0 +1,4 @@
+interface:
+  display_name: "CheMLFlow Molecular Analysis"
+  short_description: "Run opt-in molecular EDA and selected figures."
+  default_prompt: "Use $chemlflow-molecular-analysis to assess this molecular dataset and create an explicit dataset-analysis config only when it is compatible."
