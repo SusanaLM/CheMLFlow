@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# Info for running plot_distribution.py  —  pIC50 potency distribution.
+# Real per-compound counts of the log-potency property, stacked by activity
+# class. Sourced from the validated run's tidy export (pchembl_value is the
+# pIC50-equivalent log potency). Run: python plot_distribution.py pic50_distribution.yaml
+# ---------------------------------------------------------------------------
+
+input:
+  run_dir: ../outputs/curated_advanced_eda
+  molecule_table: eda/molecule_table.csv
+  property_column: pchembl_value            # pIC50-equivalent log potency
+  cohort_flag_column: has_valid_property    # only compounds with a measured potency
+  class_column: activity_class              # stack real counts by class
+
+binning:
+  bin_width: 0.5                            # log-potency units per bar
+
+classes:
+  order: [active, intermediate, inactive]
+  colors:
+    active:       "#00E676"
+    intermediate: "#00B0FF"
+    inactive:     "#000000"
+
+labels:
+  property: "pIC50 (log potency)"
+  count: "Compound count"
+  title: ""
+
+layout:
+  orientation: vertical
+  figsize: [6.8, 5.0]
+
+output:
+  stem: ../outputs/publication_figures/pic50_distribution
+  formats: [pdf, svg, png]

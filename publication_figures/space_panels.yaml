@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# Info for running plot_space_panels.py — PCA | UMAP | t-SNE side by side, one
+# shared potency colourbar, for a direct projection comparison in a single graphic.
+# Run:  python plot_space_panels.py space_panels.yaml
+# (t-SNE panel needs a run generated with --include-tsne.)
+# ---------------------------------------------------------------------------
+
+input:
+  run_dir: ../outputs/curated_advanced_eda
+  table: eda/molecule_table.csv
+  color_column: pchembl_value
+
+panels:
+  - {method: pca,  label: "PCA"}
+  - {method: umap, label: "UMAP"}
+  - {method: tsne, label: "t-SNE"}
+
+labels:
+  color: "pIC50"
+
+layout:
+  figsize: [13.5, 4.7]
+  # Same potency colours as the other figures: low -> black, mid -> blue, high -> green.
+  colormap: ["#000000", "#00B0FF", "#00E676"]
+  point_size: 9
+  alpha: 0.75
+
+output:
+  stem: ../outputs/publication_figures/space_panels
+  formats: [pdf, svg, png]

@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------------------
+# Info for running plot_scatter.py  —  chemical-space map (CheMLFlow gap).
+# CheMLFlow has no dimensionality-reduction / chemical-space visualisation.
+# Run:  python plot_scatter.py molecular_space_pca.yaml
+# ---------------------------------------------------------------------------
+
+input:
+  run_dir: ../outputs/curated_advanced_eda
+  table: eda/molecule_table.csv
+  x_column: structure_pca_x          # structure-only UMAP (least-circular view)
+  y_column: structure_pca_y
+  color_column: pchembl_value
+  color_type: continuous
+  drop_missing_color: true            # only points with a measured property are coloured
+
+labels:
+  x: "PC 1"
+  y: "PC 2"
+  color: "pIC50"
+  title: ""
+
+layout:
+  figsize: [7.2, 6.2]
+  # Matches the potency class colours: low pIC50 -> black (inactive),
+  # mid -> blue (intermediate), high -> green (active).
+  colormap: ["#000000", "#00B0FF", "#00E676"]
+  point_size: 15
+  alpha: 0.82
+  hide_ticks: true                    # axis units are arbitrary for UMAP/t-SNE
+  grid: false
+
+output:
+  stem: ../outputs/publication_figures/molecular_space_pca
+  formats: [pdf, svg, png]

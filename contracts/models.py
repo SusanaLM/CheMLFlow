@@ -14,6 +14,9 @@ class ContractSpec(BaseModel):
     required_any_of: List[List[str]] = Field(default_factory=list)
     min_columns: int = 0
     sample_model: Optional[type[BaseModel]] = None
+    required_files: List[str] = Field(default_factory=list)
+    manifest_file: Optional[str] = None
+    manifest_status: Optional[str] = None
 
 
 class BaseRow(BaseModel):
@@ -168,6 +171,41 @@ ANALYZE_EDA_OUTPUT_CONTRACT = ContractSpec(
     output_kind="dir",
     description="Output directory for EDA artifacts.",
     sample_model=None,
+)
+
+ANALYZE_MOLECULAR_EDA_INPUT_CONTRACT = ContractSpec(
+    name="analyze_molecular_eda_input",
+    description="Molecular EDA requires a CSV with a recognizable SMILES column.",
+    required_any_of=[["canonical_smiles", "smiles", "SMILES", "mol_smiles"]],
+    min_columns=1,
+)
+
+ANALYZE_MOLECULAR_EDA_OUTPUT_CONTRACT = ContractSpec(
+    name="analyze_molecular_eda_output",
+    output_kind="dir",
+    description="Completed molecular EDA offline report bundle.",
+    required_files=[
+        "run_manifest.json",
+        "artifact_manifest.csv",
+        "eda_report.html",
+        "eda/molecule_table.csv",
+        "eda/dataset_profile.json",
+        "eda/activity_cliffs.csv",
+    ],
+    manifest_file="run_manifest.json",
+    manifest_status="complete",
+)
+
+ANALYZE_PUBLICATION_FIGURES_OUTPUT_CONTRACT = ContractSpec(
+    name="analyze_publication_figures_output",
+    output_kind="dir",
+    description="Selected publication figures with durable provenance.",
+    required_files=[
+        "publication_figures_manifest.json",
+        "artifact_manifest.csv",
+    ],
+    manifest_file="publication_figures_manifest.json",
+    manifest_status="complete",
 )
 
 FEATURIZE_RDKIT_INPUT_CONTRACT = ContractSpec(

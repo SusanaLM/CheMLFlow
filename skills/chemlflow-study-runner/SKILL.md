@@ -16,6 +16,12 @@ Use this as the master CheMLFlow operating skill. It routes agents to the focuse
 - Audit before ranking. Do not report "best model" claims until the analysis curator gate passes.
 - Separate scientific parent configs from execution children. A runtime CV config is one fold/repeat slice; DOE fanout is the normal path for full K-fold results.
 - Preserve generated configs, manifests, run statuses, logs, metrics, and analysis outputs.
+- Keep `analyze.molecular_eda` and `analyze.publication_figures` out of the
+  default study flow and every DOE child. Do not infer them from a compatible
+  molecular dataset. Route an explicit molecule-inspection, molecular EDA,
+  clustering, activity-discontinuity, or selected molecular-figure request to
+  `skills/chemlflow-molecular-analysis` and run it as a separate dataset-level
+  analysis.
 - Ask or state assumptions for molecular science choices that change interpretation: Morgan vs RDKit vs ECFP4+RDKit, random vs scaffold, holdout vs CV vs nested CV, and whether SMILES-native models are in scope.
 - If the dataset has a known source paper, benchmark, or public name, identify the original task, model family, split strategy, and reported metrics before DOE design. Include a feasible comparable baseline or explicitly label the study as incomplete relative to the literature.
 - For SMILES molecular datasets, explicitly decide whether `chemprop` and `chemeleon` are in scope. Do not treat Morgan/RDKit/ECFP4+RDKit tabular models as the complete search space unless the user asked to exclude SMILES-native models or the runtime cannot support them.
@@ -33,6 +39,9 @@ Use this as the master CheMLFlow operating skill. It routes agents to the focuse
 5. For local analysis, use `analysis.py --backend local`.
 6. For Slurm analysis, use `analysis.py --backend slurm` with the orchestrator job/log inputs.
 7. For final result validation, use `skills/chemlflow-analysis-curator`.
+8. For explicitly requested optional molecular EDA or selected molecular
+   publication figures, use `skills/chemlflow-molecular-analysis` outside DOE
+   child fanout.
 
 ## Default Study Flow
 

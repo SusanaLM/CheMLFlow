@@ -18,6 +18,7 @@
 - [Quickstart](docs/quickstart.md)
 - [Configuration options](docs/config-options.md)
 - [Design-of-experiments workflows](docs/doe.md)
+- [Optional molecular EDA and selected publication figures](docs/molecular-analysis.md)
 - [Agent skills quickstart](docs/agent-skills-quickstart.md)
 
 ## Conferences, workshops, and hackathons

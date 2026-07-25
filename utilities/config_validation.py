@@ -40,6 +40,8 @@ _NODE_TO_BLOCK = {
     "train.timeseries": "train",
     "analyze.stats": "analyze",
     "analyze.eda": "analyze",
+    "analyze.molecular_eda": "analyze",
+    "analyze.publication_figures": "analyze",
 }
 
 _CONFIGLESS_NODE_TO_BLOCK = {
@@ -83,6 +85,65 @@ _ARTIFACT_RETENTION_VALUES = {"full", "audit_light"}
 _GET_DATA_SAMPLE_STRATEGIES = {"random", "stratified"}
 _GET_DATA_SAMPLE_SOURCE_TYPES = {"local_csv", "chembl", "http_csv"}
 _GET_DATA_SAMPLE_KEYS = {"fraction", "seed", "strategy", "stratify_column"}
+_MOLECULAR_EDA_KEYS = {
+    "input_path",
+    "output_dir",
+    "smiles_column",
+    "id_column",
+    "property_column",
+    "property_columns",
+    "property_type",
+    "units_column",
+    "map_methods",
+    "primary_map",
+    "property_transforms",
+    "sample_size",
+    "overwrite",
+    "fingerprint",
+    "embedding",
+    "clustering",
+    "report",
+}
+_PUBLICATION_FIGURE_KEYS = {
+    "source_dir",
+    "output_dir",
+    "figures",
+    "formats",
+    "property_column",
+    "overrides",
+    "on_missing",
+    "overwrite",
+}
+_MOLECULAR_MAP_METHODS = {"pca", "umap", "tsne", "pacmap", "trimap"}
+_PUBLICATION_FORMATS = {"pdf", "svg", "png"}
+_MOLECULAR_FINGERPRINT_KEYS = {
+    "radius", "n_bits", "include_chirality", "use_features",
+    "representation_sensitivity", "comparison_representations",
+}
+_MOLECULAR_EMBEDDING_KEYS = {
+    "property_weight", "property_weight_sensitivity", "random_state",
+    "umap_seed_sensitivity", "umap_neighbors", "umap_min_dist",
+    "validation_neighbors", "max_pairwise_molecules", "tsne_perplexity",
+    "pacmap_neighbors", "map_method_selection", "coranking_diagnostics",
+}
+_MOLECULAR_CLUSTERING_KEYS = {
+    "butina_similarity_threshold", "threshold_sensitivity", "hdbscan",
+    "hdbscan_min_cluster_size",
+}
+_MOLECULAR_REPORT_KEYS = {
+    "advanced", "higher_is_better", "drug_discovery_panel", "model_readiness",
+    "nearest_neighbors", "activity_discontinuities", "property_descriptor_plots",
+    "top_scaffolds", "singleton_scaffold_warning_fraction",
+    "representative_molecules", "max_svg_molecules", "nearest_neighbors_count",
+    "activity_similarity_threshold", "activity_difference_threshold",
+    "qed_low_threshold", "lipinski_violation_warning_threshold",
+    "max_detailed_hover_points", "use_scattergl", "export_selection_schema",
+}
+_MOLECULAR_PROPERTY_TYPES = {
+    "auto", "potency_log", "potency_linear", "physchem", "admet",
+    "qm_energy", "qm_gap", "classification", "generic_numeric",
+    "generic_categorical",
+}
 _RUNTIME_PROFILE_CONTRACTS: dict[str, dict[str, Any]] = {
     "reg_local_csv": {
         "allowed_feature_inputs": (
@@ -334,6 +395,218 @@ def _append_get_data_sample_issues(
                 ),
             )
         )
+
+
+def _validate_optional_molecular_analysis(
+    config: dict[str, Any], nodes: list[str], issues: list[ValidationIssue]
+) -> None:
+    analyze = config.get("analyze")
+    analyze_cfg = analyze if isinstance(analyze, dict) else {}
+    molecular_requested = "analyze.molecular_eda" in nodes
+    figures_requested = "analyze.publication_figures" in nodes
+    molecular = analyze_cfg.get("molecular_eda")
+    figures = analyze_cfg.get("publication_figures")
+
+    for node, child, value in (
+        ("analyze.molecular_eda", "molecular_eda", molecular),
+        ("analyze.publication_figures", "publication_figures", figures),
+    ):
+        requested = node in nodes
+        if requested and not isinstance(value, dict):
+            issues.append(
+                ValidationIssue(
+                    code="CFG_MISSING_ANALYZE_NODE_CONFIG",
+                    path=f"analyze.{child}",
+                    message=f"Node {node} requires an analyze.{child} mapping.",
+                )
+            )
+        if not requested and value is not None:
+            issues.append(
+                ValidationIssue(
+                    code="CFG_ANALYZE_CONFIG_WITHOUT_NODE",
+                    path=f"analyze.{child}",
+                    message=f"analyze.{child} is present but {node} is not in pipeline.nodes.",
+                )
+            )
+
+    if molecular_requested and isinstance(molecular, dict):
+        unknown = sorted(set(molecular) - _MOLECULAR_EDA_KEYS)
+        if unknown:
+            issues.append(
+                ValidationIssue(
+                    code="CFG_MOLECULAR_EDA_UNKNOWN_KEY",
+                    path="analyze.molecular_eda",
+                    message=f"Unknown molecular EDA keys: {unknown}",
+                )
+            )
+        if "property_column" in molecular and "property_columns" in molecular:
+            issues.append(
+                ValidationIssue(
+                    code="CFG_MOLECULAR_EDA_PROPERTY_CONFLICT",
+                    path="analyze.molecular_eda",
+                    message="Use property_column or property_columns, not both.",
+                )
+            )
+        maps = molecular.get("map_methods", ["pca", "umap"])
+        if not isinstance(maps, list) or not maps or not all(isinstance(value, str) for value in maps):
+            issues.append(
+                ValidationIssue(
+                    code="CFG_MOLECULAR_EDA_MAPS_INVALID",
+                    path="analyze.molecular_eda.map_methods",
+                    message="map_methods must be a non-empty list of map names.",
+                )
+            )
+        else:
+            normalized_maps = [value.strip().lower() for value in maps]
+            unknown_maps = sorted(set(normalized_maps) - _MOLECULAR_MAP_METHODS)
+            if unknown_maps:
+                issues.append(
+                    ValidationIssue(
+                        code="CFG_MOLECULAR_EDA_MAPS_INVALID",
+                        path="analyze.molecular_eda.map_methods",
+                        message=f"Unsupported map methods: {unknown_maps}",
+                    )
+                )
+            primary = str(molecular.get("primary_map", "umap")).strip().lower()
+            if primary not in normalized_maps:
+                issues.append(
+                    ValidationIssue(
+                        code="CFG_MOLECULAR_EDA_PRIMARY_MAP_INVALID",
+                        path="analyze.molecular_eda.primary_map",
+                        message="primary_map must be included in map_methods.",
+                    )
+                )
+        sample_size = molecular.get("sample_size")
+        if sample_size is not None and (
+            isinstance(sample_size, bool)
+            or not isinstance(sample_size, int)
+            or sample_size < 10
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="CFG_MOLECULAR_EDA_SAMPLE_INVALID",
+                    path="analyze.molecular_eda.sample_size",
+                    message="sample_size must be an integer of at least 10.",
+                )
+            )
+        for child in ("fingerprint", "embedding", "clustering", "report", "property_transforms"):
+            if child in molecular and not isinstance(molecular[child], dict):
+                issues.append(
+                    ValidationIssue(
+                        code="CFG_MOLECULAR_EDA_CHILD_INVALID",
+                        path=f"analyze.molecular_eda.{child}",
+                        message=f"{child} must be a mapping.",
+                    )
+                )
+        child_schemas = {
+            "fingerprint": _MOLECULAR_FINGERPRINT_KEYS,
+            "embedding": _MOLECULAR_EMBEDDING_KEYS,
+            "clustering": _MOLECULAR_CLUSTERING_KEYS,
+            "report": _MOLECULAR_REPORT_KEYS,
+        }
+        for child, allowed in child_schemas.items():
+            value = molecular.get(child)
+            if isinstance(value, dict):
+                child_unknown = sorted(set(value) - allowed)
+                if child_unknown:
+                    issues.append(
+                        ValidationIssue(
+                            code="CFG_MOLECULAR_EDA_CHILD_UNKNOWN_KEY",
+                            path=f"analyze.molecular_eda.{child}",
+                            message=f"Unknown {child} keys: {child_unknown}",
+                        )
+                    )
+        property_type = str(molecular.get("property_type", "auto")).strip().lower()
+        if property_type not in _MOLECULAR_PROPERTY_TYPES:
+            issues.append(
+                ValidationIssue(
+                    code="CFG_MOLECULAR_EDA_PROPERTY_TYPE_INVALID",
+                    path="analyze.molecular_eda.property_type",
+                    message=f"Unsupported property_type: {property_type!r}.",
+                )
+            )
+        if "overwrite" in molecular and not isinstance(molecular["overwrite"], bool):
+            issues.append(
+                ValidationIssue(
+                    code="CFG_MOLECULAR_EDA_OVERWRITE_INVALID",
+                    path="analyze.molecular_eda.overwrite",
+                    message="overwrite must be true or false.",
+                )
+            )
+
+    if figures_requested and isinstance(figures, dict):
+        unknown = sorted(set(figures) - _PUBLICATION_FIGURE_KEYS)
+        if unknown:
+            issues.append(
+                ValidationIssue(
+                    code="CFG_PUBLICATION_FIGURES_UNKNOWN_KEY",
+                    path="analyze.publication_figures",
+                    message=f"Unknown publication-figure keys: {unknown}",
+                )
+            )
+        selected = figures.get("figures")
+        if not isinstance(selected, list) or not selected or not all(isinstance(value, str) and value.strip() for value in selected):
+            issues.append(
+                ValidationIssue(
+                    code="CFG_PUBLICATION_FIGURES_SELECTION_REQUIRED",
+                    path="analyze.publication_figures.figures",
+                    message="Explicitly list at least one selected publication figure.",
+                )
+            )
+        formats = figures.get("formats", ["pdf", "svg", "png"])
+        if not isinstance(formats, list) or not formats or (
+            any(str(value).lower() not in _PUBLICATION_FORMATS for value in formats)
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="CFG_PUBLICATION_FIGURES_FORMAT_INVALID",
+                    path="analyze.publication_figures.formats",
+                    message="formats must be a non-empty list containing pdf, svg, and/or png.",
+                )
+            )
+        if figures.get("on_missing", "error") not in {"error", "skip"}:
+            issues.append(
+                ValidationIssue(
+                    code="CFG_PUBLICATION_FIGURES_MISSING_POLICY_INVALID",
+                    path="analyze.publication_figures.on_missing",
+                    message="on_missing must be 'error' or 'skip'.",
+                )
+            )
+        if "overwrite" in figures and not isinstance(figures["overwrite"], bool):
+            issues.append(
+                ValidationIssue(
+                    code="CFG_PUBLICATION_FIGURES_OVERWRITE_INVALID",
+                    path="analyze.publication_figures.overwrite",
+                    message="overwrite must be true or false.",
+                )
+            )
+        if "overrides" in figures and not isinstance(figures["overrides"], dict):
+            issues.append(
+                ValidationIssue(
+                    code="CFG_PUBLICATION_FIGURES_OVERRIDES_INVALID",
+                    path="analyze.publication_figures.overrides",
+                    message="overrides must be a mapping keyed by figure name.",
+                )
+            )
+        if not figures.get("source_dir") and not molecular_requested:
+            issues.append(
+                ValidationIssue(
+                    code="CFG_PUBLICATION_FIGURES_SOURCE_REQUIRED",
+                    path="analyze.publication_figures.source_dir",
+                    message=(
+                        "Provide source_dir or include analyze.molecular_eda earlier "
+                        "in this dedicated dataset-analysis pipeline."
+                    ),
+                )
+            )
+        if molecular_requested and nodes.index("analyze.publication_figures") < nodes.index("analyze.molecular_eda"):
+            issues.append(
+                ValidationIssue(
+                    code="CFG_PUBLICATION_FIGURES_ORDER_INVALID",
+                    path="pipeline.nodes",
+                    message="analyze.publication_figures must follow analyze.molecular_eda.",
+                )
+            )
 
 
 def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[ValidationIssue]:
@@ -899,6 +1172,7 @@ def collect_config_issues(config: dict[str, Any], nodes: list[str]) -> list[Vali
                 )
             )
 
+    _validate_optional_molecular_analysis(config, nodes, issues)
     return issues
 
 

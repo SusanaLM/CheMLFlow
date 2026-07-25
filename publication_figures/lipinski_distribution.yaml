@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# Info for running plot_distribution.py  —  Lipinski rule-of-five violations.
+# Real per-compound counts of Lipinski violations (0-4); structure-only, so no
+# class stacking. Run:  python plot_distribution.py lipinski_distribution.yaml
+# ---------------------------------------------------------------------------
+
+input:
+  run_dir: ../outputs/curated_advanced_eda
+  molecule_table: eda/molecule_table.csv
+  property_column: Lipinski_Violation_Count   # integer 0-4 per molecule
+
+binning:
+  bin_width: 1                                 # one bar per violation count
+  discrete: true                               # integer-centred bars (0,1,2,3)
+
+labels:
+  property: "Lipinski violations"
+  count: "Count"
+  title: ""
+
+layout:
+  orientation: vertical
+  figsize: [6.6, 5.0]
+  color: "#00E676"
+
+output:
+  stem: ../outputs/publication_figures/lipinski_distribution
+  formats: [pdf, svg, png]

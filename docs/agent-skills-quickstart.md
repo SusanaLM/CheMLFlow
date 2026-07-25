@@ -12,6 +12,7 @@ skills/
 +-- chemlflow-config-builder/
 +-- chemlflow-doe-designer/
 +-- chemlflow-analysis-curator/
++-- chemlflow-molecular-analysis/
 ```
 
 Each skill has:
@@ -39,6 +40,16 @@ Use the CheMLFlow DOE Designer skill in skills/chemlflow-doe-designer to review 
 ```text
 Use the CheMLFlow Analysis Curator skill in skills/chemlflow-analysis-curator to audit pah/pah_analysis_6689856.
 ```
+
+```text
+Use the CheMLFlow Molecular Analysis skill in skills/chemlflow-molecular-analysis to inspect this curated SMILES/pIC50 dataset and create a dedicated molecular EDA config.
+```
+
+The molecular-analysis skill is opt-in. Do not use it merely because an
+ordinary config or DOE dataset contains SMILES, IC50, or pIC50. Invoke it for an
+explicit request for molecule inspection, chemical-space projection,
+unsupervised clustering, activity-discontinuity analysis, or named molecular
+publication figures.
 
 ## 3. Run the helper checks
 
@@ -99,6 +110,16 @@ For analysis work, the agent should inspect:
 - failed or incomplete folds before discussing model performance
 - whether `report.json` says `backend: local` or `backend: slurm`
 
+For optional molecular-analysis work, the agent should check:
+
+- that the user explicitly requested the optional analysis;
+- SMILES, identifier, property, and units compatibility;
+- that the work uses a dedicated dataset-analysis config rather than DOE
+  children;
+- that publication figures are explicitly selected;
+- molecular EDA and publication manifest status, identity hashes, and artifact
+  checksums.
+
 ## 5. Optional auto-discovery
 
 Keep `skills/` in this repo as the source of truth. If your agent supports automatic skill
@@ -113,6 +134,7 @@ ln -s "$(pwd)/skills/chemlflow-doe-designer" ~/.codex/skills/chemlflow-doe-desig
 ln -s "$(pwd)/skills/chemlflow-analysis-curator" ~/.codex/skills/chemlflow-analysis-curator
 ln -s "$(pwd)/skills/chemlflow-config-builder" ~/.codex/skills/chemlflow-config-builder
 ln -s "$(pwd)/skills/chemlflow-study-runner" ~/.codex/skills/chemlflow-study-runner
+ln -s "$(pwd)/skills/chemlflow-molecular-analysis" ~/.codex/skills/chemlflow-molecular-analysis
 ```
 
 After installing or symlinking skills, restart the agent session so it can reload available

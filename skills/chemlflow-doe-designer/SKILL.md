@@ -24,6 +24,11 @@ Use this skill as a small operating manual for CheMLFlow DOE work. Keep the focu
 
 ## Checks
 
+- Never add `analyze.molecular_eda` or `analyze.publication_figures` to DOE
+  defaults, search axes, or generated execution children. Dataset compatibility
+  is not a trigger. If the user explicitly requests molecular EDA or selected
+  molecular publication figures, create a separate dataset-analysis config with
+  `skills/chemlflow-molecular-analysis`.
 - Keep fixed choices in `defaults`; keep only true experiment axes in `search_space`.
 - Treat DOE as parent/child shaped: one scientific parent can expand to many execution children, usually CV folds.
 - Treat `model_search` as an optional parent-level hyperparameter expansion axis. Use it only when the user explicitly asks for hyperparameter optimization, tuning, grid search, Optuna, random/Bayesian search, or a hyperparameter sweep. Do not infer HPO from broad prompts such as "find the best model", "benchmark models", or "compare models"; for those, compare fixed default model/feature/split branches and set `train.tuning.method: fixed`.

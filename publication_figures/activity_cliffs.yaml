@@ -1,0 +1,39 @@
+# ---------------------------------------------------------------------------
+# Info for running plot_scatter.py — similarity-defined activity discontinuities.
+# Each point is a real pair that the
+# workflow flagged (Tanimoto >= 0.70 and |Δ property| >= 1.0).
+# Run:  python plot_scatter.py activity_cliffs.yaml
+# ---------------------------------------------------------------------------
+
+input:
+  run_dir: ../outputs/curated_advanced_eda
+  table: eda/activity_cliffs.csv
+  x_column: tanimoto_similarity
+  y_column: absolute_property_difference
+  color_column: same_scaffold
+  color_type: categorical
+
+classes:
+  order: ["True", "False"]
+  colors:
+    "True":  "#3DDC84"
+    "False": "#000000"
+  labels:
+    "True":  "same scaffold"
+    "False": "cross scaffold"
+
+labels:
+  x: "Tanimoto similarity"
+  y: "|Δ pIC50| (log units)"
+  color: "scaffold relationship"
+  title: ""
+
+layout:
+  figsize: [6.8, 5.6]
+  point_size: 18
+  alpha: 0.6
+  grid: true
+
+output:
+  stem: ../outputs/publication_figures/activity_cliffs
+  formats: [pdf, svg, png]

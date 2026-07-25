@@ -870,6 +870,20 @@ def run_node_analyze_eda(context: dict) -> None:
     )
 
 
+def run_node_analyze_molecular_eda(context: dict) -> None:
+    """Run the opt-in, dataset-scoped molecular EDA bundle."""
+    from utilities.molecular_analysis import run_molecular_eda_node
+
+    run_molecular_eda_node(context)
+
+
+def run_node_analyze_publication_figures(context: dict) -> None:
+    """Render only the publication figures explicitly selected in the config."""
+    from utilities.molecular_analysis import run_publication_figures_node
+
+    run_publication_figures_node(context)
+
+
 def run_node_featurize_rdkit(context: dict) -> None:
     validate_contract(
         bind_output_path(
@@ -2962,6 +2976,8 @@ NODE_REGISTRY = {
     "label.ic50": run_node_label_ic50,
     "analyze.stats": run_node_analyze_stats,
     "analyze.eda": run_node_analyze_eda,
+    "analyze.molecular_eda": run_node_analyze_molecular_eda,
+    "analyze.publication_figures": run_node_analyze_publication_figures,
     "featurize.rdkit": run_node_featurize_rdkit,
     "featurize.rdkit_labeled": run_node_featurize_rdkit_labeled,
     "featurize.morgan": run_node_featurize_morgan,
@@ -2999,6 +3015,22 @@ def validate_pipeline_nodes(nodes: list[str]) -> None:
     This pipeline enforces a single source of truth for dataset splits: the split node.
     """
     uses_split_dependents = any(node in nodes for node in _SPLIT_REQUIRED_FOR)
+    for dataset_node in (
+        "analyze.molecular_eda",
+        "analyze.publication_figures",
+    ):
+        if nodes.count(dataset_node) > 1:
+            raise ValueError(f"Pipeline must include at most one '{dataset_node}' node.")
+    if (
+        "analyze.molecular_eda" in nodes
+        and "analyze.publication_figures" in nodes
+        and nodes.index("analyze.publication_figures")
+        < nodes.index("analyze.molecular_eda")
+    ):
+        raise ValueError(
+            "'analyze.publication_figures' must follow 'analyze.molecular_eda' "
+            "when both are in one dataset-analysis pipeline."
+        )
     split_positions = [i for i, node in enumerate(nodes) if node == "split"]
     if len(split_positions) > 1:
         raise ValueError("Pipeline must include at most one 'split' node.")
