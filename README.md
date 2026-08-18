@@ -32,7 +32,7 @@
   2. "Don’t just cite, verify: Lessons from the crisis in graph learning" International Conference for the 80th Anniversary of the Korean Mathematical Society. Special Session Math, AI, and Scientific Method.
 Presented by Eric Dolores.
 
-   - Workshops and hackathons: 
+- Workshops and hackathons: 
   1. Presentation at Industrial Mathematical Center, Pusan National University, August 12, 2026.
 Presented by Eric Dolores.
 
