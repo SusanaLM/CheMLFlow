@@ -7,8 +7,8 @@
   <img alt="Docs" src="https://img.shields.io/badge/docs-available-brightgreen">
   <img alt="Agent skills" src="https://img.shields.io/badge/agent%20skills-available-0F766E">
   <a href="https://arxiv.org/abs/2608.04942">
-  <img alt="Preprint arXiv"
-       src="https://img.shields.io/badge/Preprint-arXiv-blue?style=flat">
+  <img alt="Preprint in arXiv"
+       src="https://img.shields.io/badge/Paper-arXiv-blue?style=flat">
 </a>
 </p>
 
