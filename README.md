@@ -6,6 +6,7 @@
   <img alt="License" src="https://img.shields.io/badge/license-MIT-yellow">
   <img alt="Docs" src="https://img.shields.io/badge/docs-available-brightgreen">
   <img alt="Agent skills" src="https://img.shields.io/badge/agent%20skills-available-0F766E">
+  <img alt="Static Badge" src="https://img.shields.io/badge/Preprint%20arXiv?style=flat&link=https%3A%2F%2Farxiv.org%2Fabs%2F2608.04942">
 </p>
 
 <p align="center">
@@ -25,7 +26,12 @@
 
 - Conference presentations:
   1. "CheMLFlow: An Open Source Platform for Cheminformatics and Materials Informatics Applications" received the Best Oral Presentation Award (Silver) at the 1st Humanoid Olfactory Display International Research Conference. Presented by Susana López.
-- Workshops and hackathons: coming soon.
+  2. "Don’t just cite, verify: Lessons from the crisis in graph learning" International Conference for the 80th Anniversary of the Korean Mathematical Society. Special Session Math, AI, and Scientific Method.
+Presented by Eric Dolores.
+
+   - Workshops and hackathons: 
+  1. Presentation at Industrial Mathematical Center, Pusan National University, August 12, 2026.
+Presented by Eric Dolores.
 
 ## Pipeline vision 
 
