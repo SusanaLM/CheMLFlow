@@ -19,6 +19,19 @@ are ported from the user's notebook reference implementation, but parameterized
 so the trainer is dataset-agnostic. Hyperparameter candidates are expected to
 arrive as fixed `train.model.params` from DOE `model_search`; this module is
 invoked once per generated execution child by the training node.
+
+In our experiments, removing L-BFGS gives better results.
+
+If you uses Adaptive NVAR please cite 
+@misc{sherkhon2025adaptivenonlinearvectorautoregression,
+      title={Adaptive Nonlinear Vector Autoregression: Robust Forecasting for Noisy Chaotic Time Series}, 
+      author={Azimov Sherkhon and Susana Lopez-Moreno and Eric Dolores-Cuenca and Sieun Lee and Sangil Kim},
+      year={2025},
+      eprint={2507.08738},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2507.08738}, 
+}
 """
 
 from __future__ import annotations
