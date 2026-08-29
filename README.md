@@ -35,6 +35,10 @@ Presented by Eric Dolores.
 - Workshops and hackathons: 
   1. Presentation at Industrial Mathematical Center, Pusan National University, August 12, 2026.
 Presented by Eric Dolores.
+  2. Hackathon at AI + Math lab, Korea University, August 21, 2026.
+Presented by Nijamudheen Abdulrahiman and Eric Dolores.
+  3. Presetation at INFOTEC, Mexico, August 28, 2026.
+Presented by Eric Dolores.
 
 ## Pipeline vision 
 
@@ -49,6 +53,14 @@ The required inputs are:
 - optional ML and AI models to be trained on or using pre-trained or foundational models. 
 
 Downstream steps enforce only the minimum required columns for their node (e.g., `canonical_smiles` for RDKit, `target_column` for model training), and extra columns are allowed.
+
+### Time-series forecasting (Adaptive NVAR / Connectome NVAR)
+
+Alongside the tabular/SMILES pipeline above, CheMLFlow also has a separate
+`pipeline_type: timeseries` profile for chaotic dynamical-system forecasting,
+using Adaptive NVAR and Adaptive Connectome NVAR models. See
+[`docs/timeseries_pipeline.md`](docs/timeseries_pipeline.md) for the schema
+and quickstart, and try it with `config/timeseries_quick_demo.yaml`.
 
 ### SMILES handling
 
@@ -507,3 +519,20 @@ Under the run directory (e.g., `runs/<timestamp>/`):
 - `chemprop_best_params.pkl` (do not load untrusted pickle/joblib files)
 - `chemprop_metrics.json` (classification: `auc`/`auprc`/`accuracy`/`f1`; regression: `r2`/`mae`; plus Chemprop/foundation run settings)
 - `chemprop_predictions.csv` (`y_true` + `y_pred`; classification also includes `y_proba`)
+
+
+
+## 📚 Citation
+
+If you use **CheMLFlow** in your research, please cite:
+
+```bibtex
+@misc{smith2026chemlflowopensourceplatformcheminformatics,
+      title={CheMLFlow: An Open-Source Platform for Cheminformatics and Materials Informatics Applications},
+      author={Brendan Smith and Susana Lopez-Moreno and Eric Dolores-Cuenca and Sangil Kim and Jose L. Mendoza-Cortes and Nijamudheen Abdulrahiman},
+      year={2026},
+      eprint={2608.04942},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2608.04942},
+}
